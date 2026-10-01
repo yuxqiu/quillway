@@ -30,6 +30,10 @@ Or open the popup and press ↵ on the install card.
 
 Without home-manager: `nix profile install .#default`, then run `quillway daemon` from your compositor's autostart.
 
+### Without Nix
+
+Download `quillway-<version>-<arch>-linux.tar.gz` from [Releases](https://github.com/yuxqiu/quillway/releases) (x86_64 and aarch64; glibc 2.35 or newer), check it against its `.sha256`, and put `quillway` on your `PATH`. It needs a Wayland session (it loads libwayland, libxkbcommon and your Vulkan or GL driver at runtime) and `llama-server` from [llama.cpp](https://github.com/ggml-org/llama.cpp) on your `PATH`, or `model.llama_server` / `model.endpoint` set. Run `quillway daemon` from your compositor's autostart.
+
 ### Bind a key
 
 Quillway doesn't grab keys itself. Your compositor runs `quillway toggle`:

@@ -8,7 +8,8 @@ use crate::catalog::Sampling;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Request {
-    /// Show the popup, or hide it if visible.
+    /// Show the popup, or hide it if visible. With [`Input::Text`], an open popup
+    /// is kept and the request fails, so the text isn't lost.
     Toggle {
         /// Text to start from.
         input: Input,

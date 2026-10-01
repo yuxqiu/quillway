@@ -483,6 +483,13 @@ impl App {
     }
 
     fn open(&mut self, text: String, origin: Origin, error: Option<String>) -> Task<Message> {
+        // The model may have been installed since we last looked (copied in, or by a CLI
+        // that couldn't reach us); start it instead of offering the install card.
+        let warm = if self.engine_state == EngineState::Missing && self.active.path.is_file() {
+            self.warm_up()
+        } else {
+            Task::none()
+        };
         let id = window::Id::unique();
         let size = self.surface_size(196);
         let top = i32::try_from(self.config.ui.top_margin.saturating_sub(self.margin())).unwrap_or(i32::MAX);
@@ -503,7 +510,7 @@ impl App {
             size,
             opened: Instant::now(),
         });
-        Task::done(Message::NewLayerShell {
+        let open = Task::done(Message::NewLayerShell {
             settings: NewLayerShellSettings {
                 size: Some(size),
                 layer: Layer::Overlay,
@@ -516,7 +523,8 @@ impl App {
                 namespace: Some(namespace()),
             },
             id,
-        })
+        });
+        Task::batch([warm, open])
     }
 
     fn hide(&mut self) -> Task<Message> {
@@ -932,6 +940,20 @@ mod tests {
         let _ = app.update(Message::Preset(0));
         assert_eq!(app.popup.as_ref().unwrap().phase(), Phase::Generating);
         app
+    }
+
+    #[test]
+    fn opening_the_popup_notices_a_model_installed_meanwhile() {
+        let path = std::env::temp_dir().join(format!("quillway-test-{}.gguf", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut config = Config::default();
+        config.model.active = Some(format!("custom:{}", path.display()));
+        let (mut app, _) = App::boot(config, None);
+        assert_eq!(app.engine_state, EngineState::Missing);
+        std::fs::write(&path, b"gguf").unwrap();
+        let _ = app.update(Message::Ipc(Request::Show { input: Input::Text("hi".into()) }, reply()));
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(app.engine_state, EngineState::Starting);
     }
 
     #[test]

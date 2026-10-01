@@ -171,6 +171,16 @@ impl Config {
                 anyhow::bail!("unknown model {active:?} in `model.active`; available: {}", ids.join(", "));
             }
         }
+        let hex =
+            config.ui.accent.strip_prefix('#').filter(|h| h.len() == 6 && h.bytes().all(|b| b.is_ascii_hexdigit()));
+        if hex.is_none() {
+            anyhow::bail!("`ui.accent = {:?}` must be a colour like \"#7c6cf2\"", config.ui.accent);
+        }
+        for p in &config.presets {
+            if p.name.trim().is_empty() || p.instruction.trim().is_empty() {
+                anyhow::bail!("every `[[preset]]` needs a non-empty `name` and `instruction` (got name {:?})", p.name);
+            }
+        }
         if config.model.endpoint.is_some() && config.model.endpoint_model.is_none() {
             anyhow::bail!("`model.endpoint` needs `model.endpoint_model`, the model name the server expects");
         }
@@ -268,6 +278,20 @@ mod tests {
     fn custom_model_requires_a_path() {
         let error = Config::parse("[model]\nactive = 'custom:'").unwrap_err();
         assert!(error.to_string().contains("path"), "{error}");
+    }
+
+    #[test]
+    fn accent_must_be_a_hex_colour() {
+        for bad in ["purple", "#7c6cf", "#7c6cf2ff", "7c6cf2", "#zzzzzz"] {
+            assert!(Config::parse(&format!("[ui]\naccent = '{bad}'")).is_err(), "{bad}");
+        }
+        assert!(Config::parse("[ui]\naccent = '#7C6CF2'").is_ok());
+    }
+
+    #[test]
+    fn presets_need_a_name_and_instruction() {
+        assert!(Config::parse("[[preset]]\nname = 'X'\ninstruction = ' '").is_err());
+        assert!(Config::parse("[[preset]]\nname = ''\ninstruction = 'Do it.'").is_err());
     }
 
     #[test]

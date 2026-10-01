@@ -324,16 +324,14 @@ fn parse_sse_line(line: &str) -> Sse {
     if let Some(e) = v.get("error") {
         return Sse::Error(e.get("message").and_then(Value::as_str).unwrap_or("server error").to_owned());
     }
-    if let Some(reason) = v.pointer("/choices/0/finish_reason").and_then(Value::as_str) {
-        match reason {
-            "stop" => {}
-            "length" => return Sse::Error("the model stopped at its token limit; the rewrite is incomplete".into()),
-            _ => {
-                return Sse::Error(format!(
-                    "the model stopped with finish reason {reason:?}; the rewrite is incomplete"
-                ));
-            }
+    // Only reasons that mean "cut short" fail: servers differ in how they name a
+    // normal ending (`stop`, `eos_token`, `stop_sequence`, an empty string, …).
+    match v.pointer("/choices/0/finish_reason").and_then(Value::as_str) {
+        Some("length") => return Sse::Error("the model stopped at its token limit; the rewrite is incomplete".into()),
+        Some(reason @ ("content_filter" | "abort")) => {
+            return Sse::Error(format!("the model stopped with finish reason {reason:?}; the rewrite is incomplete"));
         }
+        _ => {}
     }
     match v.pointer("/choices/0/delta/content").and_then(Value::as_str) {
         Some(s) if !s.is_empty() => Sse::Delta(s.to_owned()),
@@ -436,6 +434,18 @@ mod tests {
         .await;
         let error = Client::new(&base, None, "test".into(), false, 8192).complete(&request()).await.unwrap_err();
         assert!(error.to_string().contains("content_filter"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn other_normal_endings_are_accepted() {
+        for reason in ["eos_token", "stop_sequence", ""] {
+            let body = format!(
+                "data: {{\"choices\":[{{\"delta\":{{\"content\":\"Done\"}},\"finish_reason\":\"{reason}\"}}]}}\n\ndata: [DONE]\n\n"
+            );
+            let base = serve(vec![("/v1/chat/completions", "", body)]).await.0;
+            let text = Client::new(&base, None, "test".into(), false, 8192).complete(&request()).await.unwrap();
+            assert_eq!(text, "Done", "{reason:?}");
+        }
     }
 
     #[tokio::test]

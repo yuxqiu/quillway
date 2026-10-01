@@ -22,6 +22,7 @@ enum Command {
     /// Run the resident daemon (normally via the systemd user service).
     Daemon,
     /// Show the popup, or hide it if it is open. Bind this to a key in your compositor.
+    /// With `--stdin`, an open popup is kept and the command fails, so the text isn't lost.
     Toggle(SourceArg),
     /// Show the popup.
     Show(SourceArg),

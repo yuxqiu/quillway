@@ -63,7 +63,10 @@ pub async fn run(cmd: ModelsCmd) -> anyhow::Result<()> {
             }
             install(e).await?;
             println!("installed {} → {}", e.name, e.path_in(&paths::models_dir()).display());
-            if models::active(&config).id != e.id {
+            if models::active(&config).id == e.id {
+                // A daemon started before the download shows "not installed" until told.
+                reload_daemon().await;
+            } else {
                 println!("make it active with `quillway models use {}`", e.id);
             }
             Ok(())
