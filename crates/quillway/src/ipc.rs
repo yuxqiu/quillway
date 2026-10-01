@@ -1,6 +1,7 @@
 //! Unix-socket IPC: the CLI sends one JSON line, the daemon answers with one.
 
 use std::sync::{Arc, Mutex};
+use std::{os::unix::fs::PermissionsExt, path::Path};
 
 use anyhow::{Context, bail};
 use futures_util::Stream;
@@ -58,11 +59,17 @@ impl std::fmt::Debug for Reply {
 /// replacing a stale one but refusing to steal a live daemon's.
 pub fn bind() -> anyhow::Result<std::os::unix::net::UnixListener> {
     let path = paths::socket();
-    if std::os::unix::net::UnixStream::connect(&path).is_ok() {
+    bind_at(&path)
+}
+
+fn bind_at(path: &Path) -> anyhow::Result<std::os::unix::net::UnixListener> {
+    if std::os::unix::net::UnixStream::connect(path).is_ok() {
         bail!("another quillway daemon is already running ({})", path.display());
     }
-    let _ = std::fs::remove_file(&path);
-    let l = std::os::unix::net::UnixListener::bind(&path).with_context(|| format!("binding {}", path.display()))?;
+    let _ = std::fs::remove_file(path);
+    let l = std::os::unix::net::UnixListener::bind(path).with_context(|| format!("binding {}", path.display()))?;
+    // `XDG_RUNTIME_DIR` is normally private, but the fallback socket lives in /tmp.
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     l.set_nonblocking(true)?;
     Ok(l)
 }
@@ -102,4 +109,18 @@ async fn handle(stream: UnixStream, tx: mpsc::Sender<(Request, Reply)>) -> anyho
     out.push('\n');
     w.write_all(out.as_bytes()).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn socket_is_private_and_a_second_daemon_cannot_take_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("quillway.sock");
+        let _listener = bind_at(&path).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(bind_at(&path).unwrap_err().to_string().contains("already running"));
+    }
 }

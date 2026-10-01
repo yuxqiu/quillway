@@ -175,6 +175,7 @@ impl Popup {
 
     /// Hand edits go into an "Edited" draft, so Ctrl+Z restores the model's text.
     fn keep_edit(&mut self) {
+        self.error = None; // it was about the text before this edit
         let text = self.draft_editor.text();
         let Some(last) = self.drafts.last_mut() else { return };
         if last.edited {
@@ -250,13 +251,21 @@ pub enum InstallEvent {
 #[derive(Debug, Clone)]
 pub enum Message {
     Ipc(Request, Reply),
-    Captured { id: u64, text: Option<String>, error: Option<String> },
+    Captured {
+        id: u64,
+        text: Option<String>,
+        error: Option<String>,
+    },
     Input(String),
     Edit(text_editor::Action),
     Submit,
     Preset(usize),
     Gen(u64, GenEvent),
     Shortcut(Shortcut),
+    /// A mouse press, which may have moved the keyboard focus to the other box.
+    Clicked(window::Id),
+    /// The box that has the keyboard after a click; `None` if the click unfocused both.
+    Focused(window::Id, Option<Field>),
     Resized(Size),
     Tick(Instant),
     Engine(u64, Result<(), String>),
@@ -306,6 +315,9 @@ impl App {
         let mut subs = vec![
             Subscription::run(ipc_stream).map(|(req, reply)| Message::Ipc(req, reply)),
             event::listen_with(shortcut),
+            event::listen_with(|event, _, id| {
+                matches!(event, Event::Mouse(iced::mouse::Event::ButtonPressed(_))).then_some(Message::Clicked(id))
+            }),
             window::close_events().map(Message::WindowClosed),
         ];
         if self.animating() {
@@ -341,6 +353,33 @@ impl App {
             Message::Preset(i) => self.run_preset(i),
             Message::Gen(id, ev) => self.on_gen(id, ev),
             Message::Shortcut(s) => self.on_shortcut(s),
+            Message::Clicked(id) => match self.popup.as_ref().filter(|p| p.id == id).map(Popup::phase) {
+                Some(Phase::Composing | Phase::Reviewing) => {
+                    iced::widget::operation::is_focused(INPUT_ID).then(move |input| {
+                        if input {
+                            Task::done(Message::Focused(id, Some(Field::Instruction)))
+                        } else {
+                            iced::widget::operation::is_focused(SOURCE_ID)
+                                .map(move |source| Message::Focused(id, source.then_some(Field::Source)))
+                        }
+                    })
+                }
+                _ => Task::none(),
+            },
+            Message::Focused(id, field) => {
+                // Keep `field` in step with clicks, so Tab and the shortcuts act on the focused box;
+                // a click on neither box gives the keyboard back to `field`'s.
+                let Some(p) = self.popup.as_mut().filter(|p| p.id == id && p.generation.is_none()) else {
+                    return Task::none();
+                };
+                match field {
+                    Some(f) => {
+                        p.field = f;
+                        Task::none()
+                    }
+                    None => focus(p.field),
+                }
+            }
             Message::Resized(size) => self.on_resize(size),
             Message::Tick(now) => {
                 self.now = now;
@@ -521,7 +560,7 @@ impl App {
         self.popup = Some(Popup {
             id,
             field: if text.trim().is_empty() { Field::Source } else { Field::Instruction },
-            source: text_editor::Content::with_text(&text),
+            source: editor_content(&text),
             original: text,
             origin,
             input: String::new(),
@@ -754,7 +793,7 @@ impl App {
                     Field::Source => Field::Instruction,
                 };
                 if p.editing() {
-                    p.draft_editor = text_editor::Content::with_text(&p.base());
+                    p.draft_editor = editor_content(&p.base());
                 }
                 focus(p.field)
             }
@@ -774,6 +813,7 @@ impl App {
             }
             (Shortcut::Undo, Phase::Reviewing) => {
                 p.drafts.pop();
+                p.error = None;
                 p.show_diff = p.drafts.last().is_some_and(|d| d.show_diff);
                 Task::none()
             }
@@ -785,6 +825,11 @@ impl App {
     fn copy(&mut self) -> Task<Message> {
         let Some(p) = self.popup.as_mut() else { return Task::none() };
         let Some(d) = p.drafts.last() else { return Task::none() };
+        // Only a hand edit can be empty; copying it would just clear the clipboard.
+        if d.text.trim().is_empty() {
+            p.error = Some("Nothing to copy: the text is empty. Ctrl+Z restores the previous draft.".into());
+            return Task::none();
+        }
         match quillway_wl::copy(&d.text) {
             // Closing at once is the confirmation; the user is waiting to paste.
             Ok(()) => self.hide(),
@@ -898,6 +943,13 @@ fn ipc_stream() -> impl Stream<Item = (Request, Reply)> {
     ipc::serve(listener)
 }
 
+/// With the cursor at the end, ready to add to the text.
+fn editor_content(text: &str) -> text_editor::Content {
+    let mut content = text_editor::Content::with_text(text);
+    content.perform(text_editor::Action::Move(text_editor::Motion::DocumentEnd));
+    content
+}
+
 fn focus(field: Field) -> Task<Message> {
     iced::widget::operation::focus(match field {
         Field::Instruction => INPUT_ID,
@@ -991,8 +1043,8 @@ mod tests {
         let mut app = reviewing_app();
         let _ = app.update(Message::Shortcut(Shortcut::Tab));
         assert!(app.popup.as_ref().unwrap().editing());
-        type_char(&mut app, '>');
         type_char(&mut app, ' ');
+        type_char(&mut app, ':');
         // Whole-draft shortcuts belong to the editor while it has the keyboard.
         for s in [Shortcut::Undo, Shortcut::Retry, Shortcut::Copy] {
             let _ = app.update(Message::Shortcut(s));
@@ -1000,7 +1052,7 @@ mod tests {
         let p = app.popup.as_ref().unwrap();
         assert!(p.generation.is_none() && p.editing());
         assert_eq!(p.drafts.len(), 2, "consecutive edits make one draft");
-        assert_eq!((p.drafts[1].text.as_str(), p.drafts[1].label.as_str()), ("> They're here.", "Edited"));
+        assert_eq!((p.drafts[1].text.as_str(), p.drafts[1].label.as_str()), ("They're here. :", "Edited"));
 
         let _ = app.update(Message::Shortcut(Shortcut::Tab));
         let _ = app.update(Message::Shortcut(Shortcut::Retry)); // nothing to retry for a hand edit
@@ -1031,10 +1083,49 @@ mod tests {
         type_char(&mut app, '!');
         let _ = app.update(Message::Preset(0));
         let p = app.popup.as_ref().unwrap();
-        assert_eq!(p.generation.as_ref().unwrap().request.text, "!They're here.");
+        assert_eq!(p.generation.as_ref().unwrap().request.text, "They're here.!");
         let _ = app.update(Message::Gen(1, GenEvent::Delta("They're here!".into())));
         let _ = app.update(Message::Gen(1, GenEvent::Done));
         assert!(!app.popup.as_ref().unwrap().editing());
+    }
+
+    #[test]
+    fn clicking_the_instruction_while_editing_stops_editing() {
+        let mut app = reviewing_app();
+        let id = app.popup.as_ref().unwrap().id;
+        let _ = app.update(Message::Shortcut(Shortcut::Tab));
+        let _ = app.update(Message::Focused(id, None)); // a click on neither box
+        assert!(app.popup.as_ref().unwrap().editing());
+        let _ = app.update(Message::Focused(id, Some(Field::Instruction)));
+        assert!(!app.popup.as_ref().unwrap().editing());
+        let _ = app.update(Message::Shortcut(Shortcut::Undo)); // a whole-draft shortcut works again
+        assert_eq!(app.popup.as_ref().unwrap().phase(), Phase::Composing);
+    }
+
+    #[test]
+    fn a_late_focus_result_cannot_change_a_new_popup() {
+        let mut app = reviewing_app();
+        let old = app.popup.as_ref().unwrap().id;
+        let _ = app.update(Message::Ipc(Request::Hide, reply()));
+        let _ = app.update(Message::Ipc(Request::Show { input: Input::Text("new text".into()) }, reply()));
+        let current = app.popup.as_ref().unwrap().id;
+        assert_ne!(old, current);
+        let _ = app.update(Message::Focused(old, Some(Field::Source)));
+        assert_eq!(app.popup.as_ref().unwrap().field, Field::Instruction);
+    }
+
+    #[test]
+    fn an_emptied_draft_is_not_copied() {
+        let mut app = reviewing_app();
+        let _ = app.update(Message::Shortcut(Shortcut::Tab));
+        let _ = app.update(Message::Edit(text_editor::Action::SelectAll));
+        let _ = app.update(Message::Edit(text_editor::Action::Edit(text_editor::Edit::Backspace)));
+        let _ = app.update(Message::Shortcut(Shortcut::Tab));
+        let _ = app.update(Message::Submit);
+        let p = app.popup.as_ref().expect("still open");
+        assert!(p.error.as_deref().is_some_and(|e| e.starts_with("Nothing to copy")));
+        let _ = app.update(Message::Shortcut(Shortcut::Undo));
+        assert_eq!(app.popup.as_ref().unwrap().error, None, "the error was about the undone text");
     }
 
     #[test]

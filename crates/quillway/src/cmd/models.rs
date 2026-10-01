@@ -99,6 +99,9 @@ pub async fn run(cmd: ModelsCmd) -> anyhow::Result<()> {
             let path = e.path_in(&paths::models_dir());
             if download::remove(&path)? {
                 println!("removed {}", path.display());
+                if models::active(&config).id == e.id {
+                    reload_daemon().await;
+                }
             } else {
                 println!("{} is not installed", e.name);
             }
@@ -154,7 +157,9 @@ async fn install(e: &Entry) -> anyhow::Result<()> {
 
 /// Tell a running daemon to pick up the change; fine if none is running.
 async fn reload_daemon() {
-    if crate::ipc::send(&Request::Reload).await.is_ok() {
-        println!("daemon reloaded");
+    match crate::ipc::send(&Request::Reload).await {
+        Ok(quillway_core::ipc::Response::Ok) => println!("daemon reloaded"),
+        Ok(quillway_core::ipc::Response::Error { message }) => eprintln!("daemon reload failed: {message}"),
+        _ => {}
     }
 }
