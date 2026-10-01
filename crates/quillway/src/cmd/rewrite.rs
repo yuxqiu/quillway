@@ -51,17 +51,25 @@ pub async fn run(a: RewriteArgs) -> anyhow::Result<()> {
     let t0 = std::time::Instant::now();
     // Share the daemon's model server; load our own only when no daemon runs.
     // `_engine` keeps that own server alive until we finish.
-    let (client, model, sampling, _engine) = match crate::ipc::send(&Request::Connect).await {
+    let daemon = match crate::ipc::send(&Request::Connect).await {
         Ok(Response::Server { base, api_key, model, llama, context, sampling }) => {
-            (Client::new(&base, api_key, model.clone(), llama, context), model, sampling, None)
+            Some((Client::new(&base, api_key, model.clone(), llama, context), model, sampling))
+        }
+        // A daemon older than this command doesn't know `connect`.
+        Ok(Response::Error { message }) if message.starts_with("bad request") => {
+            eprintln!("quillway: the running daemon is outdated; restart it to share its model server");
+            None
         }
         Ok(Response::Error { message }) => bail!("daemon: {message}"),
         Ok(other) => bail!("unexpected daemon response: {other:?}"),
-        Err(_) => {
-            let engine = Engine::new(config);
-            let active = engine.active().await;
-            (engine.client().await?, active.name, active.sampling, Some(engine))
-        }
+        Err(_) => None,
+    };
+    let (client, model, sampling, _engine) = if let Some((client, model, sampling)) = daemon {
+        (client, model, sampling, None)
+    } else {
+        let engine = Engine::new(config);
+        let active = engine.active().await;
+        (engine.client().await?, active.name, active.sampling, Some(engine))
     };
     let loaded = t0.elapsed();
     let req = Rewrite { instruction, max_tokens: None, text: text.clone(), temperature, sampling };

@@ -22,6 +22,8 @@ pub struct Server {
     api_key: String,
     model: PathBuf,
     log: Log,
+    /// Tokens one request can use, as the running server reports it.
+    context: u32,
 }
 
 impl Server {
@@ -52,12 +54,19 @@ impl Server {
             tokio::spawn(collect(stderr, log.clone()));
         }
 
-        let mut server = Self { child, port, api_key, model: model.to_owned(), log };
+        let mut server = Self { child, port, api_key, model: model.to_owned(), log, context: cfg.context };
         if let Err(e) = server.wait_ready().await {
             // Stop it before reporting: a hung server would otherwise live on.
             let _ = server.child.kill().await;
             tokio::time::sleep(Duration::from_millis(100)).await; // let the last lines arrive
             bail!("{e}\n--- llama-server log (tail) ---\n{}", server.log_tail());
+        }
+        // `extra_args` may change `--ctx-size` or `--parallel` (which splits it).
+        match server.slot_context().await {
+            Ok(n) => server.context = n,
+            Err(e) => {
+                eprintln!("quillway: reading llama-server's context size failed, assuming {}: {e:#}", cfg.context);
+            }
         }
         Ok(server)
     }
@@ -82,6 +91,21 @@ impl Server {
         }
     }
 
+    /// The per-request context window from `/props`.
+    async fn slot_context(&self) -> anyhow::Result<u32> {
+        let http = reqwest::Client::builder().timeout(Duration::from_secs(5)).build()?;
+        let props: serde_json::Value = http
+            .get(format!("http://127.0.0.1:{}/props", self.port))
+            .bearer_auth(&self.api_key)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let n = props["default_generation_settings"]["n_ctx"].as_u64().context("no n_ctx in /props")?;
+        Ok(u32::try_from(n)?)
+    }
+
     pub fn log_tail(&self) -> String {
         let log = self.log.lock().unwrap_or_else(PoisonError::into_inner);
         log.iter().map(String::as_str).collect::<Vec<_>>().join("\n")
@@ -99,6 +123,11 @@ impl Server {
     #[must_use]
     pub fn api_key(&self) -> &str {
         &self.api_key
+    }
+
+    #[must_use]
+    pub const fn context(&self) -> u32 {
+        self.context
     }
 
     #[must_use]

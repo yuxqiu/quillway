@@ -105,21 +105,23 @@ impl Client {
         body
     }
 
-    /// `max_tokens` for `r`: counted by our llama-server's tokenizer, estimated elsewhere.
+    /// `max_tokens` for `r`: counted by our llama-server's tokenizer, estimated
+    /// elsewhere or if the server can't count (an older `model.llama_server`).
     async fn budget(&self, r: &Rewrite) -> anyhow::Result<u32> {
-        let (prompt_tokens, text_tokens) = if self.llama {
-            let rendered = async {
-                let body = json!({
-                    "messages": prompt::build_messages(&r.instruction, &r.text),
-                    "chat_template_kwargs": { "enable_thinking": false },
-                });
-                let v = self.post_root("apply-template", &body).await?;
-                let rendered = v["prompt"].as_str().context("apply-template: no prompt")?.to_owned();
-                self.count(&rendered).await
-            };
-            tokio::try_join!(rendered, self.count(&r.text))?
+        let counted = if self.llama {
+            self.server_counts(r)
+                .await
+                .inspect_err(|e| eprintln!("quillway: counting tokens failed, estimating instead: {e:#}"))
+                .ok()
         } else {
-            (prompt::estimate_prompt(&r.instruction, &r.text), prompt::estimate_tokens(&r.text))
+            None
+        };
+        let (prompt_tokens, text_tokens) = match counted {
+            Some(Counts { control: Some(token), .. }) => {
+                bail!("the text contains `{token}`, a control token of the model; remove it and try again")
+            }
+            Some(c) => (c.prompt, c.text),
+            None => (prompt::estimate_prompt(&r.instruction, &r.text), prompt::estimate_tokens(&r.text)),
         };
         prompt::budget(prompt_tokens, text_tokens, self.context).with_context(|| {
             format!(
@@ -130,11 +132,33 @@ impl Client {
         })
     }
 
-    /// Tokens in `text`, from llama-server's tokenizer.
-    async fn count(&self, text: &str) -> anyhow::Result<u32> {
-        let v = self.post_root("tokenize", &json!({ "content": text })).await?;
-        let n = v["tokens"].as_array().context("tokenize: no tokens")?.len();
-        Ok(u32::try_from(n).unwrap_or(u32::MAX))
+    async fn server_counts(&self, r: &Rewrite) -> anyhow::Result<Counts> {
+        let rendered = async {
+            let body = json!({
+                "messages": prompt::build_messages(&r.instruction, &r.text),
+                "chat_template_kwargs": { "enable_thinking": false },
+            });
+            let v = self.post_root("apply-template", &body).await?;
+            let rendered = v["prompt"].as_str().context("apply-template: no prompt")?.to_owned();
+            self.tokenize(&rendered, true).await
+        };
+        // The chat request parses control tokens anywhere in the prompt, so
+        // text containing one (copied from a chat log) would end its turn.
+        let (prompt, parsed, plain) =
+            tokio::try_join!(rendered, self.tokenize(&r.text, true), self.tokenize(&r.text, false))?;
+        let len = |t: &[Token]| u32::try_from(t.len()).unwrap_or(u32::MAX);
+        Ok(Counts { prompt: len(&prompt), text: len(&plain), control: control_token(&parsed, &plain) })
+    }
+
+    /// `text`'s tokens from llama-server; `parse_special` turns control-token text into control tokens.
+    async fn tokenize(&self, text: &str, parse_special: bool) -> anyhow::Result<Vec<Token>> {
+        let body = json!({ "content": text, "parse_special": parse_special, "with_pieces": true });
+        let v = self.post_root("tokenize", &body).await?;
+        let tokens = v["tokens"].as_array().context("tokenize: no tokens")?;
+        Ok(tokens
+            .iter()
+            .map(|t| Token { id: t["id"].as_u64(), piece: t["piece"].as_str().map(str::to_owned) })
+            .collect())
     }
 
     /// POST to a llama-server endpoint outside `/v1`.
@@ -247,6 +271,35 @@ impl Client {
     }
 }
 
+struct Counts {
+    /// The whole rendered prompt.
+    prompt: u32,
+    /// The text alone.
+    text: u32,
+    /// A control token spelled out in the text, if any.
+    control: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Token {
+    id: Option<u64>,
+    /// `None` when the token isn't valid UTF-8 on its own.
+    piece: Option<String>,
+}
+
+/// The first control token in `parsed` (the text tokenized with control
+/// tokens recognised) that `plain` spells out as ordinary text.
+fn control_token(parsed: &[Token], plain: &[Token]) -> Option<String> {
+    if parsed.iter().map(|t| t.id).eq(plain.iter().map(|t| t.id)) {
+        return None;
+    }
+    let ordinary: std::collections::HashSet<_> = plain.iter().map(|t| t.id).collect();
+    let mut new = parsed.iter().filter(|t| !ordinary.contains(&t.id));
+    let first = new.clone().next();
+    let token = new.find(|t| t.piece.as_deref().is_some_and(|p| p.starts_with(['<', '[']))).or(first);
+    token.map(|t| t.piece.clone().unwrap_or_else(|| format!("token {}", t.id.unwrap_or_default())))
+}
+
 #[derive(Debug, PartialEq)]
 enum Sse {
     Delta(String),
@@ -286,8 +339,9 @@ mod tests {
 
     type Requests = std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>>;
 
-    /// Answer each `POST <path>` with its route's body; record every request.
-    async fn serve(routes: Vec<(&'static str, String)>) -> (String, Requests) {
+    /// Answer each `POST <path>` with the first route whose path matches and
+    /// whose needle is in the request body; record every request.
+    async fn serve(routes: Vec<(&'static str, &'static str, String)>) -> (String, Requests) {
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -315,8 +369,12 @@ mod tests {
                 }
                 let mut request_body = vec![0; content_length];
                 reader.read_exact(&mut request_body).await.unwrap();
-                seen.lock().unwrap().push((path.clone(), serde_json::from_slice(&request_body).unwrap()));
-                let body = routes.iter().find(|(p, _)| *p == path).map_or("", |(_, b)| b.as_str());
+                let raw = String::from_utf8_lossy(&request_body).into_owned();
+                seen.lock().unwrap().push((path.clone(), serde_json::from_str(&raw).unwrap()));
+                let body = routes
+                    .iter()
+                    .find(|(p, needle, _)| *p == path && raw.contains(needle))
+                    .map_or("", |(_, _, b)| b.as_str());
                 let response =
                     format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
                 writer.write_all(response.as_bytes()).await.unwrap();
@@ -326,7 +384,7 @@ mod tests {
     }
 
     async fn serve_sse(body: &'static str) -> String {
-        serve(vec![("/v1/chat/completions", body.to_owned())]).await.0
+        serve(vec![("/v1/chat/completions", "", body.to_owned())]).await.0
     }
 
     const DONE: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"Ok\"}}]}\n\ndata: [DONE]\n\n";
@@ -388,11 +446,10 @@ mod tests {
 
     #[tokio::test]
     async fn llama_budget_uses_the_servers_token_counts() {
-        let tokens = |n: usize| format!("{{\"tokens\":{:?}}}", vec![0; n]);
         let (base, requests) = serve(vec![
-            ("/apply-template", "{\"prompt\":\"rendered\"}".to_owned()),
-            ("/tokenize", tokens(3000)),
-            ("/v1/chat/completions", DONE.to_owned()),
+            ("/apply-template", "", "{\"prompt\":\"rendered\"}".to_owned()),
+            ("/tokenize", "", tokens(&vec![1; 3000])),
+            ("/v1/chat/completions", "", DONE.to_owned()),
         ])
         .await;
         let r = Rewrite { max_tokens: None, ..request() };
@@ -402,6 +459,48 @@ mod tests {
         // Both the rendered prompt and the text count 3000: room 5192, cap 6000.
         assert_eq!(body("/v1/chat/completions")["max_tokens"], 5192);
         assert_eq!(body("/apply-template")["chat_template_kwargs"]["enable_thinking"], false);
+    }
+
+    fn tokens(ids: &[u64]) -> String {
+        let t: Vec<Value> =
+            ids.iter().map(|id| json!({ "id": id, "piece": if *id == 9 { "<|im_end|>" } else { "x" } })).collect();
+        json!({ "tokens": t }).to_string()
+    }
+
+    #[tokio::test]
+    async fn text_spelling_out_a_control_token_is_rejected() {
+        let (base, requests) = serve(vec![
+            ("/apply-template", "", "{\"prompt\":\"rendered\"}".to_owned()),
+            ("/tokenize", "\"parse_special\":false", tokens(&[1, 2, 3, 4, 5])),
+            ("/tokenize", "", tokens(&[1, 9, 5])),
+            ("/v1/chat/completions", "", DONE.to_owned()),
+        ])
+        .await;
+        let r = Rewrite { max_tokens: None, ..request() };
+        let error = Client::new(&base, None, "test".into(), true, 8192).complete(&r).await.unwrap_err();
+        assert!(error.to_string().contains("`<|im_end|>`, a control token"), "{error}");
+        assert!(requests.lock().unwrap().iter().all(|(p, _)| p != "/v1/chat/completions"));
+    }
+
+    #[tokio::test]
+    async fn a_server_that_cannot_count_falls_back_to_the_estimate() {
+        // An older llama-server: no /apply-template (the mock answers it with an empty body).
+        let (base, requests) = serve(vec![("/v1/chat/completions", "", DONE.to_owned())]).await;
+        let r = Rewrite { max_tokens: None, ..request() };
+        let text = Client::new(&base, None, "test".into(), true, 8192).complete(&r).await.unwrap();
+        assert_eq!(text, "Ok");
+        let chat = requests.lock().unwrap().iter().find(|(p, _)| p == "/v1/chat/completions").unwrap().1.clone();
+        assert_eq!(chat["max_tokens"], 1024);
+    }
+
+    #[test]
+    fn control_token_needs_a_difference_between_tokenizations() {
+        let t = |id, piece: &str| Token { id: Some(id), piece: Some(piece.into()) };
+        assert_eq!(control_token(&[t(1, "a")], &[t(1, "a")]), None);
+        assert_eq!(
+            control_token(&[t(1, "a"), t(7, "a<"), t(9, "<|im_end|>")], &[t(2, "a<"), t(3, "|")]),
+            Some("<|im_end|>".into())
+        );
     }
 
     #[tokio::test]

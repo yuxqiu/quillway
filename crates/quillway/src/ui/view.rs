@@ -162,7 +162,8 @@ impl App {
                 let d = p.drafts.last().expect("reviewing has a draft");
                 let n = p.drafts.len();
                 let steps = if n > 1 { format!(" ({n})") } else { String::new() };
-                format!("{}{} · {}", d.label, steps, d.stats)
+                let incomplete = if d.incomplete { " (incomplete)" } else { "" };
+                format!("{}{incomplete}{} · {}", d.label, steps, d.stats)
             }
             (Phase::Composing, _) => {
                 let n = p.source.text().chars().count();

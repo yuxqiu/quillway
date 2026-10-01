@@ -162,8 +162,13 @@ impl Config {
                 if path.is_empty() {
                     anyhow::bail!("`model.active = \"custom:\"` needs a model file path");
                 }
+                // The daemon's working directory is arbitrary, and `~` isn't expanded.
+                if !Path::new(path).is_absolute() {
+                    anyhow::bail!("`model.active`: the custom model path {path:?} must be absolute");
+                }
             } else if catalog::find(active).is_none() {
-                anyhow::bail!("unknown model {active:?} in `model.active`");
+                let ids: Vec<_> = catalog::all().iter().map(|e| e.id.as_str()).collect();
+                anyhow::bail!("unknown model {active:?} in `model.active`; available: {}", ids.join(", "));
             }
         }
         if config.model.endpoint.is_some() && config.model.endpoint_model.is_none() {
@@ -242,6 +247,21 @@ mod tests {
     fn unknown_active_model_is_rejected() {
         let error = Config::parse("[model]\nactive = 'qwen3.5-typo'").unwrap_err();
         assert!(error.to_string().contains("unknown model"), "{error}");
+    }
+
+    #[test]
+    fn unknown_active_model_error_lists_the_catalog() {
+        let error = Config::parse("[model]\nactive = 'qwen3.5-typo'").unwrap_err();
+        assert!(error.to_string().contains("available: qwen3.5-2b"), "{error}");
+    }
+
+    #[test]
+    fn custom_model_path_must_be_absolute() {
+        for path in ["models/x.gguf", "~/x.gguf"] {
+            let error = Config::parse(&format!("[model]\nactive = 'custom:{path}'")).unwrap_err();
+            assert!(error.to_string().contains("absolute"), "{error}");
+        }
+        assert!(Config::parse("[model]\nactive = 'custom:/m/x.gguf'").is_ok());
     }
 
     #[test]

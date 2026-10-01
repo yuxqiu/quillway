@@ -83,7 +83,8 @@ impl Engine {
                 server::Server::start(&active.path, &cfg).await.context("starting llama-server")?
             }
         };
-        let client = Client::new(&server.base_url(), Some(server.api_key().to_owned()), active.id, true, cfg.context);
+        let client =
+            Client::new(&server.base_url(), Some(server.api_key().to_owned()), active.id, true, server.context());
         inner.server = Some(server);
         Ok(client)
     }

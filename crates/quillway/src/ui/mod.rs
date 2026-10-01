@@ -112,6 +112,8 @@ pub struct Draft {
     pub label: String,
     pub stats: String,
     pub show_diff: bool,
+    /// Generation failed part-way; this is what arrived.
+    pub incomplete: bool,
     request: Rewrite,
 }
 
@@ -354,7 +356,18 @@ impl App {
                 reply.send(Response::Ok);
                 self.hide()
             }
-            Request::Toggle { .. } if self.capturing.is_some() => {
+            Request::Show { input: Input::Text(_) } if self.popup.is_some() => {
+                // Replacing the open popup could discard a draft; don't drop the text silently either.
+                reply.send(Response::Error {
+                    message: "the popup is already open; close it (Esc) and send again".into(),
+                });
+                Task::none()
+            }
+            Request::Show { .. } if self.popup.is_some() => {
+                reply.send(Response::Ok);
+                Task::none()
+            }
+            Request::Toggle { input: Input::Clipboard } if self.capturing.is_some() => {
                 // Pressed again while the clipboard is still being read: cancel.
                 reply.send(Response::Ok);
                 self.capturing = None;
@@ -362,11 +375,13 @@ impl App {
             }
             Request::Toggle { input } | Request::Show { input } => {
                 reply.send(Response::Ok);
-                if self.popup.is_some() || self.capturing.is_some() {
-                    return Task::none();
-                }
                 match input {
-                    Input::Text(t) => self.open(t, Origin::Editor, None),
+                    // Text sent explicitly wins over a clipboard read still in flight.
+                    Input::Text(t) => {
+                        self.capturing = None;
+                        self.open(t, Origin::Editor, None)
+                    }
+                    Input::Clipboard if self.capturing.is_some() => Task::none(),
                     Input::Clipboard if self.clipboard_recent() => {
                         let id = self.next_capture;
                         self.next_capture += 1;
@@ -646,9 +661,10 @@ impl App {
                     p.show_diff = g.show_diff;
                     p.drafts.push(Draft {
                         text: partial,
-                        label: format!("{} (incomplete)", g.label),
+                        label: g.label,
                         stats: "stopped early".into(),
                         show_diff: g.show_diff,
+                        incomplete: true,
                         request: g.request,
                     });
                 }
@@ -673,6 +689,7 @@ impl App {
                     label: g.label,
                     stats: format!("{secs:.1}s · {rate:.0} tok/s"),
                     show_diff: g.show_diff,
+                    incomplete: false,
                     request: g.request,
                 });
             }
@@ -929,8 +946,42 @@ mod tests {
         let p = app.popup.as_ref().unwrap();
         assert_eq!(p.phase(), Phase::Reviewing);
         assert_eq!(p.drafts[0].text, "They're here, and");
-        assert_eq!(p.drafts[0].label, "Proofread (incomplete)");
+        assert_eq!((p.drafts[0].label.as_str(), p.drafts[0].incomplete), ("Proofread", true));
         assert_eq!(p.error.as_deref(), Some("connection reset"));
+    }
+
+    #[test]
+    fn retry_of_an_incomplete_draft_replaces_it_with_a_complete_one() {
+        let mut app = generating_app();
+        let _ = app.update(Message::Gen(0, GenEvent::Delta("They're".into())));
+        let _ = app.update(Message::Gen(0, GenEvent::Error("connection reset".into())));
+        let _ = app.update(Message::Shortcut(Shortcut::Retry));
+        let _ = app.update(Message::Gen(1, GenEvent::Delta("They're here.".into())));
+        let _ = app.update(Message::Gen(1, GenEvent::Done));
+        let p = app.popup.as_ref().unwrap();
+        assert_eq!(p.drafts.len(), 1);
+        assert_eq!((p.drafts[0].label.as_str(), p.drafts[0].incomplete), ("Proofread", false));
+        assert_eq!(p.error, None);
+    }
+
+    #[test]
+    fn stdin_text_replaces_a_pending_clipboard_read() {
+        let (mut app, _) = App::boot(Config::default(), None);
+        let _ = app.update(Message::Ipc(Request::Show { input: Input::Clipboard }, reply()));
+        let _ = app.update(Message::Ipc(Request::Show { input: Input::Text("from editor".into()) }, reply()));
+        assert_eq!(app.popup.as_ref().unwrap().source.text(), "from editor");
+        let _ = app.update(Message::Captured { id: 0, text: Some("old clipboard".into()), error: None });
+        assert_eq!(app.popup.as_ref().unwrap().source.text(), "from editor");
+    }
+
+    #[test]
+    fn stdin_text_for_an_open_popup_is_refused_not_dropped() {
+        let (mut app, _) = App::boot(Config::default(), None);
+        let _ = app.update(Message::Ipc(Request::Show { input: Input::Text("first".into()) }, reply()));
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let _ = app.update(Message::Ipc(Request::Show { input: Input::Text("second".into()) }, Reply::new(tx)));
+        assert!(matches!(rx.try_recv(), Ok(Response::Error { .. })));
+        assert_eq!(app.popup.as_ref().unwrap().source.text(), "first");
     }
 
     #[test]
