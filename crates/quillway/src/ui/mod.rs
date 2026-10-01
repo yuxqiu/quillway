@@ -186,8 +186,9 @@ pub struct App {
     next_gen: u64,
     /// `None` if the compositor can't report clipboard changes.
     watch: Option<quillway_wl::ClipboardWatch>,
-    /// A clipboard read is in flight; a second toggle cancels it.
-    capturing: bool,
+    /// The current clipboard read; older results are ignored after cancellation.
+    capturing: Option<u64>,
+    next_capture: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -217,6 +218,7 @@ pub enum InstallEvent {
 pub enum Message {
     Ipc(Request, Reply),
     Captured {
+        id: u64,
         text: Option<String>,
         error: Option<String>,
     },
@@ -251,7 +253,8 @@ impl App {
             now: Instant::now(),
             next_gen: 0,
             watch,
-            capturing: false,
+            capturing: None,
+            next_capture: 0,
         };
         let warm = app.warm_up();
         (app, warm)
@@ -286,7 +289,7 @@ impl App {
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Ipc(req, reply) => self.ipc(req, &reply),
-            Message::Captured { text, error } => self.captured(text, error),
+            Message::Captured { id, text, error } => self.captured(id, text, error),
             Message::Input(s) => self.on_input(s),
             Message::Edit(action) => {
                 if let Some(p) = self.popup.as_mut().filter(|p| p.phase() == Phase::Composing) {
@@ -343,28 +346,31 @@ impl App {
                 reply.send(Response::Ok);
                 self.hide()
             }
-            Request::Toggle { .. } if self.capturing => {
+            Request::Toggle { .. } if self.capturing.is_some() => {
                 // Pressed again while the clipboard is still being read: cancel.
                 reply.send(Response::Ok);
-                self.capturing = false;
+                self.capturing = None;
                 Task::none()
             }
             Request::Toggle { input } | Request::Show { input } => {
                 reply.send(Response::Ok);
-                if self.popup.is_some() || self.capturing {
+                if self.popup.is_some() || self.capturing.is_some() {
                     return Task::none();
                 }
                 match input {
                     Input::Text(t) => self.open(t, Origin::Editor, None),
                     Input::Clipboard if self.clipboard_recent() => {
-                        self.capturing = true;
-                        Task::perform(read_clipboard(), |(text, error)| Message::Captured { text, error })
+                        let id = self.next_capture;
+                        self.next_capture += 1;
+                        self.capturing = Some(id);
+                        Task::perform(read_clipboard(), move |(text, error)| Message::Captured { id, text, error })
                     }
                     Input::Clipboard => self.open(String::new(), Origin::Typed, None),
                 }
             }
             Request::Hide => {
                 reply.send(Response::Ok);
+                self.capturing = None;
                 self.hide()
             }
             Request::Reload => match Config::load(&paths::config_file()) {
@@ -416,10 +422,11 @@ impl App {
         self.watch.as_ref().is_none_or(|w| w.last_change().is_some_and(|t| t.elapsed() < window))
     }
 
-    fn captured(&mut self, text: Option<String>, error: Option<String>) -> Task<Message> {
-        if !std::mem::take(&mut self.capturing) || self.popup.is_some() {
+    fn captured(&mut self, id: u64, text: Option<String>, error: Option<String>) -> Task<Message> {
+        if self.capturing != Some(id) || self.popup.is_some() {
             return Task::none(); // cancelled by a second toggle
         }
+        self.capturing = None;
         match text {
             Some(t) => self.open(t, Origin::Clipboard, error),
             _ => self.open(String::new(), Origin::Typed, error),
@@ -561,9 +568,9 @@ impl App {
             p.error = Some(format!("The text contains `{}`, which Quillway uses as a delimiter.", prompt::STOP));
             return Task::none();
         }
-        if !prompt::fits(&text, context) {
+        if !prompt::fits(&text, &instruction, context) {
             p.error = Some(format!(
-                "Too long for the model's {context}-token context ({} chars). Select less, or raise `model.context`.",
+                "Text or instruction is too long for the model's {context}-token context ({} source chars). Shorten it, or raise `model.context`.",
                 text.chars().count()
             ));
             return Task::none();
@@ -846,4 +853,35 @@ fn install_stream(entry: &'static Entry) -> impl Stream<Item = InstallEvent> {
         .await;
         let _ = out.send(InstallEvent::Done(r.map_err(|e| format!("{e:#}")))).await;
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reply() -> Reply {
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        Reply::new(tx)
+    }
+
+    #[test]
+    fn hide_during_clipboard_read_keeps_popup_closed() {
+        let (mut app, _) = App::boot(Config::default(), None);
+        let _ = app.update(Message::Ipc(Request::Show { input: Input::Clipboard }, reply()));
+        let _ = app.update(Message::Ipc(Request::Hide, reply()));
+        let _ = app.update(Message::Captured { id: 0, text: Some("old clipboard".into()), error: None });
+        assert!(app.popup.is_none());
+    }
+
+    #[test]
+    fn cancelled_clipboard_read_cannot_supply_a_new_show() {
+        let (mut app, _) = App::boot(Config::default(), None);
+        let _ = app.update(Message::Ipc(Request::Show { input: Input::Clipboard }, reply()));
+        let _ = app.update(Message::Ipc(Request::Toggle { input: Input::Clipboard }, reply()));
+        let _ = app.update(Message::Ipc(Request::Show { input: Input::Clipboard }, reply()));
+        let _ = app.update(Message::Captured { id: 0, text: Some("old clipboard".into()), error: None });
+        assert!(app.popup.is_none());
+        let _ = app.update(Message::Captured { id: 1, text: Some("new clipboard".into()), error: None });
+        assert_eq!(app.popup.as_ref().unwrap().source.text(), "new clipboard");
+    }
 }

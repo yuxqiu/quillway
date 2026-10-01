@@ -36,6 +36,10 @@ pub async fn send(req: &Request) -> anyhow::Result<Response> {
 pub struct Reply(Arc<Mutex<Option<oneshot::Sender<Response>>>>);
 
 impl Reply {
+    pub(crate) fn new(tx: oneshot::Sender<Response>) -> Self {
+        Self(Arc::new(Mutex::new(Some(tx))))
+    }
+
     pub fn send(&self, r: Response) {
         let tx = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
         if let Some(tx) = tx {
@@ -89,7 +93,7 @@ async fn handle(stream: UnixStream, tx: mpsc::Sender<(Request, Reply)>) -> anyho
     let resp = match serde_json::from_str::<Request>(&line) {
         Ok(req) => {
             let (otx, orx) = oneshot::channel();
-            tx.send((req, Reply(Arc::new(Mutex::new(Some(otx)))))).await?;
+            tx.send((req, Reply::new(otx))).await?;
             orx.await.unwrap_or_else(|_| Response::Error { message: "daemon dropped the request".into() })
         }
         Err(e) => Response::Error { message: format!("bad request: {e}") },

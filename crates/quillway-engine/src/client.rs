@@ -105,9 +105,15 @@ impl Client {
                         Sse::Skip => {}
                     }
                 }
-                match bytes.next().await? {
-                    Ok(chunk) => buf.extend_from_slice(&chunk),
-                    Err(e) => return Some((Err(e.into()), (bytes, buf, true))),
+                match bytes.next().await {
+                    None => {
+                        return Some((
+                            Err(anyhow::anyhow!("incomplete response: stream ended before [DONE]")),
+                            (bytes, buf, true),
+                        ));
+                    }
+                    Some(Ok(chunk)) => buf.extend_from_slice(&chunk),
+                    Some(Err(e)) => return Some((Err(e.into()), (bytes, buf, true))),
                 }
             }
         }))
@@ -146,6 +152,9 @@ fn parse_sse_line(line: &str) -> Sse {
     if let Some(e) = v.get("error") {
         return Sse::Error(e.get("message").and_then(Value::as_str).unwrap_or("server error").to_owned());
     }
+    if v.pointer("/choices/0/finish_reason").and_then(Value::as_str) == Some("length") {
+        return Sse::Error("the model stopped at its token limit; the rewrite is incomplete".into());
+    }
     match v.pointer("/choices/0/delta/content").and_then(Value::as_str) {
         Some(s) if !s.is_empty() => Sse::Delta(s.to_owned()),
         _ => Sse::Skip,
@@ -155,6 +164,73 @@ fn parse_sse_line(line: &str) -> Sse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn serve_sse(body: &'static str) -> String {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = socket.into_split();
+            let mut reader = tokio::io::BufReader::new(reader);
+            let mut content_length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = value.trim().parse().unwrap();
+                }
+            }
+            let mut request_body = vec![0; content_length];
+            reader.read_exact(&mut request_body).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            writer.write_all(response.as_bytes()).await.unwrap();
+        });
+        base
+    }
+
+    fn request() -> Rewrite {
+        Rewrite {
+            instruction: "Proofread".into(),
+            text: "hello".into(),
+            temperature: 0.2,
+            sampling: Sampling { top_p: 0.8, top_k: 20, min_p: 0.0 },
+            max_tokens: 128,
+        }
+    }
+
+    #[tokio::test]
+    async fn incomplete_stream_is_an_error() {
+        let base = serve_sse("data: {\"choices\":[{\"delta\":{\"content\":\"Partial\"}}]}\n\n").await;
+        let error = Client::new(&base, None, "test".into(), false).complete(&request()).await.unwrap_err();
+        assert!(error.to_string().contains("incomplete"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn token_limit_is_an_error() {
+        let base = serve_sse(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Partial\"}}]}\n\n\
+             data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n\
+             data: [DONE]\n\n",
+        )
+        .await;
+        let error = Client::new(&base, None, "test".into(), false).complete(&request()).await.unwrap_err();
+        assert!(error.to_string().contains("token limit"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn complete_stream_returns_text() {
+        let base = serve_sse("data: {\"choices\":[{\"delta\":{\"content\":\"Complete\"}}]}\n\ndata: [DONE]\n\n").await;
+        let text = Client::new(&base, None, "test".into(), false).complete(&request()).await.unwrap();
+        assert_eq!(text, "Complete");
+    }
 
     #[test]
     fn parses_sse() {

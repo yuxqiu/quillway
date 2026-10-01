@@ -73,12 +73,12 @@ pub fn max_tokens(text: &str, context: u32) -> u32 {
     est_input.saturating_mul(3).saturating_div(2).saturating_add(64).clamp(128, (context / 2).max(128))
 }
 
-/// Whether `text` plus a rewrite of similar length fits in the context window.
+/// Whether `text`, `instruction`, and a rewrite of similar length fit in the context window.
 /// (~3 chars per token is conservative for English; the prefix is ~400 tokens.)
 #[must_use]
-pub fn fits(text: &str, context: u32) -> bool {
+pub fn fits(text: &str, instruction: &str, context: u32) -> bool {
     let est = est_tokens(text);
-    est.saturating_add(est.max(128)).saturating_add(400) <= context
+    est.saturating_add(est_tokens(instruction)).saturating_add(est.max(128)).saturating_add(400) <= context
 }
 
 /// ~3 characters per token: conservative for English.
@@ -101,8 +101,13 @@ mod tests {
 
     #[test]
     fn long_text_does_not_fit() {
-        assert!(fits(&"x".repeat(9000), 8192));
-        assert!(!fits(&"x".repeat(12_000), 8192));
+        assert!(fits(&"x".repeat(9000), "Proofread", 8192));
+        assert!(!fits(&"x".repeat(12_000), "Proofread", 8192));
+    }
+
+    #[test]
+    fn long_instruction_does_not_fit() {
+        assert!(!fits("hi", &"x".repeat(30_000), 8192));
     }
 
     #[test]

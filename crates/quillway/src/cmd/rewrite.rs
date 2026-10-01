@@ -47,8 +47,11 @@ pub async fn run(a: RewriteArgs) -> anyhow::Result<()> {
     if text.contains(prompt::STOP) {
         bail!("the text contains `{}`, which Quillway uses as a delimiter", prompt::STOP);
     }
-    if !prompt::fits(&text, config.model.context) {
-        bail!("input is too long for the model's {}-token context; raise `model.context`", config.model.context);
+    if !prompt::fits(&text, &instruction, config.model.context) {
+        bail!(
+            "text or instruction is too long for the model's {}-token context; raise `model.context`",
+            config.model.context
+        );
     }
     let engine = Engine::new(config.clone());
     let active = engine.active().await;
