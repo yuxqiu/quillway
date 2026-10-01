@@ -15,7 +15,7 @@ inputs.quillway.url = "github:yuxqiu/quillway";
 imports = [ inputs.quillway.homeManagerModules.default ];
 services.quillway = {
   enable = true;
-  # package = inputs.quillway.packages.${pkgs.system}.quillway-rocm;   # default: Vulkan
+  # package = inputs.quillway.packages.${pkgs.system}.quillway-rocm;   # default: Vulkan; ROCm is x86_64 only
   settings = { };                                                     # see "Configuration"
 };
 ```

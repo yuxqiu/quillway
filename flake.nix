@@ -47,6 +47,9 @@
           default = quillway; # Vulkan llama.cpp: AMD, Intel and NVIDIA GPUs
           quillway = quillway;
           quillway-cpu = quillway.override { llamaCpp = pkgs.llama-cpp; };
+        }
+        # nixpkgs builds ROCm for x86_64 only.
+        // nixpkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isx86_64 {
           quillway-rocm = quillway.override { llamaCpp = pkgs.llama-cpp-rocm; };
         }
       );
