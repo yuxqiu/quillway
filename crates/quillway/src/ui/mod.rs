@@ -352,16 +352,18 @@ impl App {
 
     fn ipc(&mut self, req: Request, reply: &Reply) -> Task<Message> {
         match req {
-            Request::Toggle { .. } if self.popup.is_some() => {
-                reply.send(Response::Ok);
-                self.hide()
-            }
-            Request::Show { input: Input::Text(_) } if self.popup.is_some() => {
+            Request::Toggle { input: Input::Text(_) } | Request::Show { input: Input::Text(_) }
+                if self.popup.is_some() =>
+            {
                 // Replacing the open popup could discard a draft; don't drop the text silently either.
                 reply.send(Response::Error {
                     message: "the popup is already open; close it (Esc) and send again".into(),
                 });
                 Task::none()
+            }
+            Request::Toggle { .. } if self.popup.is_some() => {
+                reply.send(Response::Ok);
+                self.hide()
             }
             Request::Show { .. } if self.popup.is_some() => {
                 reply.send(Response::Ok);
@@ -398,14 +400,19 @@ impl App {
             }
             Request::Reload => match Config::load(&paths::config_file()) {
                 Ok(config) => {
-                    reply.send(Response::Ok);
                     self.presets = config.presets();
                     self.active = models::active(&config);
                     self.palette = style::Palette::new(&config.ui);
                     self.config = config.clone();
                     let engine = self.engine.clone();
-                    let reload =
-                        Task::perform(async move { engine.reload(config).await }, |()| Message::Tick(Instant::now()));
+                    let reply = reply.clone();
+                    let reload = Task::perform(
+                        async move {
+                            engine.reload(config).await;
+                            reply.send(Response::Ok);
+                        },
+                        |()| Message::Tick(Instant::now()),
+                    );
                     reload.chain(self.warm_up())
                 }
                 Err(e) => {
@@ -978,10 +985,15 @@ mod tests {
     fn stdin_text_for_an_open_popup_is_refused_not_dropped() {
         let (mut app, _) = App::boot(Config::default(), None);
         let _ = app.update(Message::Ipc(Request::Show { input: Input::Text("first".into()) }, reply()));
-        let (tx, mut rx) = tokio::sync::oneshot::channel();
-        let _ = app.update(Message::Ipc(Request::Show { input: Input::Text("second".into()) }, Reply::new(tx)));
-        assert!(matches!(rx.try_recv(), Ok(Response::Error { .. })));
-        assert_eq!(app.popup.as_ref().unwrap().source.text(), "first");
+        for req in [
+            Request::Show { input: Input::Text("second".into()) },
+            Request::Toggle { input: Input::Text("third".into()) },
+        ] {
+            let (tx, mut rx) = tokio::sync::oneshot::channel();
+            let _ = app.update(Message::Ipc(req, Reply::new(tx)));
+            assert!(matches!(rx.try_recv(), Ok(Response::Error { .. })));
+            assert_eq!(app.popup.as_ref().unwrap().source.text(), "first");
+        }
     }
 
     #[test]

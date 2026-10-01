@@ -109,20 +109,28 @@ impl Client {
     /// elsewhere or if the server can't count (an older `model.llama_server`).
     async fn budget(&self, r: &Rewrite) -> anyhow::Result<u32> {
         let counted = if self.llama {
-            self.server_counts(r)
-                .await
-                .inspect_err(|e| eprintln!("quillway: counting tokens failed, estimating instead: {e:#}"))
-                .ok()
+            match tokio::try_join!(self.tokenize(&r.text, true), self.tokenize(&r.text, false)) {
+                Ok((parsed, plain)) => {
+                    if let Some(token) = control_token(&parsed, &plain) {
+                        bail!("the text contains `{token}`, a control token of the model; remove it and try again");
+                    }
+                    self.server_counts(r, &plain)
+                        .await
+                        .inspect_err(|e| eprintln!("quillway: counting tokens failed, estimating instead: {e:#}"))
+                        .ok()
+                }
+                Err(e) => {
+                    eprintln!("quillway: checking text tokens failed, estimating instead: {e:#}");
+                    None
+                }
+            }
         } else {
             None
         };
-        let (prompt_tokens, text_tokens) = match counted {
-            Some(Counts { control: Some(token), .. }) => {
-                bail!("the text contains `{token}`, a control token of the model; remove it and try again")
-            }
-            Some(c) => (c.prompt, c.text),
-            None => (prompt::estimate_prompt(&r.instruction, &r.text), prompt::estimate_tokens(&r.text)),
-        };
+        let (prompt_tokens, text_tokens) = counted.map_or_else(
+            || (prompt::estimate_prompt(&r.instruction, &r.text), prompt::estimate_tokens(&r.text)),
+            |c| (c.prompt, c.text),
+        );
         prompt::budget(prompt_tokens, text_tokens, self.context).with_context(|| {
             format!(
                 "the text is too long for the model's {}-token context ({prompt_tokens} tokens with the prompt); \
@@ -132,22 +140,16 @@ impl Client {
         })
     }
 
-    async fn server_counts(&self, r: &Rewrite) -> anyhow::Result<Counts> {
-        let rendered = async {
-            let body = json!({
-                "messages": prompt::build_messages(&r.instruction, &r.text),
-                "chat_template_kwargs": { "enable_thinking": false },
-            });
-            let v = self.post_root("apply-template", &body).await?;
-            let rendered = v["prompt"].as_str().context("apply-template: no prompt")?.to_owned();
-            self.tokenize(&rendered, true).await
-        };
-        // The chat request parses control tokens anywhere in the prompt, so
-        // text containing one (copied from a chat log) would end its turn.
-        let (prompt, parsed, plain) =
-            tokio::try_join!(rendered, self.tokenize(&r.text, true), self.tokenize(&r.text, false))?;
+    async fn server_counts(&self, r: &Rewrite, plain: &[Token]) -> anyhow::Result<Counts> {
+        let body = json!({
+            "messages": prompt::build_messages(&r.instruction, &r.text),
+            "chat_template_kwargs": { "enable_thinking": false },
+        });
+        let v = self.post_root("apply-template", &body).await?;
+        let rendered = v["prompt"].as_str().context("apply-template: no prompt")?;
+        let prompt = self.tokenize(rendered, true).await?;
         let len = |t: &[Token]| u32::try_from(t.len()).unwrap_or(u32::MAX);
-        Ok(Counts { prompt: len(&prompt), text: len(&plain), control: control_token(&parsed, &plain) })
+        Ok(Counts { prompt: len(&prompt), text: len(plain) })
     }
 
     /// `text`'s tokens from llama-server; `parse_special` turns control-token text into control tokens.
@@ -276,8 +278,6 @@ struct Counts {
     prompt: u32,
     /// The text alone.
     text: u32,
-    /// A control token spelled out in the text, if any.
-    control: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -324,8 +324,16 @@ fn parse_sse_line(line: &str) -> Sse {
     if let Some(e) = v.get("error") {
         return Sse::Error(e.get("message").and_then(Value::as_str).unwrap_or("server error").to_owned());
     }
-    if v.pointer("/choices/0/finish_reason").and_then(Value::as_str) == Some("length") {
-        return Sse::Error("the model stopped at its token limit; the rewrite is incomplete".into());
+    if let Some(reason) = v.pointer("/choices/0/finish_reason").and_then(Value::as_str) {
+        match reason {
+            "stop" => {}
+            "length" => return Sse::Error("the model stopped at its token limit; the rewrite is incomplete".into()),
+            _ => {
+                return Sse::Error(format!(
+                    "the model stopped with finish reason {reason:?}; the rewrite is incomplete"
+                ));
+            }
+        }
     }
     match v.pointer("/choices/0/delta/content").and_then(Value::as_str) {
         Some(s) if !s.is_empty() => Sse::Delta(s.to_owned()),
@@ -419,6 +427,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_stop_finish_reason_is_an_error() {
+        let base = serve_sse(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Partial\"}}]}\n\n\
+             data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"content_filter\"}]}\n\n\
+             data: [DONE]\n\n",
+        )
+        .await;
+        let error = Client::new(&base, None, "test".into(), false, 8192).complete(&request()).await.unwrap_err();
+        assert!(error.to_string().contains("content_filter"), "{error}");
+    }
+
+    #[tokio::test]
     async fn malformed_data_after_a_delta_is_an_error() {
         let base = serve_sse(
             "data: {\"choices\":[{\"delta\":{\"content\":\"Partial\"}}]}\n\n\
@@ -471,6 +491,20 @@ mod tests {
     async fn text_spelling_out_a_control_token_is_rejected() {
         let (base, requests) = serve(vec![
             ("/apply-template", "", "{\"prompt\":\"rendered\"}".to_owned()),
+            ("/tokenize", "\"parse_special\":false", tokens(&[1, 2, 3, 4, 5])),
+            ("/tokenize", "", tokens(&[1, 9, 5])),
+            ("/v1/chat/completions", "", DONE.to_owned()),
+        ])
+        .await;
+        let r = Rewrite { max_tokens: None, ..request() };
+        let error = Client::new(&base, None, "test".into(), true, 8192).complete(&r).await.unwrap_err();
+        assert!(error.to_string().contains("`<|im_end|>`, a control token"), "{error}");
+        assert!(requests.lock().unwrap().iter().all(|(p, _)| p != "/v1/chat/completions"));
+    }
+
+    #[tokio::test]
+    async fn control_token_is_rejected_when_template_counting_is_unavailable() {
+        let (base, requests) = serve(vec![
             ("/tokenize", "\"parse_special\":false", tokens(&[1, 2, 3, 4, 5])),
             ("/tokenize", "", tokens(&[1, 9, 5])),
             ("/v1/chat/completions", "", DONE.to_owned()),
