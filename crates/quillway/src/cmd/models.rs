@@ -69,12 +69,20 @@ pub async fn run(cmd: ModelsCmd) -> anyhow::Result<()> {
             Ok(())
         }
         ModelsCmd::Use { id } => {
-            if !id.starts_with("custom:") {
+            let id = if let Some(path) = id.strip_prefix("custom:") {
+                // Absolute, so the daemon finds it whatever its working directory.
+                let path = std::fs::canonicalize(path).with_context(|| format!("model file {path}"))?;
+                if !path.is_file() {
+                    bail!("{} is not a file", path.display());
+                }
+                format!("custom:{}", path.display())
+            } else {
                 let e = find(&id)?;
                 if !is_installed(e) {
                     bail!("{} is not installed; run `quillway models install {}` first", e.name, e.id);
                 }
-            }
+                id
+            };
             State { active: Some(id.clone()) }.save()?;
             if config.model.active.is_some() {
                 eprintln!("note: `model.active` in the config overrides this choice");
@@ -86,13 +94,14 @@ pub async fn run(cmd: ModelsCmd) -> anyhow::Result<()> {
         ModelsCmd::Remove { id } => {
             let e = find(&id)?;
             let path = e.path_in(&paths::models_dir());
-            match std::fs::remove_file(&path) {
-                Ok(()) => println!("removed {}", path.display()),
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => println!("{} is not installed", e.name),
-                Err(err) => return Err(err).with_context(|| format!("removing {}", path.display())),
+            if download::remove(&path)? {
+                println!("removed {}", path.display());
+            } else {
+                println!("{} is not installed", e.name);
             }
-            if let Some(dir) = path.parent() {
-                let _ = std::fs::remove_dir(dir); // only if empty
+            // `<repo>/<revision>/`, each only if now empty.
+            for dir in path.ancestors().skip(1).take(2) {
+                let _ = std::fs::remove_dir(dir);
             }
             Ok(())
         }

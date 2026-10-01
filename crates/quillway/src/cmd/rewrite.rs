@@ -5,8 +5,9 @@ use std::io::{Read, Write};
 use anyhow::{Context, bail};
 use futures_util::StreamExt;
 use quillway_core::config::Config;
+use quillway_core::ipc::{Request, Response};
 use quillway_core::{clean, paths, prompt};
-use quillway_engine::{Engine, Rewrite};
+use quillway_engine::{Client, Engine, Rewrite};
 
 #[derive(clap::Args)]
 pub struct RewriteArgs {
@@ -47,24 +48,23 @@ pub async fn run(a: RewriteArgs) -> anyhow::Result<()> {
     if text.contains(prompt::STOP) {
         bail!("the text contains `{}`, which Quillway uses as a delimiter", prompt::STOP);
     }
-    if !prompt::fits(&text, &instruction, config.model.context) {
-        bail!(
-            "text or instruction is too long for the model's {}-token context; raise `model.context`",
-            config.model.context
-        );
-    }
-    let engine = Engine::new(config.clone());
-    let active = engine.active().await;
     let t0 = std::time::Instant::now();
-    let client = engine.client().await?;
-    let loaded = t0.elapsed();
-    let req = Rewrite {
-        instruction,
-        max_tokens: prompt::max_tokens(&text, config.model.context),
-        text: text.clone(),
-        temperature,
-        sampling: active.sampling,
+    // Share the daemon's model server; load our own only when no daemon runs.
+    // `_engine` keeps that own server alive until we finish.
+    let (client, model, sampling, _engine) = match crate::ipc::send(&Request::Connect).await {
+        Ok(Response::Server { base, api_key, model, llama, context, sampling }) => {
+            (Client::new(&base, api_key, model.clone(), llama, context), model, sampling, None)
+        }
+        Ok(Response::Error { message }) => bail!("daemon: {message}"),
+        Ok(other) => bail!("unexpected daemon response: {other:?}"),
+        Err(_) => {
+            let engine = Engine::new(config);
+            let active = engine.active().await;
+            (engine.client().await?, active.name, active.sampling, Some(engine))
+        }
     };
+    let loaded = t0.elapsed();
+    let req = Rewrite { instruction, max_tokens: None, text: text.clone(), temperature, sampling };
     let t1 = std::time::Instant::now();
     let mut first = None;
     let mut deltas = 0usize;
@@ -86,7 +86,7 @@ pub async fn run(a: RewriteArgs) -> anyhow::Result<()> {
         let gen_secs = total.saturating_sub(first).as_secs_f64().max(1e-3);
         eprintln!(
             "model {} · startup {:.1}s · first token {:.2}s · {} tokens · {:.1} tok/s",
-            active.name,
+            model,
             loaded.as_secs_f64(),
             first.as_secs_f64(),
             deltas,

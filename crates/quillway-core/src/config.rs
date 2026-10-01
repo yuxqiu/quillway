@@ -28,7 +28,7 @@ pub struct ModelConfig {
     pub active: Option<String>,
     /// OpenAI-compatible base URL (e.g. `http://127.0.0.1:11434/v1`). Set to skip the built-in llama-server.
     pub endpoint: Option<String>,
-    /// Model name sent to `endpoint`.
+    /// Model name sent to `endpoint`; required with it.
     pub endpoint_model: Option<String>,
     /// Bearer token for `endpoint`.
     pub endpoint_api_key: Option<String>,
@@ -90,7 +90,7 @@ pub struct UiConfig {
     /// Draw the shadow ourselves (needs a transparent margin). Turn off when a
     /// compositor rule draws it, e.g. niri `layer-rule { shadow { on; } }`.
     pub client_shadow: bool,
-    /// Font family name; the system sans-serif when unset.
+    /// Font family name; the system sans-serif when unset. Applies after a daemon restart.
     pub font: Option<String>,
 }
 
@@ -147,10 +147,18 @@ impl Config {
     /// The file exists but can't be read or isn't a valid config.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         match std::fs::read_to_string(path) {
-            Ok(s) => toml::from_str(&s).with_context(|| format!("parsing {}", path.display())),
+            Ok(s) => Self::parse(&s).with_context(|| format!("parsing {}", path.display())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
         }
+    }
+
+    fn parse(s: &str) -> anyhow::Result<Self> {
+        let config: Self = toml::from_str(s)?;
+        if config.model.endpoint.is_some() && config.model.endpoint_model.is_none() {
+            anyhow::bail!("`model.endpoint` needs `model.endpoint_model`, the model name the server expects");
+        }
+        Ok(config)
     }
 
     /// The configured presets, or the built-in ones if none are configured.
@@ -217,6 +225,12 @@ mod tests {
     #[test]
     fn unknown_keys_are_rejected() {
         assert!(toml::from_str::<Config>("[ui]\nbogus = 1").is_err());
+    }
+
+    #[test]
+    fn endpoint_requires_a_model_name() {
+        assert!(Config::parse("[model]\nendpoint = \"http://h/v1\"").is_err());
+        assert!(Config::parse("[model]\nendpoint = \"http://h/v1\"\nendpoint_model = \"m\"").is_ok());
     }
 
     #[test]

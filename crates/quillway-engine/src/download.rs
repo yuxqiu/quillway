@@ -4,6 +4,7 @@
 //! on disk, and the file is renamed into place only after the digest matches.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, bail};
 use futures_util::StreamExt;
@@ -66,7 +67,12 @@ pub async fn download(job: Job<'_>, mut on_progress: impl FnMut(Progress)) -> an
     on_progress(Progress { done: have, total: job.size });
 
     if have < job.size {
-        let mut req = reqwest::Client::new().get(job.url);
+        let http = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(30))
+            // A stalled connection fails (keeping the `.part`) instead of hanging.
+            .read_timeout(Duration::from_secs(60))
+            .build()?;
+        let mut req = http.get(job.url);
         if let Ok(token) = std::env::var("HF_TOKEN") {
             req = req.bearer_auth(token);
         }
@@ -112,11 +118,41 @@ pub async fn download(job: Job<'_>, mut on_progress: impl FnMut(Progress)) -> an
     Ok(())
 }
 
+/// Delete `dest` and its download leftovers; `Ok(false)` if it wasn't installed.
+///
+/// # Errors
+///
+/// A download of it is running, or a file can't be removed.
+pub fn remove(dest: &Path) -> anyhow::Result<bool> {
+    if !dest.parent().is_some_and(Path::is_dir) {
+        return Ok(false);
+    }
+    let held = lock(dest)?;
+    let removed = remove_if_present(dest)?;
+    remove_if_present(&part_path(dest))?;
+    drop(held);
+    remove_if_present(&lock_path(dest))?;
+    Ok(removed)
+}
+
+fn remove_if_present(path: &Path) -> anyhow::Result<bool> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
+    }
+}
+
+fn lock_path(dest: &Path) -> PathBuf {
+    let mut p = dest.as_os_str().to_owned();
+    p.push(".lock");
+    PathBuf::from(p)
+}
+
 fn lock(dest: &Path) -> anyhow::Result<std::fs::File> {
     use std::os::fd::AsRawFd;
-    let mut path = dest.as_os_str().to_owned();
-    path.push(".lock");
-    let f = std::fs::File::create(&path).with_context(|| format!("creating {}", Path::new(&path).display()))?;
+    let path = lock_path(dest);
+    let f = std::fs::File::create(&path).with_context(|| format!("creating {}", path.display()))?;
     // SAFETY: `f` is an open file descriptor for the duration of the call.
     if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         bail!("another download of {} is already running", dest.display());
@@ -260,6 +296,21 @@ mod tests {
             download(Job { url: &url, dest: &dest, size: 5000, sha256: &sha(b"other") }, |_| {}).await.unwrap_err();
         assert!(err.to_string().contains("sha256 mismatch"), "{err}");
         assert!(!dest.exists() && !part_path(&dest).exists());
+    }
+
+    #[test]
+    fn remove_cleans_up_and_respects_a_running_download() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("model.gguf");
+        std::fs::write(&dest, b"m").unwrap();
+        std::fs::write(part_path(&dest), b"p").unwrap();
+        {
+            let _running = lock(&dest).unwrap();
+            assert!(remove(&dest).unwrap_err().to_string().contains("already running"));
+        }
+        assert!(remove(&dest).unwrap());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        assert!(!remove(&dest).unwrap());
     }
 
     #[tokio::test]

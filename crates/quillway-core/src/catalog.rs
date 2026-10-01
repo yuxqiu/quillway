@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// One downloadable model.
 #[derive(Debug, Clone, Deserialize)]
@@ -41,7 +41,7 @@ pub struct Entry {
 }
 
 /// Per-model sampling parameters sent with each request.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Sampling {
     /// Nucleus sampling cutoff.
@@ -112,6 +112,7 @@ mod tests {
             assert!(Path::new(&e.file).extension().is_some_and(|x| x == "gguf"));
         }
         let mut ids: Vec<_> = all().iter().map(|e| &e.id).collect();
+        ids.sort();
         ids.dedup();
         assert_eq!(ids.len(), all().len());
     }

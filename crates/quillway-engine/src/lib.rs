@@ -58,11 +58,14 @@ impl Engine {
         let cfg = inner.config.model.clone();
         if let Some(endpoint) = &cfg.endpoint {
             drop(inner);
-            let model = cfg.endpoint_model.clone().unwrap_or_else(|| "default".into());
-            return Ok(Client::new(endpoint, cfg.endpoint_api_key.clone(), model, false));
+            let model = cfg.endpoint_model.clone().unwrap_or_default();
+            return Ok(Client::new(endpoint, cfg.endpoint_api_key.clone(), model, false, cfg.context));
         }
         let active = models::active(&inner.config);
-        if !active.path.exists() {
+        if !active.path.is_file() {
+            if !active.catalog {
+                bail!("model file not found: {}", active.path.display());
+            }
             bail!("model {} is not installed (run `quillway models install {}`)", active.name, active.id);
         }
         // The lock is held across startup on purpose: concurrent callers wait
@@ -80,7 +83,7 @@ impl Engine {
                 server::Server::start(&active.path, &cfg).await.context("starting llama-server")?
             }
         };
-        let client = Client::new(&server.base_url(), Some(server.api_key().to_owned()), active.id, true);
+        let client = Client::new(&server.base_url(), Some(server.api_key().to_owned()), active.id, true, cfg.context);
         inner.server = Some(server);
         Ok(client)
     }
@@ -94,15 +97,7 @@ impl Engine {
     pub async fn warm_up(&self) -> anyhow::Result<()> {
         let client = self.client().await?;
         if client.is_llama() {
-            let sampling = self.active().await.sampling;
-            let r = Rewrite {
-                instruction: "Proofread.".into(),
-                text: "ok".into(),
-                temperature: 0.0,
-                sampling,
-                max_tokens: 1,
-            };
-            client.complete(&r).await?;
+            client.warm_up(self.active().await.sampling).await?;
         }
         Ok(())
     }

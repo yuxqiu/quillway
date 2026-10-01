@@ -9,8 +9,8 @@ use std::fmt::Write;
 use std::time::Instant;
 
 use futures_util::StreamExt;
+use quillway_core::clean;
 use quillway_core::config::{Config, default_presets};
-use quillway_core::{clean, prompt};
 use quillway_engine::{Engine, Rewrite};
 
 const TEXTS: [&str; 10] = [
@@ -54,7 +54,7 @@ async fn main() -> anyhow::Result<()> {
                     text: text.to_owned(),
                     temperature: preset.temperature.unwrap_or(0.7),
                     sampling: active.sampling,
-                    max_tokens: prompt::max_tokens(text, config.model.context),
+                    max_tokens: None,
                 };
                 let t0 = Instant::now();
                 let mut first = None;

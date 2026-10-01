@@ -66,24 +66,40 @@ pub fn build_messages(instruction: &str, text: &str) -> Vec<ChatMessage> {
     out
 }
 
-/// Output budget: generous for rewrites, bounded so a runaway generation can't stall.
+/// The output room every request must have, even for a short text.
+const MIN_OUTPUT: u32 = 128;
+/// Output cap for short texts, so "expand this into an email" has room.
+const OUTPUT_FLOOR: u32 = 1024;
+/// Upper estimate of the system prompt, few-shot turns and chat-template tokens.
+const PREFIX_ESTIMATE: u32 = 450;
+
+/// `max_tokens` for a request whose whole prompt is `prompt_tokens`, rewriting
+/// a text of `text_tokens`; `None` if not even a rewrite of similar length fits.
+///
+/// The cap (twice the text, at least [`OUTPUT_FLOOR`]) only stops a runaway
+/// generation; a real rewrite never comes near it.
 #[must_use]
-pub fn max_tokens(text: &str, context: u32) -> u32 {
-    let est_input = est_tokens(text);
-    est_input.saturating_mul(3).saturating_div(2).saturating_add(64).clamp(128, (context / 2).max(128))
+pub fn budget(prompt_tokens: u32, text_tokens: u32, context: u32) -> Option<u32> {
+    let room = context.checked_sub(prompt_tokens)?;
+    if room < text_tokens.max(MIN_OUTPUT) {
+        return None;
+    }
+    Some(room.min(text_tokens.saturating_mul(2).max(OUTPUT_FLOOR)))
 }
 
-/// Whether `text`, `instruction`, and a rewrite of similar length fit in the context window.
-/// (~3 chars per token is conservative for English; the prefix is ~400 tokens.)
+/// Upper estimate of the prompt's tokens, for servers we can't ask.
 #[must_use]
-pub fn fits(text: &str, instruction: &str, context: u32) -> bool {
-    let est = est_tokens(text);
-    est.saturating_add(est_tokens(instruction)).saturating_add(est.max(128)).saturating_add(400) <= context
+pub fn estimate_prompt(instruction: &str, text: &str) -> u32 {
+    PREFIX_ESTIMATE.saturating_add(estimate_tokens(instruction)).saturating_add(estimate_tokens(text))
 }
 
-/// ~3 characters per token: conservative for English.
-fn est_tokens(text: &str) -> u32 {
-    u32::try_from(text.chars().count().div_ceil(3)).unwrap_or(u32::MAX)
+/// Upper estimate of `text`'s tokens without a tokenizer: ~3 ASCII characters
+/// per token, and one per other character (CJK runs ~0.5, Cyrillic ~0.25).
+#[must_use]
+pub fn estimate_tokens(text: &str) -> u32 {
+    let ascii = text.bytes().filter(u8::is_ascii).count();
+    let other = text.chars().filter(|c| !c.is_ascii()).count();
+    u32::try_from(ascii.div_ceil(3) + other).unwrap_or(u32::MAX)
 }
 
 #[cfg(test)]
@@ -100,20 +116,36 @@ mod tests {
     }
 
     #[test]
-    fn long_text_does_not_fit() {
-        assert!(fits(&"x".repeat(9000), "Proofread", 8192));
-        assert!(!fits(&"x".repeat(12_000), "Proofread", 8192));
+    fn short_text_gets_room_to_expand() {
+        assert_eq!(budget(500, 10, 8192), Some(1024));
     }
 
     #[test]
-    fn long_instruction_does_not_fit() {
-        assert!(!fits("hi", &"x".repeat(30_000), 8192));
+    fn long_text_is_capped_by_the_remaining_context() {
+        assert_eq!(budget(3000, 2500, 8192), Some(5000));
+        assert_eq!(budget(4500, 3600, 8192), Some(3692));
     }
 
     #[test]
-    fn max_tokens_is_bounded() {
-        assert_eq!(max_tokens("hi", 8192), 128);
-        assert_eq!(max_tokens(&"x".repeat(1_000_000), 8192), 4096);
-        assert_eq!(max_tokens(&"x".repeat(3000), 8192), 1564);
+    fn text_that_cannot_be_rewritten_in_full_does_not_fit() {
+        assert_eq!(budget(4500, 4000, 8192), None);
+        assert_eq!(budget(8100, 10, 8192), None);
+        assert_eq!(budget(9000, 10, 8192), None);
+    }
+
+    #[test]
+    fn estimate_is_conservative_for_non_latin_text() {
+        // Measured with the Qwen3.5 tokenizer: 21, 18 and 16 tokens.
+        assert!(
+            estimate_tokens("Their going to the park tomorow, weather permiting. We was hoping you could came to.")
+                >= 21
+        );
+        assert!(estimate_tokens("我们原计划周一开会，但是会议室已经被预订了，所以我们需要重新安排时间。") >= 18);
+        assert!(estimate_tokens("Мы планировали встретиться в понедельник, но комната уже забронирована.") >= 16);
+    }
+
+    #[test]
+    fn estimated_long_instruction_does_not_fit() {
+        assert_eq!(budget(estimate_prompt(&"x".repeat(30_000), "hi"), estimate_tokens("hi"), 8192), None);
     }
 }

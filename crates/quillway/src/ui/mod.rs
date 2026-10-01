@@ -184,6 +184,8 @@ pub struct App {
     pub install: Option<Install>,
     pub now: Instant,
     next_gen: u64,
+    /// The latest warm-up; results of earlier ones (superseded by a reload) are ignored.
+    warm_id: u64,
     /// `None` if the compositor can't report clipboard changes.
     watch: Option<quillway_wl::ClipboardWatch>,
     /// The current clipboard read; older results are ignored after cancellation.
@@ -232,7 +234,7 @@ pub enum Message {
     Tick(Instant),
     /// Close the popup if it is still this window (a delayed hide must not close a newer one).
     Hide(window::Id),
-    Engine(Result<(), String>),
+    Engine(u64, Result<(), String>),
     InstallStart,
     Install(InstallEvent),
     WindowClosed(window::Id),
@@ -252,6 +254,7 @@ impl App {
             install: None,
             now: Instant::now(),
             next_gen: 0,
+            warm_id: 0,
             watch,
             capturing: None,
             next_capture: 0,
@@ -266,8 +269,12 @@ impl App {
             return Task::none();
         }
         self.engine_state = EngineState::Starting;
+        self.warm_id += 1;
+        let id = self.warm_id;
         let engine = self.engine.clone();
-        Task::perform(async move { engine.warm_up().await.map_err(|e| format!("{e:#}")) }, Message::Engine)
+        Task::perform(async move { engine.warm_up().await.map_err(|e| format!("{e:#}")) }, move |r| {
+            Message::Engine(id, r)
+        })
     }
 
     fn subscription(&self) -> Subscription<Message> {
@@ -313,7 +320,8 @@ impl App {
                     Task::none()
                 }
             }
-            Message::Engine(r) => {
+            Message::Engine(id, _) if id != self.warm_id => Task::none(),
+            Message::Engine(_, r) => {
                 self.engine_state = match r {
                     Ok(()) => EngineState::Ready,
                     Err(_) if self.config.model.endpoint.is_none() && !self.active.path.is_file() => {
@@ -399,6 +407,25 @@ impl App {
                 };
                 reply.send(Response::Status { visible: self.popup.is_some(), model: self.model_label(), engine });
                 Task::none()
+            }
+            Request::Connect => {
+                let (engine, reply, sampling) = (self.engine.clone(), reply.clone(), self.active.sampling);
+                Task::perform(
+                    async move {
+                        reply.send(match engine.client().await {
+                            Ok(c) => Response::Server {
+                                base: c.base().to_owned(),
+                                api_key: c.api_key().map(str::to_owned),
+                                model: c.model().to_owned(),
+                                llama: c.is_llama(),
+                                context: c.context(),
+                                sampling,
+                            },
+                            Err(e) => Response::Error { message: format!("{e:#}") },
+                        });
+                    },
+                    |()| Message::Tick(Instant::now()),
+                )
             }
             Request::Quit => {
                 reply.send(Response::Ok);
@@ -556,7 +583,6 @@ impl App {
     }
 
     fn generate(&mut self, label: String, instruction: String, temperature: f32, show_diff: bool) -> Task<Message> {
-        let context = self.config.model.context;
         let sampling = self.active.sampling;
         let Some(p) = self.popup.as_mut() else { return Task::none() };
         let text = p.base();
@@ -568,15 +594,8 @@ impl App {
             p.error = Some(format!("The text contains `{}`, which Quillway uses as a delimiter.", prompt::STOP));
             return Task::none();
         }
-        if !prompt::fits(&text, &instruction, context) {
-            p.error = Some(format!(
-                "Text or instruction is too long for the model's {context}-token context ({} source chars). Shorten it, or raise `model.context`.",
-                text.chars().count()
-            ));
-            return Task::none();
-        }
-        let request =
-            Rewrite { instruction, max_tokens: prompt::max_tokens(&text, context), text, temperature, sampling };
+        // The client counts tokens and rejects text too long for the context.
+        let request = Rewrite { instruction, max_tokens: None, text, temperature, sampling };
         if p.drafts.is_empty() {
             p.original.clone_from(&request.text);
         }
@@ -620,7 +639,19 @@ impl App {
                 g.raw.push_str(&d);
             }
             GenEvent::Error(e) => {
-                p.generation = None;
+                let g = p.generation.take().expect("matched above");
+                let partial = clean::clean(&g.raw, &g.request.text, false).trim_end().to_owned();
+                // Keep what arrived, marked, unless a retry failed (its old draft stays).
+                if !partial.trim().is_empty() && !g.replace {
+                    p.show_diff = g.show_diff;
+                    p.drafts.push(Draft {
+                        text: partial,
+                        label: format!("{} (incomplete)", g.label),
+                        stats: "stopped early".into(),
+                        show_diff: g.show_diff,
+                        request: g.request,
+                    });
+                }
                 p.error = Some(e);
             }
             GenEvent::Done => {
@@ -862,6 +893,53 @@ mod tests {
     fn reply() -> Reply {
         let (tx, _rx) = tokio::sync::oneshot::channel();
         Reply::new(tx)
+    }
+
+    fn endpoint_config() -> Config {
+        let mut config = Config::default();
+        config.model.endpoint = Some("http://127.0.0.1:1/v1".into());
+        config.model.endpoint_model = Some("m".into());
+        config
+    }
+
+    fn generating_app() -> App {
+        let (mut app, _) = App::boot(endpoint_config(), None);
+        let _ = app.update(Message::Ipc(Request::Show { input: Input::Text("their here".into()) }, reply()));
+        let _ = app.update(Message::Preset(0));
+        assert_eq!(app.popup.as_ref().unwrap().phase(), Phase::Generating);
+        app
+    }
+
+    #[test]
+    fn superseded_warm_up_result_is_ignored() {
+        let (mut app, _) = App::boot(endpoint_config(), None);
+        let first = app.warm_id;
+        let _ = app.warm_up(); // a reload
+        let _ = app.update(Message::Engine(first, Err("killed by the reload".into())));
+        assert_eq!(app.engine_state, EngineState::Starting);
+        let _ = app.update(Message::Engine(app.warm_id, Ok(())));
+        assert_eq!(app.engine_state, EngineState::Ready);
+    }
+
+    #[test]
+    fn error_keeps_partial_output_as_an_incomplete_draft() {
+        let mut app = generating_app();
+        let _ = app.update(Message::Gen(0, GenEvent::Delta("They're here, and".into())));
+        let _ = app.update(Message::Gen(0, GenEvent::Error("connection reset".into())));
+        let p = app.popup.as_ref().unwrap();
+        assert_eq!(p.phase(), Phase::Reviewing);
+        assert_eq!(p.drafts[0].text, "They're here, and");
+        assert_eq!(p.drafts[0].label, "Proofread (incomplete)");
+        assert_eq!(p.error.as_deref(), Some("connection reset"));
+    }
+
+    #[test]
+    fn error_before_any_output_adds_no_draft() {
+        let mut app = generating_app();
+        let _ = app.update(Message::Gen(0, GenEvent::Error("too long".into())));
+        let p = app.popup.as_ref().unwrap();
+        assert_eq!(p.phase(), Phase::Composing);
+        assert_eq!(p.error.as_deref(), Some("too long"));
     }
 
     #[test]

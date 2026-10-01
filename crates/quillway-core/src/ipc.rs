@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::catalog::Sampling;
+
 /// A command from the CLI.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -22,6 +24,9 @@ pub enum Request {
     Reload,
     /// Report [`Response::Status`].
     Status,
+    /// Start the model server if needed and report [`Response::Server`], so
+    /// `quillway rewrite` shares it instead of loading a second copy.
+    Connect,
     /// Stop the daemon.
     Quit,
 }
@@ -37,7 +42,7 @@ pub enum Input {
 }
 
 /// The daemon's answer.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum Response {
     /// Done.
@@ -50,6 +55,21 @@ pub enum Response {
         model: String,
         /// Model server state, e.g. `ready`.
         engine: String,
+    },
+    /// Answer to [`Request::Connect`]: how to reach the daemon's model server.
+    Server {
+        /// OpenAI-compatible `/v1` URL.
+        base: String,
+        /// Bearer token.
+        api_key: Option<String>,
+        /// Model name for requests.
+        model: String,
+        /// Our own llama-server (exact token counts, llama.cpp fields).
+        llama: bool,
+        /// Context window in tokens.
+        context: u32,
+        /// Sampling defaults of the active model.
+        sampling: Sampling,
     },
     /// The request failed.
     Error {
