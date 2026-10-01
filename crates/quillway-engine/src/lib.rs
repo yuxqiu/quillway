@@ -6,7 +6,7 @@
 pub mod client;
 pub mod download;
 pub mod models;
-pub mod server;
+mod server;
 
 use std::sync::Arc;
 
@@ -17,6 +17,7 @@ use tokio::sync::Mutex;
 pub use client::{Client, Rewrite};
 pub use models::Active;
 
+/// Shared handle to the model backend; clones share one server.
 #[derive(Clone)]
 pub struct Engine {
     inner: Arc<Mutex<Inner>>,
@@ -28,6 +29,8 @@ struct Inner {
 }
 
 impl Engine {
+    /// An engine for `config`; nothing starts until the first request.
+    #[must_use]
     pub fn new(config: Config) -> Self {
         Self { inner: Arc::new(Mutex::new(Inner { config, server: None })) }
     }
@@ -45,36 +48,49 @@ impl Engine {
     }
 
     /// A client ready to accept requests, starting llama-server if needed.
+    ///
+    /// # Errors
+    ///
+    /// The model isn't installed, or llama-server fails to start.
+    #[expect(clippy::significant_drop_tightening, reason = "held across startup so callers share one server")]
     pub async fn client(&self) -> anyhow::Result<Client> {
         let mut inner = self.inner.lock().await;
         let cfg = inner.config.model.clone();
-        if let Some(endpoint) = cfg.endpoint {
-            return Ok(Client::new(
-                endpoint,
-                cfg.endpoint_api_key,
-                cfg.endpoint_model.unwrap_or_else(|| "default".into()),
-                false,
-            ));
+        if let Some(endpoint) = &cfg.endpoint {
+            drop(inner);
+            let model = cfg.endpoint_model.clone().unwrap_or_else(|| "default".into());
+            return Ok(Client::new(endpoint, cfg.endpoint_api_key.clone(), model, false));
         }
         let active = models::active(&inner.config);
         if !active.path.exists() {
             bail!("model {} is not installed (run `quillway models install {}`)", active.name, active.id);
         }
-        let reuse = match inner.server.as_mut() {
-            Some(s) => s.model_path() == active.path && s.is_alive(),
-            None => false,
-        };
-        if !reuse {
-            inner.server = None; // kill the old one before starting another
-            let s = server::Server::start(&active.path, &cfg).await.context("starting llama-server")?;
-            inner.server = Some(s);
+        // The lock is held across startup on purpose: concurrent callers wait
+        // for this server instead of starting their own.
+        if let Some(s) = inner.server.as_mut()
+            && !s.is_alive()
+        {
+            eprintln!("quillway: llama-server exited; restarting. Its last output:\n{}", s.log_tail());
         }
-        let s = inner.server.as_ref().expect("server just ensured");
-        Ok(Client::new(s.base_url(), Some(s.api_key().to_owned()), active.id.clone(), true))
+        let reusable = inner.server.as_mut().is_some_and(|s| s.model_path() == active.path && s.is_alive());
+        let server = match inner.server.take() {
+            Some(s) if reusable => s,
+            old => {
+                drop(old); // stop the previous server before starting another
+                server::Server::start(&active.path, &cfg).await.context("starting llama-server")?
+            }
+        };
+        let client = Client::new(&server.base_url(), Some(server.api_key().to_owned()), active.id, true);
+        inner.server = Some(server);
+        Ok(client)
     }
 
     /// Start the server and run one tiny request, so GPU pipelines are built
     /// and the fixed prompt prefix is cached before the first real rewrite.
+    ///
+    /// # Errors
+    ///
+    /// As [`Engine::client`], or the warm-up request fails.
     pub async fn warm_up(&self) -> anyhow::Result<()> {
         let client = self.client().await?;
         if client.is_llama() {
@@ -89,14 +105,5 @@ impl Engine {
             client.complete(&r).await?;
         }
         Ok(())
-    }
-
-    pub async fn describe(&self) -> String {
-        let inner = self.inner.lock().await;
-        match &inner.config.model.endpoint {
-            Some(e) => format!("endpoint {e}"),
-            None if inner.server.is_some() => "llama-server (running)".into(),
-            None => "llama-server (stopped)".into(),
-        }
     }
 }

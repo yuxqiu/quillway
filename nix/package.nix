@@ -1,6 +1,8 @@
-# Quillway, built with crane. `llama-cpp` provides `llama-server` on the
+# Quillway, built with crane. `llamaCpp` provides `llama-server` on the
 # wrapper's PATH; override it to pick a GPU backend, e.g.
-#   quillway.override { llama-cpp = llama-cpp.override { cudaSupport = true; }; }
+#   quillway.override { llamaCpp = llama-cpp.override { cudaSupport = true; }; }
+# (Not named `llama-cpp`: callPackage would fill that from nixpkgs, the
+# CPU-only build, ignoring the Vulkan default below.)
 {
   lib,
   craneLib,
@@ -11,7 +13,7 @@
   vulkan-loader,
   libGL,
   llama-cpp-vulkan,
-  llama-cpp ? llama-cpp-vulkan,
+  llamaCpp ? llama-cpp-vulkan,
 }:
 let
   src = lib.fileset.toSource {
@@ -44,7 +46,7 @@ craneLib.buildPackage (
     doCheck = false;
     postFixup = ''
       patchelf --add-rpath ${lib.makeLibraryPath runtimeLibs} $out/bin/quillway
-      wrapProgram $out/bin/quillway --prefix PATH : ${lib.makeBinPath [ llama-cpp ]}
+      wrapProgram $out/bin/quillway --prefix PATH : ${lib.makeBinPath [ llamaCpp ]}
     '';
     passthru = { inherit cargoArtifacts common; };
     meta = {

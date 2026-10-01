@@ -10,16 +10,24 @@ use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+/// Bytes on disk so far.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Progress {
+    /// Bytes downloaded, including any resumed part.
     pub done: u64,
+    /// Expected size.
     pub total: u64,
 }
 
+/// One file to fetch.
 pub struct Job<'a> {
+    /// Source URL.
     pub url: &'a str,
+    /// Final path; `<dest>.part` holds the download until it is verified.
     pub dest: &'a Path,
+    /// Expected size in bytes.
     pub size: u64,
+    /// Expected sha256, hex.
     pub sha256: &'a str,
 }
 
@@ -29,13 +37,22 @@ fn part_path(dest: &Path) -> PathBuf {
     PathBuf::from(p)
 }
 
+/// Download `job`, resuming a previous `.part`, and verify it.
+///
+/// # Errors
+///
+/// Network or disk failure (the `.part` is kept for resuming), not enough
+/// free space, a size/sha256 mismatch (the `.part` is deleted), or another
+/// download of the same file already running.
 pub async fn download(job: Job<'_>, mut on_progress: impl FnMut(Progress)) -> anyhow::Result<()> {
+    let dir = job.dest.parent().context("destination has no parent directory")?;
+    tokio::fs::create_dir_all(dir).await?;
+    // Held until we return, so a CLI and a popup install can't both append to the `.part`.
+    let _lock = lock(job.dest)?;
     if job.dest.is_file() {
         on_progress(Progress { done: job.size, total: job.size });
         return Ok(());
     }
-    let dir = job.dest.parent().context("destination has no parent directory")?;
-    tokio::fs::create_dir_all(dir).await?;
     let part = part_path(job.dest);
 
     let mut hasher = Sha256::new();
@@ -95,6 +112,18 @@ pub async fn download(job: Job<'_>, mut on_progress: impl FnMut(Progress)) -> an
     Ok(())
 }
 
+fn lock(dest: &Path) -> anyhow::Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    let mut path = dest.as_os_str().to_owned();
+    path.push(".lock");
+    let f = std::fs::File::create(&path).with_context(|| format!("creating {}", Path::new(&path).display()))?;
+    // SAFETY: `f` is an open file descriptor for the duration of the call.
+    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        bail!("another download of {} is already running", dest.display());
+    }
+    Ok(f)
+}
+
 async fn hash_existing(part: &Path, hasher: &mut Sha256) -> anyhow::Result<u64> {
     let mut f = match tokio::fs::File::open(part).await {
         Ok(f) => f,
@@ -127,19 +156,26 @@ fn free_bytes(dir: &Path) -> anyhow::Result<u64> {
     let c = std::ffi::CString::new(dir.as_os_str().as_bytes())?;
     let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
     // SAFETY: `c` is a valid NUL-terminated path and `s` a writable statvfs.
-    if unsafe { libc::statvfs(c.as_ptr(), &mut s) } != 0 {
+    if unsafe { libc::statvfs(c.as_ptr(), &raw mut s) } != 0 {
         return Err(std::io::Error::last_os_error()).context("statvfs");
     }
     Ok(s.f_bavail as u64 * s.f_frsize as u64)
 }
 
+/// `1.3 GB` / `731 MB`.
+#[must_use]
+#[expect(clippy::cast_precision_loss, reason = "display only")]
 pub fn human(bytes: u64) -> String {
     let b = bytes as f64;
     if b >= 1e9 { format!("{:.1} GB", b / 1e9) } else { format!("{:.0} MB", b / 1e6) }
 }
 
 fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    use std::fmt::Write;
+    bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
 }
 
 #[cfg(test)]
@@ -224,5 +260,16 @@ mod tests {
             download(Job { url: &url, dest: &dest, size: 5000, sha256: &sha(b"other") }, |_| {}).await.unwrap_err();
         assert!(err.to_string().contains("sha256 mismatch"), "{err}");
         assert!(!dest.exists() && !part_path(&dest).exists());
+    }
+
+    #[tokio::test]
+    async fn refuses_concurrent_download() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("model.gguf");
+        let _held = lock(&dest).unwrap();
+        let err = download(Job { url: "http://127.0.0.1:1/x", dest: &dest, size: 1, sha256: "00" }, |_| {})
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("already running"), "{err}");
     }
 }

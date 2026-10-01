@@ -46,8 +46,8 @@
         {
           default = quillway; # Vulkan llama.cpp: AMD, Intel and NVIDIA GPUs
           quillway = quillway;
-          quillway-cpu = quillway.override { llama-cpp = pkgs.llama-cpp; };
-          quillway-rocm = quillway.override { llama-cpp = pkgs.llama-cpp-rocm; };
+          quillway-cpu = quillway.override { llamaCpp = pkgs.llama-cpp; };
+          quillway-rocm = quillway.override { llamaCpp = pkgs.llama-cpp-rocm; };
         }
       );
 

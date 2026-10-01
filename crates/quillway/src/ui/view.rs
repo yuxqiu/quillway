@@ -25,11 +25,9 @@ impl App {
         let pal = self.palette.faded(self.fade());
 
         let mut sections: Vec<Element<'_, Message>> = vec![self.input_row(p, pal)];
-        if let Some(body) = self.body(p, pal) {
-            sections.push(hairline(pal));
-            sections.push(body);
-        }
-        if matches!(p.phase(), Phase::Composing | Phase::Reviewing) && self.engine_state != EngineState::Missing {
+        sections.push(hairline(pal));
+        sections.push(self.body(p, pal));
+        if matches!(p.phase(), Phase::Composing | Phase::Reviewing) && !self.needs_install(p) {
             sections.push(hairline(pal));
             sections.push(self.chips(pal));
         }
@@ -37,7 +35,8 @@ impl App {
         sections.push(self.footer(p, pal));
 
         let panel = container(column(sections)).width(Length::Fill).style(pal.panel());
-        let ring = container(panel).padding(RING).width(self.config.ui.width as f32).style(pal.ring(self.shimmer()));
+        let width = f32::from(u16::try_from(self.config.ui.width).unwrap_or(u16::MAX));
+        let ring = container(panel).padding(RING).width(width).style(pal.ring(self.shimmer()));
         let measured = sensor(ring).on_show(Message::Resized).on_resize(Message::Resized);
 
         container(
@@ -45,13 +44,13 @@ impl App {
                 .direction(scrollable::Direction::Vertical(scrollable::Scrollbar::hidden()))
                 .height(Length::Fill),
         )
-        .padding(self.margin() as u16)
+        .padding(f32::from(u16::try_from(self.margin()).unwrap_or(0)))
         .into()
     }
 
     fn input_row<'a>(&'a self, p: &'a Popup, pal: Palette) -> Element<'a, Message> {
         let (placeholder, editable) = match p.phase() {
-            Phase::Composing if self.engine_state == EngineState::Missing => ("No model installed", false),
+            Phase::Composing if self.needs_install(p) => ("No model installed", false),
             Phase::Composing => ("Describe your change…", true),
             Phase::Generating => ("Writing…", false),
             Phase::Reviewing => ("Refine: make it warmer…   (↵ on empty copies)", true),
@@ -60,20 +59,20 @@ impl App {
         let mut input = text_input(placeholder, &p.input)
             .id(INPUT_ID)
             .size(18)
-            .padding(Padding { top: 15.0, bottom: 15.0, left: PAD_X as f32, right: PAD_X as f32 })
+            .padding(Padding { top: 15.0, bottom: 15.0, left: f32::from(PAD_X), right: f32::from(PAD_X) })
             .style(pal.input());
         if editable {
             input = input.on_input(Message::Input).on_submit(Message::Submit);
         }
-        if self.engine_state == EngineState::Missing {
+        if self.needs_install(p) {
             input = input.on_submit(Message::Submit);
         }
         input.into()
     }
 
-    fn body<'a>(&'a self, p: &'a Popup, pal: Palette) -> Option<Element<'a, Message>> {
-        if self.engine_state == EngineState::Missing {
-            return Some(self.install_card(pal));
+    fn body<'a>(&'a self, p: &'a Popup, pal: Palette) -> Element<'a, Message> {
+        if self.needs_install(p) {
+            return self.install_card(pal);
         }
         let content: Element<'a, Message> = match p.phase() {
             Phase::Composing => text_editor(&p.source)
@@ -90,10 +89,10 @@ impl App {
                     _ => text_editor::Binding::from_key_press(k),
                 })
                 .into(),
-            Phase::Generating => match self.streaming_text() {
-                Some(t) => body_scroll(text(t).size(15).color(pal.text).into()),
-                None => text("…").size(15).color(pal.faint).into(),
-            },
+            Phase::Generating => self.streaming_text().map_or_else(
+                || text("…").size(15).color(pal.faint).into(),
+                |t| body_scroll(text(t).size(15).color(pal.text).into()),
+            ),
             Phase::Reviewing | Phase::Copied => {
                 let d = p.drafts.last().expect("reviewing has a draft");
                 let color = if p.phase() == Phase::Copied { pal.dim } else { pal.text };
@@ -111,10 +110,14 @@ impl App {
         if let EngineState::Failed(e) = &self.engine_state {
             col = col.push(text(format!("Model server failed: {}", preview(e, 200))).size(13).color(pal.error));
         }
-        Some(container(col).padding([12, PAD_X]).width(Length::Fill).into())
+        container(col).padding([12, PAD_X]).width(Length::Fill).into()
     }
 
     fn install_card(&self, pal: Palette) -> Element<'_, Message> {
+        if !self.active.catalog {
+            let msg = format!("Model file not found: {}", self.active.path.display());
+            return container(text(msg).size(13).color(pal.error)).padding([14, PAD_X]).width(Length::Fill).into();
+        }
         let entry = quillway_core::catalog::find(&self.active.id).unwrap_or_else(quillway_core::catalog::default_entry);
         let line: Element<'_, Message> = match &self.install {
             Some(i) if i.error.is_some() => text(i.error.clone().unwrap_or_default()).size(13).color(pal.error).into(),
@@ -151,9 +154,9 @@ impl App {
 
     fn footer<'a>(&'a self, p: &'a Popup, pal: Palette) -> Element<'a, Message> {
         let left = match (p.phase(), &self.engine_state) {
-            (_, EngineState::Starting) => format!("{} · loading…", self.active.name),
+            (_, EngineState::Starting) => format!("{} · loading…", self.model_label()),
             (Phase::Generating, _) => {
-                format!("{} · {}", self.active.name, p.generation.as_ref().map(|g| g.label.as_str()).unwrap_or(""))
+                format!("{} · {}", self.model_label(), p.generation.as_ref().map_or("", |g| g.label.as_str()))
             }
             (Phase::Reviewing | Phase::Copied, _) => {
                 let d = p.drafts.last().expect("reviewing has a draft");
@@ -163,11 +166,11 @@ impl App {
             }
             (Phase::Composing, _) => {
                 let n = p.source.text().chars().count();
-                format!("{} · {} · {} chars", self.active.name, p.origin.label(), n)
+                format!("{} · {} · {} chars", self.model_label(), p.origin.label(), n)
             }
         };
         let hints = match p.phase() {
-            _ if self.engine_state == EngineState::Missing => "↵ install   esc close",
+            _ if self.needs_install(p) && self.active.catalog => "↵ install   esc close",
             Phase::Composing => "↵ run   1–9 preset   ⇥ switch box   esc close",
             Phase::Generating => "esc stop",
             Phase::Reviewing => "↵ copy   ⇥ diff   ^R retry   ^Z undo   esc",

@@ -6,6 +6,7 @@ use quillway_core::catalog::Sampling;
 use quillway_core::prompt::{self, ChatMessage};
 use serde_json::{Value, json};
 
+/// A connection to one OpenAI-compatible server.
 #[derive(Debug, Clone)]
 pub struct Client {
     http: reqwest::Client,
@@ -19,23 +20,32 @@ pub struct Client {
 /// One rewrite request.
 #[derive(Debug, Clone)]
 pub struct Rewrite {
+    /// What to do, e.g. a preset's instruction.
     pub instruction: String,
+    /// The text to rewrite.
     pub text: String,
+    /// Sampling temperature.
     pub temperature: f32,
+    /// Model-specific sampling defaults.
     pub sampling: Sampling,
+    /// Upper bound on generated tokens.
     pub max_tokens: u32,
 }
 
 impl Client {
-    pub fn new(base: String, api_key: Option<String>, model: String, llama: bool) -> Self {
+    /// `base` is the `/v1` URL; `llama` enables llama.cpp-only request fields.
+    #[must_use]
+    pub fn new(base: &str, api_key: Option<String>, model: String, llama: bool) -> Self {
         Self { http: reqwest::Client::new(), base: base.trim_end_matches('/').to_owned(), api_key, model, llama }
     }
 
-    pub fn is_llama(&self) -> bool {
+    /// Whether this is our own llama-server.
+    #[must_use]
+    pub const fn is_llama(&self) -> bool {
         self.llama
     }
 
-    pub fn body(&self, r: &Rewrite) -> Value {
+    fn body(&self, r: &Rewrite) -> Value {
         let messages: Vec<ChatMessage> = prompt::build_messages(&r.instruction, &r.text);
         let mut body = json!({
             "model": self.model,
@@ -46,8 +56,9 @@ impl Client {
             "max_tokens": r.max_tokens,
             "stop": [prompt::STOP],
         });
-        if self.llama {
-            let o = body.as_object_mut().expect("object");
+        if self.llama
+            && let Value::Object(o) = &mut body
+        {
             o.insert("top_k".into(), json!(r.sampling.top_k));
             o.insert("min_p".into(), json!(r.sampling.min_p));
             o.insert("cache_prompt".into(), json!(true));
@@ -60,6 +71,10 @@ impl Client {
     }
 
     /// Stream content deltas. Dropping the stream cancels the request.
+    ///
+    /// # Errors
+    ///
+    /// The server is unreachable or rejects the request; later failures arrive as stream items.
     pub async fn stream(
         &self,
         r: &Rewrite,
@@ -99,6 +114,10 @@ impl Client {
     }
 
     /// Collect a whole response (CLI use).
+    ///
+    /// # Errors
+    ///
+    /// As [`Client::stream`], plus any error reported mid-stream.
     pub async fn complete(&self, r: &Rewrite) -> anyhow::Result<String> {
         let mut s = std::pin::pin!(self.stream(r).await?);
         let mut out = String::new();
@@ -155,8 +174,8 @@ mod tests {
             sampling: Sampling { top_p: 0.8, top_k: 20, min_p: 0.0 },
             max_tokens: 128,
         };
-        let ours = Client::new("http://h/v1".into(), None, "m".into(), true).body(&r);
-        let byo = Client::new("http://h/v1".into(), None, "m".into(), false).body(&r);
+        let ours = Client::new("http://h/v1", None, "m".into(), true).body(&r);
+        let byo = Client::new("http://h/v1", None, "m".into(), false).body(&r);
         assert_eq!(ours["chat_template_kwargs"]["enable_thinking"], false);
         assert_eq!(ours["top_k"], 20);
         assert!(byo.get("top_k").is_none() && byo.get("chat_template_kwargs").is_none());

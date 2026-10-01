@@ -2,25 +2,32 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// A command from the CLI.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Request {
     /// Show the popup, or hide it if visible.
     Toggle {
+        /// Text to start from.
         input: Input,
     },
+    /// Show the popup (no-op if visible).
     Show {
+        /// Text to start from.
         input: Input,
     },
+    /// Hide the popup.
     Hide,
     /// Re-read config/state and restart the model server.
     Reload,
+    /// Report [`Response::Status`].
     Status,
+    /// Stop the daemon.
     Quit,
 }
 
 /// Where the text to rewrite comes from.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "from", content = "text", rename_all = "snake_case")]
 pub enum Input {
     /// The clipboard if it was copied recently, else an empty box to type in.
@@ -29,12 +36,26 @@ pub enum Input {
     Text(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// The daemon's answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum Response {
+    /// Done.
     Ok,
-    Status { visible: bool, model: String, engine: String },
-    Error { message: String },
+    /// Answer to [`Request::Status`].
+    Status {
+        /// Whether the popup is open.
+        visible: bool,
+        /// Active model's display name.
+        model: String,
+        /// Model server state, e.g. `ready`.
+        engine: String,
+    },
+    /// The request failed.
+    Error {
+        /// What went wrong.
+        message: String,
+    },
 }
 
 #[cfg(test)]

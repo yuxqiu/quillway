@@ -5,6 +5,7 @@
 //! Per model: how often raw output needed cleanup (preamble, think tags,
 //! quotes, fences), latency after warm-up, and every output for eyeballing.
 
+use std::fmt::Write;
 use std::time::Instant;
 
 use futures_util::StreamExt;
@@ -45,7 +46,7 @@ async fn main() -> anyhow::Result<()> {
         let client = engine.client().await?;
 
         let (mut cleaned, mut think, mut firsts, mut rates) = (0, 0, Vec::new(), Vec::new());
-        details += &format!("\n## {}\n\n", active.name);
+        let _ = write!(details, "\n## {}\n\n", active.name);
         for text in TEXTS {
             for preset in [proofread, professional] {
                 let r = Rewrite {
@@ -68,12 +69,13 @@ async fn main() -> anyhow::Result<()> {
                 let first = first.unwrap_or_default();
                 let gen_secs = t0.elapsed().saturating_sub(first).as_secs_f64().max(1e-3);
                 firsts.push(first.as_secs_f64());
-                rates.push(n.saturating_sub(1) as f64 / gen_secs);
+                rates.push(f64::from(u32::try_from(n.saturating_sub(1)).unwrap_or(u32::MAX)) / gen_secs);
                 let out = clean::clean(&raw, text, true);
                 let needed = out.trim() != raw.trim();
-                cleaned += needed as usize;
-                think += raw.contains("<think>") as usize;
-                details += &format!(
+                cleaned += usize::from(needed);
+                think += usize::from(raw.contains("<think>"));
+                let _ = write!(
+                    details,
                     "- **{}**: `{}`\n  → {}{}\n",
                     preset.name,
                     text.replace('\n', "⏎"),

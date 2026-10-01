@@ -7,6 +7,8 @@
 /// can be recognised and dropped before it flashes on screen.
 pub const DISPLAY_AFTER: usize = 60;
 
+/// Whether enough output has arrived to show it.
+#[must_use]
 pub fn ready(raw: &str, finished: bool) -> bool {
     finished || raw.chars().count() >= DISPLAY_AFTER
 }
@@ -16,58 +18,62 @@ const PREAMBLE_STARTS: [&str; 10] =
 
 const OUTRO_STARTS: [&str; 5] = ["let me know", "i hope", "feel free", "hope this", "if you'd like"];
 
+/// `raw` model output with the wrapping removed.
+///
+/// `input` is the text that was rewritten; its quoting and trailing newline
+/// are mirrored. `finished` enables the end-of-output rules (outro, quotes,
+/// trailing newline).
+#[must_use]
 pub fn clean(raw: &str, input: &str, finished: bool) -> String {
-    let mut s = strip_think(raw).to_owned();
-
-    s = s.trim_start().to_owned();
+    let mut s = strip_think(raw).trim_start();
     if let Some(rest) = s.strip_prefix("<text>") {
-        s = rest.trim_start().to_owned();
+        s = rest.trim_start();
     }
     if let Some(i) = s.find("</text>") {
-        s.truncate(i);
+        s = &s[..i];
     }
 
-    // "Sure! Here's the rewritten text:" on its own line.
+    // "Sure! Here's the rewritten text:" on its own line, unless the input
+    // itself starts that way ("Revised timeline:").
+    let input_first = input.trim_start().lines().next().unwrap_or("").trim().to_lowercase();
     if let Some((first, rest)) = s.split_once('\n') {
         let f = first.trim().to_lowercase();
-        if f.len() < 90 && f.ends_with(':') && PREAMBLE_STARTS.iter().any(|p| f.starts_with(p)) {
-            s = rest.trim_start().to_owned();
+        let preamble = PREAMBLE_STARTS.iter().find(|p| f.starts_with(*p));
+        if f.len() < 90 && f.ends_with(':') && preamble.is_some_and(|p| !input_first.starts_with(p)) {
+            s = rest.trim_start();
         }
     }
 
     if !input.trim_start().starts_with("```") && s.starts_with("```") {
-        s = match s.split_once('\n') {
-            Some((_, body)) => body.to_owned(),
-            None => String::new(),
-        };
+        s = s.split_once('\n').map_or("", |(_, body)| body);
         if let Some(i) = s.rfind("```") {
-            s.truncate(i);
+            s = &s[..i];
         }
     }
 
-    if finished {
-        if let Some(i) = s.trim_end().rfind("\n\n") {
-            let last = s[i..].trim().to_lowercase();
-            if OUTRO_STARTS.iter().any(|p| last.starts_with(p)) {
-                s.truncate(i);
-            }
-        }
-        s = strip_wrapping_quotes(s.trim_end(), input).to_owned();
-        if input.ends_with('\n') {
-            s.push('\n');
-        }
+    if !finished {
+        return s.to_owned();
     }
-    s
+    // An outro is only the model's if the input had nothing like it.
+    let input_lc = input.to_lowercase();
+    if !OUTRO_STARTS.iter().any(|p| input_lc.contains(p))
+        && let Some(i) = s.trim_end().rfind("\n\n")
+        && OUTRO_STARTS.iter().any(|p| s[i..].trim().to_lowercase().starts_with(p))
+    {
+        s = &s[..i];
+    }
+    let mut out = strip_wrapping_quotes(s.trim_end(), input).to_owned();
+    if input.ends_with('\n') {
+        out.push('\n');
+    }
+    out
 }
 
 /// Drop `<think>…</think>`; an unterminated block hides everything after it.
 fn strip_think(s: &str) -> &str {
     let t = s.trim_start();
     if let Some(rest) = t.strip_prefix("<think>") {
-        return match rest.find("</think>") {
-            Some(i) => &rest[i + "</think>".len()..],
-            None => "",
-        };
+        return rest.find("</think>").map_or("", |i| &rest[i + "</think>".len()..]);
     }
     s
 }
@@ -136,6 +142,18 @@ mod tests {
     fn strips_outro_paragraph() {
         assert_eq!(done("Hello.\n\nLet me know if you need anything else!", "hi"), "Hello.");
         assert_eq!(done("Hello.\n\nWorld.", "hi\n\nworld"), "Hello.\n\nWorld.");
+    }
+
+    #[test]
+    fn keeps_preamble_and_outro_that_were_in_the_input() {
+        assert_eq!(done("Revised timeline:\n- Mon", "revised timeline:\n- mon"), "Revised timeline:\n- Mon");
+        assert_eq!(
+            done(
+                "Could you review the document?\n\nLet me know what you think.",
+                "can u review the doc\n\nlet me know what u think"
+            ),
+            "Could you review the document?\n\nLet me know what you think."
+        );
     }
 
     #[test]

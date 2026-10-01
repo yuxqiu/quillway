@@ -8,11 +8,16 @@ use quillway_core::config::Config;
 use quillway_core::paths;
 use serde::{Deserialize, Serialize};
 
+/// The model requests will use.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Active {
+    /// Catalog id, or `custom:<path>`.
     pub id: String,
+    /// Display name.
     pub name: String,
+    /// The GGUF file (may not exist yet).
     pub path: PathBuf,
+    /// Sampling defaults.
     pub sampling: Sampling,
     /// A catalog entry (installable) rather than a custom path.
     pub catalog: bool,
@@ -22,28 +27,39 @@ pub struct Active {
 /// possibly read-only, Nix-generated config file.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct State {
+    /// Chosen with `quillway models use`.
     pub active: Option<String>,
 }
 
 impl State {
+    /// The saved state; empty if missing or unreadable.
+    #[must_use]
     pub fn load() -> Self {
         std::fs::read_to_string(paths::state_file()).ok().and_then(|s| toml::from_str(&s).ok()).unwrap_or_default()
     }
 
+    /// Write the state file.
+    ///
+    /// # Errors
+    ///
+    /// The state directory or file can't be written.
     pub fn save(&self) -> anyhow::Result<()> {
         let p = paths::state_file();
-        std::fs::create_dir_all(p.parent().expect("state file has a parent"))?;
+        if let Some(dir) = p.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
         std::fs::write(&p, toml::to_string(self)?).with_context(|| format!("writing {}", p.display()))
     }
 }
 
 /// Priority: config `model.active`, then `models use` state, then the catalog default.
+#[must_use]
 pub fn active(config: &Config) -> Active {
     let chosen = config.model.active.clone().or_else(|| State::load().active);
     resolve(chosen.as_deref(), &paths::models_dir())
 }
 
-pub fn resolve(id: Option<&str>, models_dir: &Path) -> Active {
+fn resolve(id: Option<&str>, models_dir: &Path) -> Active {
     if let Some(path) = id.and_then(|i| i.strip_prefix("custom:")) {
         let path = PathBuf::from(path);
         let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
@@ -59,6 +75,8 @@ pub fn resolve(id: Option<&str>, models_dir: &Path) -> Active {
     Active { id: e.id.clone(), name: e.name.clone(), path: e.path_in(models_dir), sampling: e.sampling, catalog: true }
 }
 
+/// Whether the entry's file is downloaded.
+#[must_use]
 pub fn is_installed(e: &catalog::Entry) -> bool {
     e.path_in(&paths::models_dir()).is_file()
 }

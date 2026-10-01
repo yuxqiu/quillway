@@ -37,7 +37,8 @@ pub struct Reply(Arc<Mutex<Option<oneshot::Sender<Response>>>>);
 
 impl Reply {
     pub fn send(&self, r: Response) {
-        if let Some(tx) = self.0.lock().expect("reply lock").take() {
+        let tx = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+        if let Some(tx) = tx {
             let _ = tx.send(r);
         }
     }
@@ -89,7 +90,7 @@ async fn handle(stream: UnixStream, tx: mpsc::Sender<(Request, Reply)>) -> anyho
         Ok(req) => {
             let (otx, orx) = oneshot::channel();
             tx.send((req, Reply(Arc::new(Mutex::new(Some(otx)))))).await?;
-            orx.await.unwrap_or(Response::Error { message: "daemon dropped the request".into() })
+            orx.await.unwrap_or_else(|_| Response::Error { message: "daemon dropped the request".into() })
         }
         Err(e) => Response::Error { message: format!("bad request: {e}") },
     };

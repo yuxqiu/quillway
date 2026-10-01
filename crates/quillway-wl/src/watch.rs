@@ -25,6 +25,10 @@ pub struct ClipboardWatch(Arc<Mutex<Option<Instant>>>);
 
 impl ClipboardWatch {
     /// Connect to the compositor and watch on a background thread.
+    ///
+    /// # Errors
+    ///
+    /// No Wayland connection, or the compositor lacks data-control.
     pub fn start() -> anyhow::Result<Self> {
         let conn = Connection::connect_to_env().context("connecting to Wayland")?;
         let (globals, mut queue) = registry_queue_init::<State>(&conn)?;
@@ -55,8 +59,10 @@ impl ClipboardWatch {
         Ok(watch)
     }
 
+    /// When the clipboard last changed after the watch started.
+    #[must_use]
     pub fn last_change(&self) -> Option<Instant> {
-        *self.0.lock().expect("watch lock")
+        *self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -68,7 +74,7 @@ struct State {
 impl State {
     fn changed(&self) {
         if self.armed {
-            *self.last.lock().expect("watch lock") = Some(Instant::now());
+            *self.last.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Instant::now());
         }
     }
 }
@@ -78,7 +84,7 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for State {
         state: &mut Self,
         device: &ExtDataControlDeviceV1,
         event: ext_device::Event,
-        _: &(),
+        (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
@@ -103,7 +109,7 @@ impl Dispatch<ZwlrDataControlDeviceV1, ()> for State {
         state: &mut Self,
         device: &ZwlrDataControlDeviceV1,
         event: wlr_device::Event,
-        _: &(),
+        (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {

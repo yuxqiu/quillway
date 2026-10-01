@@ -6,6 +6,7 @@
 
 use serde::Serialize;
 
+/// Shared instructions for every request.
 pub const SYSTEM_PROMPT: &str = "You are a text-rewriting engine, not a chat assistant. \
 You receive a task and a text inside <text> tags. Output ONLY the rewritten text: \
 no preamble, no explanation, no quotes, no notes, no markdown fences, no <text> tags. \
@@ -39,16 +40,21 @@ const FEW_SHOT: [(&str, &str, &str); 4] = [
     ),
 ];
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+/// One OpenAI-style chat message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ChatMessage {
+    /// `system`, `user` or `assistant`.
     pub role: &'static str,
+    /// Message text.
     pub content: String,
 }
 
-pub fn user_turn(instruction: &str, text: &str) -> String {
+fn user_turn(instruction: &str, text: &str) -> String {
     format!("Task: {}\n<text>\n{}\n</text>", instruction.trim(), text)
 }
 
+/// The full conversation for rewriting `text` according to `instruction`.
+#[must_use]
 pub fn build_messages(instruction: &str, text: &str) -> Vec<ChatMessage> {
     let msg = |role, content: String| ChatMessage { role, content };
     let mut out = vec![msg("system", SYSTEM_PROMPT.to_owned())];
@@ -61,16 +67,23 @@ pub fn build_messages(instruction: &str, text: &str) -> Vec<ChatMessage> {
 }
 
 /// Output budget: generous for rewrites, bounded so a runaway generation can't stall.
+#[must_use]
 pub fn max_tokens(text: &str, context: u32) -> u32 {
-    let est_input = (text.chars().count() as u32).div_ceil(3);
-    (est_input * 3 / 2 + 64).clamp(128, (context / 2).max(128))
+    let est_input = est_tokens(text);
+    est_input.saturating_mul(3).saturating_div(2).saturating_add(64).clamp(128, (context / 2).max(128))
 }
 
 /// Whether `text` plus a rewrite of similar length fits in the context window.
 /// (~3 chars per token is conservative for English; the prefix is ~400 tokens.)
+#[must_use]
 pub fn fits(text: &str, context: u32) -> bool {
-    let est = (text.chars().count() as u32).div_ceil(3);
-    400 + est + est.max(128) <= context
+    let est = est_tokens(text);
+    est.saturating_add(est.max(128)).saturating_add(400) <= context
+}
+
+/// ~3 characters per token: conservative for English.
+fn est_tokens(text: &str) -> u32 {
+    u32::try_from(text.chars().count().div_ceil(3)).unwrap_or(u32::MAX)
 }
 
 #[cfg(test)]

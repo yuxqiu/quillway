@@ -5,17 +5,22 @@ use std::path::Path;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
+/// The whole config file.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
+    /// `[model]`
     pub model: ModelConfig,
+    /// `[ui]`
     pub ui: UiConfig,
+    /// `[behavior]`
     pub behavior: Behavior,
     /// Replaces the built-in presets when non-empty.
     #[serde(rename = "preset")]
     pub presets: Vec<Preset>,
 }
 
+/// `[model]`: which model runs and how.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ModelConfig {
@@ -57,20 +62,26 @@ impl Default for ModelConfig {
     }
 }
 
+/// Popup colour scheme.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ThemeChoice {
+    /// Light text on a dark panel.
     #[default]
     Dark,
+    /// Dark text on a light panel.
     Light,
 }
 
+/// `[ui]`: popup look and placement.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct UiConfig {
+    /// Colour scheme.
     pub theme: ThemeChoice,
-    /// `#rrggbb`
+    /// Accent colour, `#rrggbb`.
     pub accent: String,
+    /// Panel width in logical pixels.
     pub width: u32,
     /// Distance from the top of the output, in logical pixels.
     pub top_margin: u32,
@@ -79,6 +90,7 @@ pub struct UiConfig {
     /// Draw the shadow ourselves (needs a transparent margin). Turn off when a
     /// compositor rule draws it, e.g. niri `layer-rule { shadow { on; } }`.
     pub client_shadow: bool,
+    /// Font family name; the system sans-serif when unset.
     pub font: Option<String>,
 }
 
@@ -96,6 +108,7 @@ impl Default for UiConfig {
     }
 }
 
+/// `[behavior]`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Behavior {
@@ -110,11 +123,15 @@ impl Default for Behavior {
     }
 }
 
+/// `[[preset]]`: a one-key rewrite.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Preset {
+    /// Chip label.
     pub name: String,
+    /// The task given to the model.
     pub instruction: String,
+    /// Sampling temperature; 0.7 when unset. Low for proofreading, higher for rewording.
     #[serde(default)]
     pub temperature: Option<f32>,
     /// Open the result in the word-diff view.
@@ -124,6 +141,10 @@ pub struct Preset {
 
 impl Config {
     /// Reads `path`; a missing file yields the defaults.
+    ///
+    /// # Errors
+    ///
+    /// The file exists but can't be read or isn't a valid config.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         match std::fs::read_to_string(path) {
             Ok(s) => toml::from_str(&s).with_context(|| format!("parsing {}", path.display())),
@@ -132,11 +153,15 @@ impl Config {
         }
     }
 
+    /// The configured presets, or the built-in ones if none are configured.
+    #[must_use]
     pub fn presets(&self) -> Vec<Preset> {
         if self.presets.is_empty() { default_presets() } else { self.presets.clone() }
     }
 }
 
+/// Proofread, Rewrite, Friendly, Professional, Concise, Summary, Key points.
+#[must_use]
 pub fn default_presets() -> Vec<Preset> {
     let p = |name: &str, instruction: &str, temperature: f32, show_diff: bool| Preset {
         name: name.into(),

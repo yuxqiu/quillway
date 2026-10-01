@@ -11,3 +11,6 @@ serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
 similar = "2"
+
+[lints]
+workspace = true

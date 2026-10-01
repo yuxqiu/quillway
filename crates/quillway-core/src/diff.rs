@@ -2,20 +2,28 @@
 
 use similar::{ChangeTag, TextDiff};
 
+/// How a span differs between the old and new text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Change {
+    /// In both.
     Same,
+    /// Only in the new text.
     Added,
+    /// Only in the old text.
     Removed,
 }
 
+/// A run of text with one kind of change.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Span {
+    /// The kind of change.
     pub change: Change,
+    /// The text, including its whitespace.
     pub text: String,
 }
 
 /// Adjacent tokens with the same tag are merged into one span.
+#[must_use]
 pub fn word_diff(old: &str, new: &str) -> Vec<Span> {
     let diff = TextDiff::from_words(old, new);
     let mut out: Vec<Span> = Vec::new();
@@ -33,10 +41,6 @@ pub fn word_diff(old: &str, new: &str) -> Vec<Span> {
     out
 }
 
-pub fn changed_words(spans: &[Span]) -> usize {
-    spans.iter().filter(|s| s.change == Change::Added).map(|s| s.text.split_whitespace().count()).sum()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -48,7 +52,6 @@ mod tests {
         let added: String = d.iter().filter(|s| s.change == Change::Added).map(|s| s.text.as_str()).collect();
         assert_eq!(removed, "their");
         assert_eq!(added, "they're");
-        assert_eq!(changed_words(&d), 1);
     }
 
     #[test]

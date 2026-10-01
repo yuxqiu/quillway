@@ -1,4 +1,4 @@
-//! The daemon: an iced_layershell program with no surface until `show`.
+//! The daemon: an `iced_layershell` program with no surface until `show`.
 //!
 //! One popup at a time. Its life: take the input text (recent clipboard, text
 //! from the CLI, or typed into the popup) → compose → generate (streamed) →
@@ -32,6 +32,7 @@ const SOURCE_ID: &str = "quillway-source";
 const MAX_SURFACE_HEIGHT: u32 = 760;
 const COPIED_LINGER: Duration = Duration::from_millis(450);
 const FADE_IN: Duration = Duration::from_millis(140);
+const CLIPBOARD_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Bound before the UI starts; taken once by the IPC subscription.
 static LISTENER: Mutex<Option<UnixListener>> = Mutex::new(None);
@@ -42,10 +43,9 @@ pub fn run() -> anyhow::Result<()> {
     let watch = quillway_wl::ClipboardWatch::start()
         .inspect_err(|e| eprintln!("quillway: {e:#}; the clipboard will always count as recent"))
         .ok();
-    let default_font = match &config.ui.font {
-        Some(f) => iced::Font::with_name(Box::leak(f.clone().into_boxed_str())),
-        None => iced::Font::default(),
-    };
+    // `Font::with_name` needs a `'static` name; this runs once per process.
+    let default_font =
+        config.ui.font.as_ref().map_or_else(iced::Font::default, |f| iced::Font::with_name(f.clone().leak()));
     iced_layershell::daemon(move || App::boot(config.clone(), watch.clone()), namespace, App::update, App::view)
         .subscription(App::subscription)
         .style(|app: &App, _| iced::theme::Style {
@@ -75,11 +75,11 @@ pub enum Origin {
 }
 
 impl Origin {
-    pub fn label(self) -> &'static str {
+    pub const fn label(self) -> &'static str {
         match self {
-            Origin::Clipboard => "clipboard",
-            Origin::Editor => "editor",
-            Origin::Typed => "typed",
+            Self::Clipboard => "clipboard",
+            Self::Editor => "editor",
+            Self::Typed => "typed",
         }
     }
 }
@@ -91,7 +91,7 @@ pub enum Field {
     Source,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EngineState {
     Starting,
     Ready,
@@ -149,7 +149,7 @@ pub struct Popup {
 }
 
 impl Popup {
-    pub fn phase(&self) -> Phase {
+    pub const fn phase(&self) -> Phase {
         if self.copied {
             Phase::Copied
         } else if self.generation.is_some() {
@@ -163,10 +163,7 @@ impl Popup {
 
     /// Text the next preset/refinement applies to: the latest draft, else the input.
     fn base(&self) -> String {
-        match self.drafts.last() {
-            Some(d) => d.text.clone(),
-            None => self.source.text(),
-        }
+        self.drafts.last().map_or_else(|| self.source.text(), |d| d.text.clone())
     }
 }
 
@@ -189,6 +186,8 @@ pub struct App {
     next_gen: u64,
     /// `None` if the compositor can't report clipboard changes.
     watch: Option<quillway_wl::ClipboardWatch>,
+    /// A clipboard read is in flight; a second toggle cancels it.
+    capturing: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -217,7 +216,10 @@ pub enum InstallEvent {
 #[derive(Debug, Clone)]
 pub enum Message {
     Ipc(Request, Reply),
-    Captured { text: Option<String>, error: Option<String> },
+    Captured {
+        text: Option<String>,
+        error: Option<String>,
+    },
     Input(String),
     Edit(text_editor::Action),
     Submit,
@@ -226,7 +228,8 @@ pub enum Message {
     Shortcut(Shortcut),
     Resized(Size),
     Tick(Instant),
-    Hide,
+    /// Close the popup if it is still this window (a delayed hide must not close a newer one).
+    Hide(window::Id),
     Engine(Result<(), String>),
     InstallStart,
     Install(InstallEvent),
@@ -248,6 +251,7 @@ impl App {
             now: Instant::now(),
             next_gen: 0,
             watch,
+            capturing: false,
         };
         let warm = app.warm_up();
         (app, warm)
@@ -281,7 +285,7 @@ impl App {
 
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::Ipc(req, reply) => self.ipc(req, reply),
+            Message::Ipc(req, reply) => self.ipc(req, &reply),
             Message::Captured { text, error } => self.captured(text, error),
             Message::Input(s) => self.on_input(s),
             Message::Edit(action) => {
@@ -299,7 +303,13 @@ impl App {
                 self.now = now;
                 Task::none()
             }
-            Message::Hide => self.hide(),
+            Message::Hide(id) => {
+                if self.popup.as_ref().is_some_and(|p| p.id == id) {
+                    self.hide()
+                } else {
+                    Task::none()
+                }
+            }
             Message::Engine(r) => {
                 self.engine_state = match r {
                     Ok(()) => EngineState::Ready,
@@ -327,20 +337,27 @@ impl App {
         }
     }
 
-    fn ipc(&mut self, req: Request, reply: Reply) -> Task<Message> {
+    fn ipc(&mut self, req: Request, reply: &Reply) -> Task<Message> {
         match req {
             Request::Toggle { .. } if self.popup.is_some() => {
                 reply.send(Response::Ok);
                 self.hide()
             }
+            Request::Toggle { .. } if self.capturing => {
+                // Pressed again while the clipboard is still being read: cancel.
+                reply.send(Response::Ok);
+                self.capturing = false;
+                Task::none()
+            }
             Request::Toggle { input } | Request::Show { input } => {
                 reply.send(Response::Ok);
-                if self.popup.is_some() {
+                if self.popup.is_some() || self.capturing {
                     return Task::none();
                 }
                 match input {
                     Input::Text(t) => self.open(t, Origin::Editor, None),
                     Input::Clipboard if self.clipboard_recent() => {
+                        self.capturing = true;
                         Task::perform(read_clipboard(), |(text, error)| Message::Captured { text, error })
                     }
                     Input::Clipboard => self.open(String::new(), Origin::Typed, None),
@@ -359,7 +376,7 @@ impl App {
                     self.config = config.clone();
                     let engine = self.engine.clone();
                     let reload =
-                        Task::perform(async move { engine.reload(config).await }, |_| Message::Tick(Instant::now()));
+                        Task::perform(async move { engine.reload(config).await }, |()| Message::Tick(Instant::now()));
                     reload.chain(self.warm_up())
                 }
                 Err(e) => {
@@ -374,7 +391,7 @@ impl App {
                     EngineState::Missing => "model not installed".to_owned(),
                     EngineState::Failed(e) => format!("failed: {e}"),
                 };
-                reply.send(Response::Status { visible: self.popup.is_some(), model: self.active.name.clone(), engine });
+                reply.send(Response::Status { visible: self.popup.is_some(), model: self.model_label(), engine });
                 Task::none()
             }
             Request::Quit => {
@@ -384,7 +401,7 @@ impl App {
         }
     }
 
-    fn margin(&self) -> u32 {
+    const fn margin(&self) -> u32 {
         if self.config.ui.client_shadow { style::SHADOW_MARGIN } else { 0 }
     }
 
@@ -400,8 +417,8 @@ impl App {
     }
 
     fn captured(&mut self, text: Option<String>, error: Option<String>) -> Task<Message> {
-        if self.popup.is_some() {
-            return Task::none();
+        if !std::mem::take(&mut self.capturing) || self.popup.is_some() {
+            return Task::none(); // cancelled by a second toggle
         }
         match text {
             Some(t) => self.open(t, Origin::Clipboard, error),
@@ -412,7 +429,7 @@ impl App {
     fn open(&mut self, text: String, origin: Origin, error: Option<String>) -> Task<Message> {
         let id = window::Id::unique();
         let size = self.surface_size(196);
-        let top = self.config.ui.top_margin as i32 - self.margin() as i32;
+        let top = i32::try_from(self.config.ui.top_margin.saturating_sub(self.margin())).unwrap_or(i32::MAX);
         self.now = Instant::now();
         self.popup = Some(Popup {
             id,
@@ -436,7 +453,7 @@ impl App {
                 layer: Layer::Overlay,
                 anchor: Anchor::Top,
                 exclusive_zone: None,
-                margin: Some((top.max(0), 0, 0, 0)),
+                margin: Some((top, 0, 0, 0)),
                 keyboard_interactivity: KeyboardInteractivity::Exclusive,
                 output_option: OutputOption::Active,
                 events_transparent: false,
@@ -460,6 +477,11 @@ impl App {
         }
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "layout heights are small and positive"
+    )]
     fn on_resize(&mut self, panel: Size) -> Task<Message> {
         let mut tasks = Vec::new();
         let want = self.surface_size(panel.height.ceil() as u32);
@@ -493,7 +515,8 @@ impl App {
     }
 
     fn submit(&mut self) -> Task<Message> {
-        if self.engine_state == EngineState::Missing {
+        let Some(p) = self.popup.as_ref() else { return Task::none() };
+        if self.needs_install(p) {
             return self.start_install();
         }
         let Some(p) = self.popup.as_mut() else { return Task::none() };
@@ -534,6 +557,10 @@ impl App {
             p.error = Some("Nothing to rewrite: type or paste the text into the box (Tab switches boxes).".into());
             return Task::none();
         }
+        if text.contains(prompt::STOP) {
+            p.error = Some(format!("The text contains `{}`, which Quillway uses as a delimiter.", prompt::STOP));
+            return Task::none();
+        }
         if !prompt::fits(&text, context) {
             p.error = Some(format!(
                 "Too long for the model's {context}-token context ({} chars). Select less, or raise `model.context`.",
@@ -544,7 +571,7 @@ impl App {
         let request =
             Rewrite { instruction, max_tokens: prompt::max_tokens(&text, context), text, temperature, sampling };
         if p.drafts.is_empty() {
-            p.original = request.text.clone();
+            p.original.clone_from(&request.text);
         }
         self.start(label, request, show_diff, false)
     }
@@ -577,6 +604,10 @@ impl App {
         let Some(g) = p.generation.as_mut().filter(|g| g.id == id) else { return Task::none() };
         match ev {
             GenEvent::Delta(d) => {
+                // Text is flowing, so whatever failed before has recovered.
+                if matches!(self.engine_state, EngineState::Failed(_) | EngineState::Starting) {
+                    self.engine_state = EngineState::Ready;
+                }
                 g.first.get_or_insert_with(Instant::now);
                 g.deltas += 1;
                 g.raw.push_str(&d);
@@ -593,8 +624,8 @@ impl App {
                     return Task::none();
                 }
                 let secs = g.started.elapsed().as_secs_f64();
-                let gen_secs = g.first.map(|f| f.elapsed().as_secs_f64()).unwrap_or(secs).max(1e-3);
-                let rate = g.deltas.saturating_sub(1) as f64 / gen_secs;
+                let gen_secs = g.first.map_or(secs, |f| f.elapsed().as_secs_f64()).max(1e-3);
+                let rate = f64::from(u32::try_from(g.deltas.saturating_sub(1)).unwrap_or(u32::MAX)) / gen_secs;
                 p.show_diff = g.show_diff;
                 if g.replace {
                     p.drafts.pop();
@@ -653,7 +684,8 @@ impl App {
         match quillway_wl::copy(&d.text) {
             Ok(()) => {
                 p.copied = true;
-                Task::perform(tokio::time::sleep(COPIED_LINGER), |_| Message::Hide)
+                let id = p.id;
+                Task::perform(tokio::time::sleep(COPIED_LINGER), move |()| Message::Hide(id))
             }
             Err(e) => {
                 p.error = Some(format!("{e:#}"));
@@ -702,6 +734,19 @@ impl App {
                 i.error = Some(e);
                 Task::none()
             }
+        }
+    }
+
+    /// The install card replaces the composer only before anything was generated.
+    pub fn needs_install(&self, p: &Popup) -> bool {
+        self.engine_state == EngineState::Missing && p.phase() == Phase::Composing
+    }
+
+    /// Name shown in the footer and `status`.
+    pub fn model_label(&self) -> String {
+        match &self.config.model.endpoint {
+            Some(_) => self.config.model.endpoint_model.clone().unwrap_or_else(|| "endpoint".into()),
+            None => self.active.name.clone(),
         }
     }
 
@@ -760,10 +805,14 @@ fn focus(field: Field) -> Task<Message> {
 
 /// Returns (text, error).
 async fn read_clipboard() -> (Option<String>, Option<String>) {
-    match tokio::task::spawn_blocking(quillway_wl::read).await {
-        Ok(Ok(text)) => (text, None),
-        Ok(Err(e)) => (None, Some(format!("{e:#}"))),
-        Err(e) => (None, Some(e.to_string())),
+    // The app that owns the clipboard sends the data; a hung one must not block the popup.
+    match tokio::time::timeout(CLIPBOARD_TIMEOUT, tokio::task::spawn_blocking(quillway_wl::read)).await {
+        Ok(Ok(Ok(text))) => (text, None),
+        Ok(Ok(Err(e))) => (None, Some(format!("{e:#}"))),
+        Ok(Err(e)) => (None, Some(e.to_string())),
+        Err(_) => {
+            (None, Some("The app that owns the clipboard didn't respond; type or paste the text instead.".into()))
+        }
     }
 }
 
@@ -788,7 +837,8 @@ fn install_stream(entry: &'static Entry) -> impl Stream<Item = InstallEvent> {
         let mut progress = out.clone();
         let mut last = 0u64;
         let r = download::download(Job { url: &url, dest: &dest, size: entry.size, sha256: &entry.sha256 }, |p| {
-            if p.done.saturating_sub(last) >= 8 << 20 || p.done == p.total {
+            // `done` drops back to 0 when the server ignores the resume range.
+            if p.done < last || p.done - last >= 8 << 20 || p.done == p.total {
                 last = p.done;
                 let _ = progress.try_send(InstallEvent::Progress(p.done));
             }

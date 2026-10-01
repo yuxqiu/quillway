@@ -36,7 +36,7 @@ pub async fn run() -> anyhow::Result<()> {
     );
 
     match quillway_wl::read() {
-        Ok(t) => check(true, "clipboard", format!("readable ({} chars)", t.map(|t| t.chars().count()).unwrap_or(0))),
+        Ok(t) => check(true, "clipboard", format!("readable ({} chars)", t.map_or(0, |t| t.chars().count()))),
         Err(e) => check(false, "clipboard", format!("{e:#}")),
     }
     match quillway_wl::ClipboardWatch::start() {
@@ -44,34 +44,33 @@ pub async fn run() -> anyhow::Result<()> {
         Err(e) => check(false, "clipboard watch", format!("{e:#} (the clipboard is always treated as recent)")),
     }
 
-    match &config.model.endpoint {
-        Some(e) => check(true, "endpoint", format!("{e} (built-in llama-server disabled)")),
-        None => {
-            let bin = config.model.llama_server.clone().unwrap_or_else(|| "llama-server".into());
-            let found = std::process::Command::new(&bin).arg("--version").output();
-            match found {
-                Ok(o) => {
-                    let all = String::from_utf8_lossy(&o.stderr).into_owned() + &String::from_utf8_lossy(&o.stdout);
-                    let v = all.lines().find(|l| l.starts_with("version")).unwrap_or("found").to_owned();
-                    check(true, "llama-server", v)
-                }
-                Err(e) => check(false, "llama-server", format!("{bin}: {e}")),
+    if let Some(e) = &config.model.endpoint {
+        check(true, "endpoint", format!("{e} (built-in llama-server disabled)"));
+    } else {
+        let bin = config.model.llama_server.clone().unwrap_or_else(|| "llama-server".into());
+        let found = std::process::Command::new(&bin).arg("--version").output();
+        match found {
+            Ok(o) => {
+                let all = String::from_utf8_lossy(&o.stderr).into_owned() + &String::from_utf8_lossy(&o.stdout);
+                let v = all.lines().find(|l| l.starts_with("version")).unwrap_or("found").to_owned();
+                check(true, "llama-server", v);
             }
-            let active = models::active(&config);
-            check(
-                active.path.is_file(),
-                "model",
-                format!(
-                    "{} ({})",
-                    active.name,
-                    if active.path.is_file() {
-                        active.path.display().to_string()
-                    } else {
-                        format!("not installed: run `quillway models install {}`", active.id)
-                    }
-                ),
-            );
+            Err(e) => check(false, "llama-server", format!("{bin}: {e}")),
         }
+        let active = models::active(&config);
+        check(
+            active.path.is_file(),
+            "model",
+            format!(
+                "{} ({})",
+                active.name,
+                if active.path.is_file() {
+                    active.path.display().to_string()
+                } else {
+                    format!("not installed: run `quillway models install {}`", active.id)
+                }
+            ),
+        );
     }
 
     match crate::ipc::send(&Request::Status).await {

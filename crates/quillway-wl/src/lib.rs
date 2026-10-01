@@ -14,6 +14,10 @@ use wl_clipboard_rs::paste::{self, ClipboardType, Error, MimeType, Seat};
 const MAX_BYTES: u64 = 1 << 20;
 
 /// Text on the clipboard; `Ok(None)` when it is empty or non-text.
+///
+/// # Errors
+///
+/// The compositor can't be reached or lacks data-control.
 pub fn read() -> anyhow::Result<Option<String>> {
     match paste::get_contents(ClipboardType::Regular, Seat::Unspecified, MimeType::Text) {
         Ok((pipe, _mime)) => {
@@ -29,6 +33,10 @@ pub fn read() -> anyhow::Result<Option<String>> {
 
 /// Put `text` on the clipboard. A background thread keeps serving it until
 /// something else is copied, so the caller must stay alive (the daemon does).
+///
+/// # Errors
+///
+/// The compositor can't be reached or lacks data-control.
 pub fn copy(text: &str) -> anyhow::Result<()> {
     Options::new()
         .copy(copy::Source::Bytes(text.as_bytes().into()), copy::MimeType::Text)

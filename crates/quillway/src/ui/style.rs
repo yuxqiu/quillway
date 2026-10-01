@@ -88,6 +88,7 @@ impl Palette {
     /// Outer ring: a hairline normally, a rotating accent gradient while working.
     pub fn ring(self, shimmer: Option<f32>) -> impl Fn(&iced::Theme) -> container::Style {
         move |_| {
+            #[expect(clippy::option_if_let_else, reason = "a match reads better for two styles")]
             let background = match shimmer {
                 Some(phase) => {
                     let (a, b, c) = (self.accent, rotate_hue(self.accent, 0.18), rotate_hue(self.accent, -0.22));
@@ -162,10 +163,13 @@ fn parse_hex(s: &str) -> Option<Color> {
         return None;
     }
     let v = u32::from_str_radix(h, 16).ok()?;
-    Some(Color::from_rgb8((v >> 16) as u8, (v >> 8) as u8, v as u8))
+    let [_, r, g, b] = v.to_be_bytes();
+    Some(Color::from_rgb8(r, g, b))
 }
 
 /// Shift hue by `turns` (fraction of a full circle) in HSV space.
+#[expect(clippy::float_cmp, reason = "`max` is one of r, g, b exactly")]
+#[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "h6 is in [0, 6)")]
 fn rotate_hue(c: Color, turns: f32) -> Color {
     let (r, g, b) = (c.r, c.g, c.b);
     let max = r.max(g).max(b);
@@ -184,7 +188,7 @@ fn rotate_hue(c: Color, turns: f32) -> Color {
     let s = if max == 0.0 { 0.0 } else { d / max };
     let (v, h6) = (max, h * 6.0);
     let x = v * s * (1.0 - ((h6 % 2.0) - 1.0).abs());
-    let m = v - v * s;
+    let m = v.mul_add(-s, v);
     let (r1, g1, b1) = match h6 as u32 {
         0 => (v * s, x, 0.0),
         1 => (x, v * s, 0.0),

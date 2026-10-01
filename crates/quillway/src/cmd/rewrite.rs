@@ -44,6 +44,9 @@ pub async fn run(a: RewriteArgs) -> anyhow::Result<()> {
         bail!("nothing to rewrite on stdin");
     }
 
+    if text.contains(prompt::STOP) {
+        bail!("the text contains `{}`, which Quillway uses as a delimiter", prompt::STOP);
+    }
     if !prompt::fits(&text, config.model.context) {
         bail!("input is too long for the model's {}-token context; raise `model.context`", config.model.context);
     }
@@ -84,7 +87,7 @@ pub async fn run(a: RewriteArgs) -> anyhow::Result<()> {
             loaded.as_secs_f64(),
             first.as_secs_f64(),
             deltas,
-            deltas.saturating_sub(1) as f64 / gen_secs
+            f64::from(u32::try_from(deltas.saturating_sub(1)).unwrap_or(u32::MAX)) / gen_secs
         );
     }
     Ok(())

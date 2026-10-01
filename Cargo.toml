@@ -9,6 +9,21 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/yuxqiu/quillway"
 
+# Same lint set as ../zippel. Every crate opts in with `[lints] workspace = true`.
+[workspace.lints.rust]
+missing_docs = "warn"
+unused_import_braces = "warn"
+unused_lifetimes = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+wildcard_imports = "allow"
+uninlined_format_args = "allow"
+similar_names = "allow"
+too_many_lines = "allow"
+many_single_char_names = "allow"
+
 [workspace.dependencies]
 quillway-core = { path = "crates/quillway-core" }
 quillway-engine = { path = "crates/quillway-engine" }

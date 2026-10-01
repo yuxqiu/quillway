@@ -18,7 +18,7 @@ in
       type = lib.types.package;
       default = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
       defaultText = lib.literalExpression "quillway.packages.\${system}.default";
-      description = "The Quillway package (choose a llama.cpp backend with `.override { llama-cpp = …; }`).";
+      description = "The Quillway package (choose a llama.cpp backend with `.override { llamaCpp = …; }`).";
     };
 
     settings = lib.mkOption {
@@ -28,7 +28,7 @@ in
         {
           model.active = "gemma-4-e4b";
           ui = { theme = "dark"; opacity = 0.78; client_shadow = false; };
-          behavior.source = "primary";
+          behavior.recent_secs = 30;
         }
       '';
       description = ''
