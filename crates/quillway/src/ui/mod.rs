@@ -2,7 +2,7 @@
 //!
 //! One popup at a time. Its life: take the input text (recent clipboard, text
 //! from the CLI, or typed into the popup) → compose → generate (streamed) →
-//! review / refine → copy → hide.
+//! review / refine / edit → copy → hide.
 
 mod style;
 mod view;
@@ -30,7 +30,6 @@ use crate::ipc::{self, Reply};
 const INPUT_ID: &str = "quillway-input";
 const SOURCE_ID: &str = "quillway-source";
 const MAX_SURFACE_HEIGHT: u32 = 760;
-const COPIED_LINGER: Duration = Duration::from_millis(450);
 const FADE_IN: Duration = Duration::from_millis(140);
 const CLIPBOARD_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -84,7 +83,8 @@ impl Origin {
     }
 }
 
-/// Which box has the keyboard while composing.
+/// Which box has the keyboard: the instruction, or the text (the source while
+/// composing, the latest draft while reviewing).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Field {
     Instruction,
@@ -104,7 +104,6 @@ pub enum Phase {
     Composing,
     Generating,
     Reviewing,
-    Copied,
 }
 
 pub struct Draft {
@@ -114,6 +113,8 @@ pub struct Draft {
     pub show_diff: bool,
     /// Generation failed part-way; this is what arrived.
     pub incomplete: bool,
+    /// Edited by hand; holds the request of the draft it was edited from.
+    pub edited: bool,
     request: Rewrite,
 }
 
@@ -141,9 +142,10 @@ pub struct Popup {
     pub field: Field,
     pub input: String,
     pub drafts: Vec<Draft>,
+    /// The latest draft, while it is being edited by hand.
+    pub draft_editor: text_editor::Content,
     pub generation: Option<Generation>,
     pub show_diff: bool,
-    pub copied: bool,
     pub error: Option<String>,
     focused: bool,
     size: (u32, u32),
@@ -152,9 +154,7 @@ pub struct Popup {
 
 impl Popup {
     pub const fn phase(&self) -> Phase {
-        if self.copied {
-            Phase::Copied
-        } else if self.generation.is_some() {
+        if self.generation.is_some() {
             Phase::Generating
         } else if self.drafts.is_empty() {
             Phase::Composing
@@ -166,6 +166,34 @@ impl Popup {
     /// Text the next preset/refinement applies to: the latest draft, else the input.
     fn base(&self) -> String {
         self.drafts.last().map_or_else(|| self.source.text(), |d| d.text.clone())
+    }
+
+    /// The latest draft has the keyboard (Tab while reviewing).
+    pub fn editing(&self) -> bool {
+        self.phase() == Phase::Reviewing && self.field == Field::Source
+    }
+
+    /// Hand edits go into an "Edited" draft, so Ctrl+Z restores the model's text.
+    fn keep_edit(&mut self) {
+        let text = self.draft_editor.text();
+        let Some(last) = self.drafts.last_mut() else { return };
+        if last.edited {
+            last.text = text;
+            return;
+        }
+        if last.text == text {
+            return;
+        }
+        let draft = Draft {
+            text,
+            label: "Edited".into(),
+            stats: "by hand".into(),
+            show_diff: last.show_diff,
+            incomplete: false,
+            edited: true,
+            request: last.request.clone(),
+        };
+        self.drafts.push(draft);
     }
 }
 
@@ -199,6 +227,7 @@ pub struct App {
 pub enum Shortcut {
     Escape,
     Tab,
+    Diff,
     Retry,
     Undo,
     Copy,
@@ -221,11 +250,7 @@ pub enum InstallEvent {
 #[derive(Debug, Clone)]
 pub enum Message {
     Ipc(Request, Reply),
-    Captured {
-        id: u64,
-        text: Option<String>,
-        error: Option<String>,
-    },
+    Captured { id: u64, text: Option<String>, error: Option<String> },
     Input(String),
     Edit(text_editor::Action),
     Submit,
@@ -234,8 +259,6 @@ pub enum Message {
     Shortcut(Shortcut),
     Resized(Size),
     Tick(Instant),
-    /// Close the popup if it is still this window (a delayed hide must not close a newer one).
-    Hide(window::Id),
     Engine(u64, Result<(), String>),
     InstallStart,
     Install(InstallEvent),
@@ -301,8 +324,16 @@ impl App {
             Message::Captured { id, text, error } => self.captured(id, text, error),
             Message::Input(s) => self.on_input(s),
             Message::Edit(action) => {
-                if let Some(p) = self.popup.as_mut().filter(|p| p.phase() == Phase::Composing) {
-                    p.source.perform(action);
+                if let Some(p) = self.popup.as_mut() {
+                    if p.phase() == Phase::Composing {
+                        p.source.perform(action);
+                    } else if p.editing() {
+                        let edit = action.is_edit();
+                        p.draft_editor.perform(action);
+                        if edit {
+                            p.keep_edit();
+                        }
+                    }
                 }
                 Task::none()
             }
@@ -314,13 +345,6 @@ impl App {
             Message::Tick(now) => {
                 self.now = now;
                 Task::none()
-            }
-            Message::Hide(id) => {
-                if self.popup.as_ref().is_some_and(|p| p.id == id) {
-                    self.hide()
-                } else {
-                    Task::none()
-                }
             }
             Message::Engine(id, _) if id != self.warm_id => Task::none(),
             Message::Engine(_, r) => {
@@ -502,9 +526,9 @@ impl App {
             origin,
             input: String::new(),
             drafts: Vec::new(),
+            draft_editor: text_editor::Content::new(),
             generation: None,
             show_diff: false,
-            copied: false,
             error,
             focused: false,
             size,
@@ -563,7 +587,7 @@ impl App {
 
     fn on_input(&mut self, s: String) -> Task<Message> {
         let Some(p) = self.popup.as_mut() else { return Task::none() };
-        if p.generation.is_some() || p.copied {
+        if p.generation.is_some() {
             return Task::none();
         }
         // A lone digit typed into an empty box picks a preset.
@@ -600,13 +624,13 @@ impl App {
                     self.generate("Refine".into(), instruction, 0.7, false)
                 }
             }
-            Phase::Generating | Phase::Copied => Task::none(),
+            Phase::Generating => Task::none(),
         }
     }
 
     fn run_preset(&mut self, i: usize) -> Task<Message> {
         let Some(preset) = self.presets.get(i).cloned() else { return Task::none() };
-        if self.popup.as_ref().is_none_or(|p| p.generation.is_some() || p.copied) {
+        if self.popup.as_ref().is_none_or(|p| p.generation.is_some()) {
             return Task::none();
         }
         self.generate(preset.name, preset.instruction, preset.temperature.unwrap_or(0.7), preset.show_diff)
@@ -640,6 +664,8 @@ impl App {
             Task::run(stream_rewrite(self.engine.clone(), request.clone()), move |ev| Message::Gen(id, ev)).abortable();
         p.error = None;
         p.input.clear();
+        // The new draft is reviewed from the instruction box, even if this started while editing.
+        p.field = Field::Instruction;
         p.generation = Some(Generation {
             id,
             handle,
@@ -652,7 +678,7 @@ impl App {
             first: None,
             deltas: 0,
         });
-        task
+        Task::batch([task, focus(Field::Instruction)])
     }
 
     fn on_gen(&mut self, id: u64, ev: GenEvent) -> Task<Message> {
@@ -680,6 +706,7 @@ impl App {
                         stats: "stopped early".into(),
                         show_diff: g.show_diff,
                         incomplete: true,
+                        edited: false,
                         request: g.request,
                     });
                 }
@@ -705,6 +732,7 @@ impl App {
                     stats: format!("{secs:.1}s · {rate:.0} tok/s"),
                     show_diff: g.show_diff,
                     incomplete: false,
+                    edited: false,
                     request: g.request,
                 });
             }
@@ -720,18 +748,24 @@ impl App {
                 Task::none()
             }
             (Shortcut::Escape, _) => self.hide(),
-            (Shortcut::Tab, Phase::Composing) => {
+            (Shortcut::Tab, Phase::Composing | Phase::Reviewing) => {
                 p.field = match p.field {
                     Field::Instruction => Field::Source,
                     Field::Source => Field::Instruction,
                 };
+                if p.editing() {
+                    p.draft_editor = text_editor::Content::with_text(&p.base());
+                }
                 focus(p.field)
             }
-            (Shortcut::Tab, Phase::Reviewing) => {
+            // While editing, the editor has the keyboard: these would act on the whole draft.
+            _ if p.editing() => Task::none(),
+            (Shortcut::Diff, Phase::Reviewing) => {
                 p.show_diff = !p.show_diff;
                 Task::none()
             }
-            (Shortcut::Retry, Phase::Reviewing) => {
+            // An edited draft has no request of its own to retry.
+            (Shortcut::Retry, Phase::Reviewing) if p.drafts.last().is_some_and(|d| !d.edited) => {
                 let d = p.drafts.last().expect("reviewing has a draft");
                 let mut request = d.request.clone();
                 request.temperature = (request.temperature + 0.3).min(1.2);
@@ -752,11 +786,8 @@ impl App {
         let Some(p) = self.popup.as_mut() else { return Task::none() };
         let Some(d) = p.drafts.last() else { return Task::none() };
         match quillway_wl::copy(&d.text) {
-            Ok(()) => {
-                p.copied = true;
-                let id = p.id;
-                Task::perform(tokio::time::sleep(COPIED_LINGER), move |()| Message::Hide(id))
-            }
+            // Closing at once is the confirmation; the user is waiting to paste.
+            Ok(()) => self.hide(),
             Err(e) => {
                 p.error = Some(format!("{e:#}"));
                 Task::none()
@@ -853,6 +884,7 @@ fn shortcut(event: Event, _status: event::Status, _window: window::Id) -> Option
     let s = match key.as_ref() {
         Key::Named(Named::Escape) => Shortcut::Escape,
         Key::Named(Named::Tab) => Shortcut::Tab,
+        Key::Character("d") if modifiers.control() => Shortcut::Diff,
         Key::Character("r") if modifiers.control() => Shortcut::Retry,
         Key::Character("z") if modifiers.control() => Shortcut::Undo,
         Key::Character("c") if modifiers.control() => Shortcut::Copy,
@@ -940,6 +972,69 @@ mod tests {
         let _ = app.update(Message::Preset(0));
         assert_eq!(app.popup.as_ref().unwrap().phase(), Phase::Generating);
         app
+    }
+
+    fn reviewing_app() -> App {
+        let mut app = generating_app();
+        let _ = app.update(Message::Gen(0, GenEvent::Delta("They're here.".into())));
+        let _ = app.update(Message::Gen(0, GenEvent::Done));
+        assert_eq!(app.popup.as_ref().unwrap().phase(), Phase::Reviewing);
+        app
+    }
+
+    fn type_char(app: &mut App, c: char) {
+        let _ = app.update(Message::Edit(text_editor::Action::Edit(text_editor::Edit::Insert(c))));
+    }
+
+    #[test]
+    fn tab_in_review_edits_the_draft_and_undo_restores_the_model_text() {
+        let mut app = reviewing_app();
+        let _ = app.update(Message::Shortcut(Shortcut::Tab));
+        assert!(app.popup.as_ref().unwrap().editing());
+        type_char(&mut app, '>');
+        type_char(&mut app, ' ');
+        // Whole-draft shortcuts belong to the editor while it has the keyboard.
+        for s in [Shortcut::Undo, Shortcut::Retry, Shortcut::Copy] {
+            let _ = app.update(Message::Shortcut(s));
+        }
+        let p = app.popup.as_ref().unwrap();
+        assert!(p.generation.is_none() && p.editing());
+        assert_eq!(p.drafts.len(), 2, "consecutive edits make one draft");
+        assert_eq!((p.drafts[1].text.as_str(), p.drafts[1].label.as_str()), ("> They're here.", "Edited"));
+
+        let _ = app.update(Message::Shortcut(Shortcut::Tab));
+        let _ = app.update(Message::Shortcut(Shortcut::Retry)); // nothing to retry for a hand edit
+        assert!(app.popup.as_ref().unwrap().generation.is_none());
+        let _ = app.update(Message::Shortcut(Shortcut::Undo));
+        let p = app.popup.as_ref().unwrap();
+        assert_eq!(p.drafts.len(), 1);
+        assert_eq!(p.base(), "They're here.");
+    }
+
+    #[test]
+    fn diff_has_its_own_key_and_is_off_while_editing() {
+        let mut app = reviewing_app();
+        let shown = app.popup.as_ref().unwrap().show_diff;
+        let _ = app.update(Message::Shortcut(Shortcut::Diff));
+        assert_eq!(app.popup.as_ref().unwrap().show_diff, !shown);
+        let _ = app.update(Message::Shortcut(Shortcut::Tab));
+        let _ = app.update(Message::Shortcut(Shortcut::Diff));
+        assert_eq!(app.popup.as_ref().unwrap().show_diff, !shown, "ignored while editing");
+        let _ = app.update(Message::Shortcut(Shortcut::Tab));
+        assert_eq!(app.popup.as_ref().unwrap().show_diff, !shown, "Tab no longer toggles the diff");
+    }
+
+    #[test]
+    fn a_rewrite_started_while_editing_is_reviewed_from_the_instruction() {
+        let mut app = reviewing_app();
+        let _ = app.update(Message::Shortcut(Shortcut::Tab));
+        type_char(&mut app, '!');
+        let _ = app.update(Message::Preset(0));
+        let p = app.popup.as_ref().unwrap();
+        assert_eq!(p.generation.as_ref().unwrap().request.text, "!They're here.");
+        let _ = app.update(Message::Gen(1, GenEvent::Delta("They're here!".into())));
+        let _ = app.update(Message::Gen(1, GenEvent::Done));
+        assert!(!app.popup.as_ref().unwrap().editing());
     }
 
     #[test]

@@ -54,7 +54,6 @@ impl App {
             Phase::Composing => ("Describe your change…", true),
             Phase::Generating => ("Writing…", false),
             Phase::Reviewing => ("Refine: make it warmer…   (↵ on empty copies)", true),
-            Phase::Copied => ("", false),
         };
         let mut input = text_input(placeholder, &p.input)
             .id(INPUT_ID)
@@ -75,31 +74,19 @@ impl App {
             return self.install_card(pal);
         }
         let content: Element<'a, Message> = match p.phase() {
-            Phase::Composing => text_editor(&p.source)
-                .id(SOURCE_ID)
-                .placeholder("Type or paste the text to rewrite…")
-                .on_action(Message::Edit)
-                .size(14)
-                .padding(0)
-                .max_height(SOURCE_MAX_HEIGHT)
-                .style(pal.editor())
-                // Tab switches boxes instead of inserting a tab.
-                .key_binding(|k| match k.key {
-                    Key::Named(Named::Tab) => None,
-                    _ => text_editor::Binding::from_key_press(k),
-                })
-                .into(),
+            Phase::Composing => editor(&p.source, "Type or paste the text to rewrite…", SOURCE_MAX_HEIGHT, pal),
+            // No diff while editing: the edits go into the text itself.
+            Phase::Reviewing if p.editing() => editor(&p.draft_editor, "", BODY_MAX_HEIGHT, pal),
             Phase::Generating => self.streaming_text().map_or_else(
                 || text("…").size(15).color(pal.faint).into(),
                 |t| body_scroll(text(t).size(15).color(pal.text).into()),
             ),
-            Phase::Reviewing | Phase::Copied => {
+            Phase::Reviewing => {
                 let d = p.drafts.last().expect("reviewing has a draft");
-                let color = if p.phase() == Phase::Copied { pal.dim } else { pal.text };
                 if p.show_diff {
                     body_scroll(diff_view(&p.original, &d.text, pal))
                 } else {
-                    body_scroll(text(d.text.as_str()).size(15).color(color).into())
+                    body_scroll(text(d.text.as_str()).size(15).color(pal.text).into())
                 }
             }
         };
@@ -158,7 +145,7 @@ impl App {
             (Phase::Generating, _) => {
                 format!("{} · {}", self.model_label(), p.generation.as_ref().map_or("", |g| g.label.as_str()))
             }
-            (Phase::Reviewing | Phase::Copied, _) => {
+            (Phase::Reviewing, _) => {
                 let d = p.drafts.last().expect("reviewing has a draft");
                 let n = p.drafts.len();
                 let steps = if n > 1 { format!(" ({n})") } else { String::new() };
@@ -174,15 +161,17 @@ impl App {
             _ if self.needs_install(p) && self.active.catalog => "↵ install   esc close",
             Phase::Composing => "↵ run   1–9 preset   ⇥ switch box   esc close",
             Phase::Generating => "esc stop",
-            Phase::Reviewing => "↵ copy   ⇥ diff   ^R retry   ^Z undo   esc",
-            Phase::Copied => "✓ Copied",
+            Phase::Reviewing if p.editing() => "⇥ done editing   esc close",
+            Phase::Reviewing if p.drafts.last().is_some_and(|d| d.edited) => {
+                "↵ copy   ⇥ edit   ^D diff   ^Z undo   esc"
+            }
+            Phase::Reviewing => "↵ copy   ⇥ edit   ^D diff   ^R retry   ^Z undo   esc",
         };
-        let hint_color = if p.phase() == Phase::Copied { pal.added } else { pal.faint };
         container(
             row![
                 text(left).size(12).color(pal.dim),
                 Space::new().width(Length::Fill),
-                text(hints).size(12).color(hint_color)
+                text(hints).size(12).color(pal.faint)
             ]
             .spacing(12),
         )
@@ -190,6 +179,29 @@ impl App {
         .width(Length::Fill)
         .into()
     }
+}
+
+/// The text box: the source while composing, the latest draft while editing it.
+fn editor<'a>(
+    content: &'a text_editor::Content,
+    placeholder: &'a str,
+    max_height: f32,
+    pal: Palette,
+) -> Element<'a, Message> {
+    text_editor(content)
+        .id(SOURCE_ID)
+        .placeholder(placeholder)
+        .on_action(Message::Edit)
+        .size(14)
+        .padding(0)
+        .max_height(max_height)
+        .style(pal.editor())
+        // Tab switches boxes instead of inserting a tab.
+        .key_binding(|k| match k.key {
+            Key::Named(Named::Tab) => None,
+            _ => text_editor::Binding::from_key_press(k),
+        })
+        .into()
 }
 
 fn hairline<'a>(pal: Palette) -> Element<'a, Message> {

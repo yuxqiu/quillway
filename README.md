@@ -69,7 +69,8 @@ bindsym Mod4+space exec quillway toggle
 | Review | ↵ (empty box) / Ctrl+C | **Copy** the result and close |
 | | type, then ↵ | Refine the current draft ("warmer", "shorter") |
 | | `1`–`9` | Run another preset on the current draft |
-| | Tab | Toggle the word diff against the original |
+| | Tab | Move between the instruction and the result, to edit the result yourself |
+| | Ctrl+D | Toggle the word diff against the original (off while editing) |
 | | Ctrl+R | Retry (a variant at a higher temperature) |
 | | Ctrl+Z | Undo the last draft |
 | Anywhere | Esc | Close |
