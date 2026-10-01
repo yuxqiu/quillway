@@ -50,19 +50,6 @@ bind = SUPER, space, exec, quillway toggle
 bindsym Mod4+space exec quillway toggle
 ```
 
-### Blur and shadow on niri (optional)
-
-niri blurs the whole layer surface, so Quillway's own shadow margin would blur as a square box. Let niri round, shadow and blur the panel instead, and set `ui.client_shadow = false` (lower `ui.opacity`, e.g. `0.78`, to see the blur):
-
-```kdl
-layer-rule {
-    match namespace="^quillway$"
-    geometry-corner-radius 16
-    shadow { on; softness 28; spread 2; offset x=0 y=12; color "#00000073"; }
-    background-effect { blur true; xray false; }
-}
-```
-
 ## Using it
 
 | Where | Key | Action |
