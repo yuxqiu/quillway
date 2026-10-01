@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/yuxqiu/quillway"
@@ -31,4 +31,13 @@ anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.9"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "process", "time", "fs", "sync"] }
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "macros",
+  "net",
+  "io-util",
+  "process",
+  "time",
+  "fs",
+  "sync",
+] }

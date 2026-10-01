@@ -2984,7 +2984,7 @@ dependencies = [
 
 [[package]]
 name = "quillway"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -3002,7 +3002,7 @@ dependencies = [
 
 [[package]]
 name = "quillway-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "serde",
@@ -3013,7 +3013,7 @@ dependencies = [
 
 [[package]]
 name = "quillway-engine"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "fastrand",
@@ -3031,7 +3031,7 @@ dependencies = [
 
 [[package]]
 name = "quillway-wl"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "wayland-client",
