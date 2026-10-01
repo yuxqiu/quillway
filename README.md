@@ -17,6 +17,7 @@ Quillway is a rewrite popup for Wayland that you open with a keyboard shortcut. 
 ```nix
 # flake.nix
 inputs.quillway.url = "github:yuxqiu/quillway";
+inputs.quillway.inputs.nixpkgs.follows = "nixpkgs";
 
 # home-manager configuration
 imports = [ inputs.quillway.homeManagerModules.default ];
@@ -160,6 +161,7 @@ cargo test --workspace
 cargo run -p quillway -- daemon
 nix flake check             # clippy (deny warnings), tests, rustfmt, package build
 cargo run --release -p quillway-engine --example eval -- qwen3.5-4b gemma-4-e4b   # compare models
+scripts/screenshots.sh      # re-render assets/screenshot-{dark,light}.png in a headless sway
 ```
 
 The code is split into four crates:

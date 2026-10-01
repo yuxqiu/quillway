@@ -103,9 +103,37 @@
                 wev
                 wl-clipboard
                 llama-cpp-vulkan
+                # scripts/screenshots.sh
+                sway
+                swaybg
+                grim
+                wtype
+                imagemagick
+                pngquant
+                oxipng
               ]);
             buildInputs = runtimeLibs;
             LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath runtimeLibs;
+            # GPU drivers matching this nixpkgs, for scripts/screenshots.sh.
+            QUILLWAY_SCREENSHOT_MESA = "${pkgs.mesa}";
+            # Load Mesa's GPU drivers from this nixpkgs, not the host's: a host driver
+            # built against a newer glibc fails to load here (e.g. AMD's, via LLVM), and
+            # Quillway silently falls back to software rendering and llama-server to the
+            # CPU. NVIDIA's proprietary driver isn't part of Mesa, so keep the host's.
+            # Lavapipe (software Vulkan) is left out so nothing picks it over the GPU.
+            shellHook = ''
+              if [ ! -e /proc/driver/nvidia ]; then
+                export GBM_BACKENDS_PATH=${pkgs.mesa}/lib/gbm
+                export LIBGL_DRIVERS_PATH=${pkgs.mesa}/lib/dri
+                export __EGL_VENDOR_LIBRARY_FILENAMES=${pkgs.mesa}/share/glvnd/egl_vendor.d/50_mesa.json
+                VK_DRIVER_FILES=
+                for icd in ${pkgs.mesa}/share/vulkan/icd.d/*.json; do
+                  case $icd in */lvp_icd.*) ;; *) VK_DRIVER_FILES=$VK_DRIVER_FILES$icd: ;; esac
+                done
+                export VK_DRIVER_FILES
+                unset icd
+              fi
+            '';
           };
         }
       );
