@@ -75,8 +75,14 @@ pub async fn run(a: RewriteArgs) -> anyhow::Result<()> {
         deltas += 1;
         raw.push_str(&d?);
     }
+    if raw.trim().is_empty() {
+        bail!("the model returned nothing");
+    }
     let total = t1.elapsed();
     let out = if a.raw { raw } else { clean::clean(&raw, &text, true) };
+    if out.trim().is_empty() {
+        bail!("the model returned nothing after cleanup");
+    }
     std::io::stdout().write_all(out.as_bytes())?;
     if !out.ends_with('\n') {
         println!();

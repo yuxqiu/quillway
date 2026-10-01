@@ -118,7 +118,9 @@ pub async fn download(job: Job<'_>, mut on_progress: impl FnMut(Progress)) -> an
     Ok(())
 }
 
-/// Delete `dest` and its download leftovers; `Ok(false)` if it wasn't installed.
+/// Delete `dest` and its partial download; `Ok(false)` if it wasn't installed.
+/// The lock file stays so a downloader that already opened it keeps coordinating
+/// with new downloaders.
 ///
 /// # Errors
 ///
@@ -131,7 +133,6 @@ pub fn remove(dest: &Path) -> anyhow::Result<bool> {
     let removed = remove_if_present(dest)?;
     remove_if_present(&part_path(dest))?;
     drop(held);
-    remove_if_present(&lock_path(dest))?;
     Ok(removed)
 }
 
@@ -299,7 +300,7 @@ mod tests {
     }
 
     #[test]
-    fn remove_cleans_up_and_respects_a_running_download() {
+    fn remove_deletes_model_and_partial_but_respects_a_running_download() {
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("model.gguf");
         std::fs::write(&dest, b"m").unwrap();
@@ -309,8 +310,24 @@ mod tests {
             assert!(remove(&dest).unwrap_err().to_string().contains("already running"));
         }
         assert!(remove(&dest).unwrap());
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        assert!(!dest.exists() && !part_path(&dest).exists());
+        assert!(lock_path(&dest).exists());
         assert!(!remove(&dest).unwrap());
+    }
+
+    #[test]
+    fn removal_keeps_the_lock_identity_for_a_waiting_downloader() {
+        use std::os::fd::AsRawFd;
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("model.gguf");
+        std::fs::write(&dest, b"model").unwrap();
+        let waiting = std::fs::File::create(lock_path(&dest)).unwrap();
+
+        assert!(remove(&dest).unwrap());
+        // This descriptor represents a downloader that opened the lock before removal.
+        assert_eq!(unsafe { libc::flock(waiting.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
+        assert!(lock(&dest).unwrap_err().to_string().contains("already running"));
     }
 
     #[tokio::test]

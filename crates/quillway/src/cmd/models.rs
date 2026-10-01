@@ -99,10 +99,6 @@ pub async fn run(cmd: ModelsCmd) -> anyhow::Result<()> {
             } else {
                 println!("{} is not installed", e.name);
             }
-            // `<repo>/<revision>/`, each only if now empty.
-            for dir in path.ancestors().skip(1).take(2) {
-                let _ = std::fs::remove_dir(dir);
-            }
             Ok(())
         }
     }

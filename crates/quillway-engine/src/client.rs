@@ -223,8 +223,9 @@ impl Client {
         };
         let mut s = std::pin::pin!(self.stream(&r).await?);
         match s.next().await {
+            Some(Ok(_)) => Ok(()),
             Some(Err(e)) => Err(e),
-            _ => Ok(()),
+            None => bail!("warm-up produced no token"),
         }
     }
 
@@ -238,6 +239,9 @@ impl Client {
         let mut out = String::new();
         while let Some(d) = s.next().await {
             out.push_str(&d?);
+        }
+        if out.trim().is_empty() {
+            bail!("the model returned nothing");
         }
         Ok(out)
     }
@@ -254,10 +258,16 @@ enum Sse {
 fn parse_sse_line(line: &str) -> Sse {
     let Some(data) = line.trim_end().strip_prefix("data:") else { return Sse::Skip };
     let data = data.trim_start();
+    if data.is_empty() {
+        return Sse::Skip;
+    }
     if data == "[DONE]" {
         return Sse::Done;
     }
-    let Ok(v) = serde_json::from_str::<Value>(data) else { return Sse::Skip };
+    let v = match serde_json::from_str::<Value>(data) {
+        Ok(v) => v,
+        Err(e) => return Sse::Error(format!("malformed SSE data: {e}")),
+    };
     if let Some(e) = v.get("error") {
         return Sse::Error(e.get("message").and_then(Value::as_str).unwrap_or("server error").to_owned());
     }
@@ -351,10 +361,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn malformed_data_after_a_delta_is_an_error() {
+        let base = serve_sse(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Partial\"}}]}\n\n\
+             data: {bad json}\n\n\
+             data: [DONE]\n\n",
+        )
+        .await;
+        let error = Client::new(&base, None, "test".into(), false, 8192).complete(&request()).await.unwrap_err();
+        assert!(error.to_string().contains("malformed"), "{error}");
+    }
+
+    #[tokio::test]
     async fn complete_stream_returns_text() {
         let base = serve_sse("data: {\"choices\":[{\"delta\":{\"content\":\"Complete\"}}]}\n\ndata: [DONE]\n\n").await;
         let text = Client::new(&base, None, "test".into(), false, 8192).complete(&request()).await.unwrap();
         assert_eq!(text, "Complete");
+    }
+
+    #[tokio::test]
+    async fn empty_rewrite_is_an_error() {
+        let base = serve_sse("data: [DONE]\n\n").await;
+        let error = Client::new(&base, None, "test".into(), false, 8192).complete(&request()).await.unwrap_err();
+        assert!(error.to_string().contains("nothing"), "{error}");
     }
 
     #[tokio::test]
@@ -394,6 +423,14 @@ mod tests {
         .await;
         let client = Client::new(&base, None, "test".into(), true, 8192);
         client.warm_up(request().sampling).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn warm_up_requires_a_token() {
+        let base = serve_sse("data: [DONE]\n\n").await;
+        let client = Client::new(&base, None, "test".into(), true, 8192);
+        let error = client.warm_up(request().sampling).await.unwrap_err();
+        assert!(error.to_string().contains("no token"), "{error}");
     }
 
     #[test]

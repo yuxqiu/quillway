@@ -5,6 +5,8 @@ use std::path::Path;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
+use crate::catalog;
+
 /// The whole config file.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -155,6 +157,15 @@ impl Config {
 
     fn parse(s: &str) -> anyhow::Result<Self> {
         let config: Self = toml::from_str(s)?;
+        if let Some(active) = &config.model.active {
+            if let Some(path) = active.strip_prefix("custom:") {
+                if path.is_empty() {
+                    anyhow::bail!("`model.active = \"custom:\"` needs a model file path");
+                }
+            } else if catalog::find(active).is_none() {
+                anyhow::bail!("unknown model {active:?} in `model.active`");
+            }
+        }
         if config.model.endpoint.is_some() && config.model.endpoint_model.is_none() {
             anyhow::bail!("`model.endpoint` needs `model.endpoint_model`, the model name the server expects");
         }
@@ -225,6 +236,18 @@ mod tests {
     #[test]
     fn unknown_keys_are_rejected() {
         assert!(toml::from_str::<Config>("[ui]\nbogus = 1").is_err());
+    }
+
+    #[test]
+    fn unknown_active_model_is_rejected() {
+        let error = Config::parse("[model]\nactive = 'qwen3.5-typo'").unwrap_err();
+        assert!(error.to_string().contains("unknown model"), "{error}");
+    }
+
+    #[test]
+    fn custom_model_requires_a_path() {
+        let error = Config::parse("[model]\nactive = 'custom:'").unwrap_err();
+        assert!(error.to_string().contains("path"), "{error}");
     }
 
     #[test]

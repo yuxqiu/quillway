@@ -943,6 +943,15 @@ mod tests {
     }
 
     #[test]
+    fn escape_stops_generation_without_closing_the_popup() {
+        let mut app = generating_app();
+        let _ = app.update(Message::Shortcut(Shortcut::Escape));
+        assert_eq!(app.popup.as_ref().unwrap().phase(), Phase::Composing);
+        let _ = app.update(Message::Gen(0, GenEvent::Delta("late response".into())));
+        assert_eq!(app.popup.as_ref().unwrap().phase(), Phase::Composing);
+    }
+
+    #[test]
     fn hide_during_clipboard_read_keeps_popup_closed() {
         let (mut app, _) = App::boot(Config::default(), None);
         let _ = app.update(Message::Ipc(Request::Show { input: Input::Clipboard }, reply()));
