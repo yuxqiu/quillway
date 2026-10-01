@@ -12,7 +12,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, Stream, StreamExt, stream};
-use iced::keyboard::{self, Key, key::Named};
+use iced::keyboard::{self, Key, key::Code, key::Named, key::Physical};
 use iced::widget::text_editor;
 use iced::{Event, Size, Subscription, Task, event, task, window};
 use iced_layershell::reexport::{Anchor, KeyboardInteractivity, Layer, NewLayerShellSettings, OutputOption};
@@ -146,6 +146,8 @@ pub struct Popup {
     pub draft_editor: text_editor::Content,
     pub generation: Option<Generation>,
     pub show_diff: bool,
+    /// Set by Ctrl+D: the user's choice outlives the presets' defaults.
+    diff_pinned: bool,
     pub error: Option<String>,
     focused: bool,
     size: (u32, u32),
@@ -222,6 +224,9 @@ pub struct App {
     /// The current clipboard read; older results are ignored after cancellation.
     capturing: Option<u64>,
     next_capture: u64,
+    /// The key of the last shortcut, until it is released. layershellev delivers auto-repeat
+    /// as fresh presses (`repeat: false`), so a press of the held key is a repeat.
+    held: Option<Physical>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -231,7 +236,7 @@ pub enum Shortcut {
     Diff,
     Retry,
     Undo,
-    Copy,
+    Preset(usize),
 }
 
 #[derive(Debug, Clone)]
@@ -261,7 +266,8 @@ pub enum Message {
     Submit,
     Preset(usize),
     Gen(u64, GenEvent),
-    Shortcut(Shortcut),
+    Shortcut(Shortcut, Physical),
+    KeyReleased(Physical),
     /// A mouse press, which may have moved the keyboard focus to the other box.
     Clicked(window::Id),
     /// The box that has the keyboard after a click; `None` if the click unfocused both.
@@ -292,6 +298,7 @@ impl App {
             watch,
             capturing: None,
             next_capture: 0,
+            held: None,
         };
         let warm = app.warm_up();
         (app, warm)
@@ -352,7 +359,18 @@ impl App {
             Message::Submit => self.submit(),
             Message::Preset(i) => self.run_preset(i),
             Message::Gen(id, ev) => self.on_gen(id, ev),
-            Message::Shortcut(s) => self.on_shortcut(s),
+            // A held key acts once: a held Esc would stop the generation, then close the popup.
+            Message::Shortcut(_, key) if self.held == Some(key) => Task::none(),
+            Message::Shortcut(s, key) => {
+                self.held = Some(key);
+                self.on_shortcut(s)
+            }
+            Message::KeyReleased(key) => {
+                if self.held == Some(key) {
+                    self.held = None;
+                }
+                Task::none()
+            }
             Message::Clicked(id) => match self.popup.as_ref().filter(|p| p.id == id).map(Popup::phase) {
                 Some(Phase::Composing | Phase::Reviewing) => {
                     iced::widget::operation::is_focused(INPUT_ID).then(move |input| {
@@ -553,6 +571,8 @@ impl App {
         } else {
             Task::none()
         };
+        // A key held as the last popup closed was released elsewhere.
+        self.held = None;
         let id = window::Id::unique();
         let size = self.surface_size(196);
         let top = i32::try_from(self.config.ui.top_margin.saturating_sub(self.margin())).unwrap_or(i32::MAX);
@@ -568,6 +588,7 @@ impl App {
             draft_editor: text_editor::Content::new(),
             generation: None,
             show_diff: false,
+            diff_pinned: false,
             error,
             focused: false,
             size,
@@ -629,14 +650,6 @@ impl App {
         if p.generation.is_some() {
             return Task::none();
         }
-        // A lone digit typed into an empty box picks a preset.
-        if p.input.is_empty()
-            && let Some(d) = single_digit(&s)
-            && d >= 1
-            && (d as usize) <= self.presets.len()
-        {
-            return self.run_preset(d as usize - 1);
-        }
         p.input = s;
         Task::none()
     }
@@ -669,7 +682,7 @@ impl App {
 
     fn run_preset(&mut self, i: usize) -> Task<Message> {
         let Some(preset) = self.presets.get(i).cloned() else { return Task::none() };
-        if self.popup.as_ref().is_none_or(|p| p.generation.is_some()) {
+        if self.popup.as_ref().is_none_or(|p| p.generation.is_some() || self.needs_install(p)) {
             return Task::none();
         }
         self.generate(preset.name, preset.instruction, preset.temperature.unwrap_or(0.7), preset.show_diff)
@@ -738,7 +751,9 @@ impl App {
                 let partial = clean::clean(&g.raw, &g.request.text, false).trim_end().to_owned();
                 // Keep what arrived, marked, unless a retry failed (its old draft stays).
                 if !partial.trim().is_empty() && !g.replace {
-                    p.show_diff = g.show_diff;
+                    if !p.diff_pinned {
+                        p.show_diff = g.show_diff;
+                    }
                     p.drafts.push(Draft {
                         text: partial,
                         label: g.label,
@@ -755,13 +770,15 @@ impl App {
                 let g = p.generation.take().expect("matched above");
                 let text = clean::clean(&g.raw, &g.request.text, true);
                 if text.trim().is_empty() {
-                    p.error = Some("The model returned nothing. Try again (Ctrl+R) or another preset.".into());
+                    p.error = Some("The model returned nothing. Run it again, or try another preset.".into());
                     return Task::none();
                 }
                 let secs = g.started.elapsed().as_secs_f64();
                 let gen_secs = g.first.map_or(secs, |f| f.elapsed().as_secs_f64()).max(1e-3);
                 let rate = f64::from(u32::try_from(g.deltas.saturating_sub(1)).unwrap_or(u32::MAX)) / gen_secs;
-                p.show_diff = g.show_diff;
+                if !p.diff_pinned {
+                    p.show_diff = g.show_diff;
+                }
                 if g.replace {
                     p.drafts.pop();
                 }
@@ -797,10 +814,12 @@ impl App {
                 }
                 focus(p.field)
             }
-            // While editing, the editor has the keyboard: these would act on the whole draft.
-            _ if p.editing() => Task::none(),
+            // The Ctrl shortcuts work from the instruction box; the text box keeps its keys.
+            _ if p.field == Field::Source => Task::none(),
+            (Shortcut::Preset(i), Phase::Composing | Phase::Reviewing) => self.run_preset(i),
             (Shortcut::Diff, Phase::Reviewing) => {
                 p.show_diff = !p.show_diff;
+                p.diff_pinned = true;
                 Task::none()
             }
             // An edited draft has no request of its own to retry.
@@ -814,10 +833,11 @@ impl App {
             (Shortcut::Undo, Phase::Reviewing) => {
                 p.drafts.pop();
                 p.error = None;
-                p.show_diff = p.drafts.last().is_some_and(|d| d.show_diff);
+                if !p.diff_pinned {
+                    p.show_diff = p.drafts.last().is_some_and(|d| d.show_diff);
+                }
                 Task::none()
             }
-            (Shortcut::Copy, Phase::Reviewing) => self.copy(),
             _ => Task::none(),
         }
     }
@@ -915,27 +935,49 @@ impl App {
     }
 }
 
-fn single_digit(s: &str) -> Option<u32> {
-    let mut chars = s.chars();
-    let c = chars.next()?;
-    if chars.next().is_some() {
-        return None;
-    }
-    c.to_digit(10)
-}
-
 fn shortcut(event: Event, _status: event::Status, _window: window::Id) -> Option<Message> {
-    let Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) = event else { return None };
+    let (key, physical_key, modifiers) = match event {
+        Event::Keyboard(keyboard::Event::KeyPressed { key, physical_key, modifiers, .. }) => {
+            (key, physical_key, modifiers)
+        }
+        Event::Keyboard(keyboard::Event::KeyReleased { physical_key, .. }) => {
+            return Some(Message::KeyReleased(physical_key));
+        }
+        _ => return None,
+    };
     let s = match key.as_ref() {
         Key::Named(Named::Escape) => Shortcut::Escape,
         Key::Named(Named::Tab) => Shortcut::Tab,
-        Key::Character("d") if modifiers.control() => Shortcut::Diff,
-        Key::Character("r") if modifiers.control() => Shortcut::Retry,
-        Key::Character("z") if modifiers.control() => Shortcut::Undo,
-        Key::Character("c") if modifiers.control() => Shortcut::Copy,
-        _ => return None,
+        _ if !modifiers.control() => return None,
+        // The character first, so remapped and virtual keyboards behave as they type.
+        _ => match key.to_latin(physical_key) {
+            Some('d') => Shortcut::Diff,
+            Some('r') => Shortcut::Retry,
+            Some('z') => Shortcut::Undo,
+            Some(c @ '1'..='9') => Shortcut::Preset(c as usize - '1' as usize),
+            Some(c) if c.is_ascii_alphanumeric() => return None,
+            // Symbols on the digit row (AZERTY's `&é"'(…`): go by the key's position.
+            _ => Shortcut::Preset(preset_index(physical_key)?),
+        },
     };
-    Some(Message::Shortcut(s))
+    Some(Message::Shortcut(s, physical_key))
+}
+
+/// Ctrl+1–9 picks presets 0–8.
+const fn preset_index(key: Physical) -> Option<usize> {
+    let Physical::Code(code) = key else { return None };
+    Some(match code {
+        Code::Digit1 => 0,
+        Code::Digit2 => 1,
+        Code::Digit3 => 2,
+        Code::Digit4 => 3,
+        Code::Digit5 => 4,
+        Code::Digit6 => 5,
+        Code::Digit7 => 6,
+        Code::Digit8 => 7,
+        Code::Digit9 => 8,
+        _ => return None,
+    })
 }
 
 fn ipc_stream() -> impl Stream<Item = (Request, Reply)> {
@@ -1041,23 +1083,23 @@ mod tests {
     #[test]
     fn tab_in_review_edits_the_draft_and_undo_restores_the_model_text() {
         let mut app = reviewing_app();
-        let _ = app.update(Message::Shortcut(Shortcut::Tab));
+        let _ = app.on_shortcut(Shortcut::Tab);
         assert!(app.popup.as_ref().unwrap().editing());
         type_char(&mut app, ' ');
         type_char(&mut app, ':');
         // Whole-draft shortcuts belong to the editor while it has the keyboard.
-        for s in [Shortcut::Undo, Shortcut::Retry, Shortcut::Copy] {
-            let _ = app.update(Message::Shortcut(s));
+        for s in [Shortcut::Undo, Shortcut::Retry, Shortcut::Diff, Shortcut::Preset(1)] {
+            let _ = app.on_shortcut(s);
         }
         let p = app.popup.as_ref().unwrap();
         assert!(p.generation.is_none() && p.editing());
         assert_eq!(p.drafts.len(), 2, "consecutive edits make one draft");
         assert_eq!((p.drafts[1].text.as_str(), p.drafts[1].label.as_str()), ("They're here. :", "Edited"));
 
-        let _ = app.update(Message::Shortcut(Shortcut::Tab));
-        let _ = app.update(Message::Shortcut(Shortcut::Retry)); // nothing to retry for a hand edit
+        let _ = app.on_shortcut(Shortcut::Tab);
+        let _ = app.on_shortcut(Shortcut::Retry); // nothing to retry for a hand edit
         assert!(app.popup.as_ref().unwrap().generation.is_none());
-        let _ = app.update(Message::Shortcut(Shortcut::Undo));
+        let _ = app.on_shortcut(Shortcut::Undo);
         let p = app.popup.as_ref().unwrap();
         assert_eq!(p.drafts.len(), 1);
         assert_eq!(p.base(), "They're here.");
@@ -1067,19 +1109,19 @@ mod tests {
     fn diff_has_its_own_key_and_is_off_while_editing() {
         let mut app = reviewing_app();
         let shown = app.popup.as_ref().unwrap().show_diff;
-        let _ = app.update(Message::Shortcut(Shortcut::Diff));
+        let _ = app.on_shortcut(Shortcut::Diff);
         assert_eq!(app.popup.as_ref().unwrap().show_diff, !shown);
-        let _ = app.update(Message::Shortcut(Shortcut::Tab));
-        let _ = app.update(Message::Shortcut(Shortcut::Diff));
+        let _ = app.on_shortcut(Shortcut::Tab);
+        let _ = app.on_shortcut(Shortcut::Diff);
         assert_eq!(app.popup.as_ref().unwrap().show_diff, !shown, "ignored while editing");
-        let _ = app.update(Message::Shortcut(Shortcut::Tab));
+        let _ = app.on_shortcut(Shortcut::Tab);
         assert_eq!(app.popup.as_ref().unwrap().show_diff, !shown, "Tab no longer toggles the diff");
     }
 
     #[test]
     fn a_rewrite_started_while_editing_is_reviewed_from_the_instruction() {
         let mut app = reviewing_app();
-        let _ = app.update(Message::Shortcut(Shortcut::Tab));
+        let _ = app.on_shortcut(Shortcut::Tab);
         type_char(&mut app, '!');
         let _ = app.update(Message::Preset(0));
         let p = app.popup.as_ref().unwrap();
@@ -1093,12 +1135,12 @@ mod tests {
     fn clicking_the_instruction_while_editing_stops_editing() {
         let mut app = reviewing_app();
         let id = app.popup.as_ref().unwrap().id;
-        let _ = app.update(Message::Shortcut(Shortcut::Tab));
+        let _ = app.on_shortcut(Shortcut::Tab);
         let _ = app.update(Message::Focused(id, None)); // a click on neither box
         assert!(app.popup.as_ref().unwrap().editing());
         let _ = app.update(Message::Focused(id, Some(Field::Instruction)));
         assert!(!app.popup.as_ref().unwrap().editing());
-        let _ = app.update(Message::Shortcut(Shortcut::Undo)); // a whole-draft shortcut works again
+        let _ = app.on_shortcut(Shortcut::Undo); // a whole-draft shortcut works again
         assert_eq!(app.popup.as_ref().unwrap().phase(), Phase::Composing);
     }
 
@@ -1117,15 +1159,87 @@ mod tests {
     #[test]
     fn an_emptied_draft_is_not_copied() {
         let mut app = reviewing_app();
-        let _ = app.update(Message::Shortcut(Shortcut::Tab));
+        let _ = app.on_shortcut(Shortcut::Tab);
         let _ = app.update(Message::Edit(text_editor::Action::SelectAll));
         let _ = app.update(Message::Edit(text_editor::Action::Edit(text_editor::Edit::Backspace)));
-        let _ = app.update(Message::Shortcut(Shortcut::Tab));
+        let _ = app.on_shortcut(Shortcut::Tab);
         let _ = app.update(Message::Submit);
         let p = app.popup.as_ref().expect("still open");
         assert!(p.error.as_deref().is_some_and(|e| e.starts_with("Nothing to copy")));
-        let _ = app.update(Message::Shortcut(Shortcut::Undo));
+        let _ = app.on_shortcut(Shortcut::Undo);
         assert_eq!(app.popup.as_ref().unwrap().error, None, "the error was about the undone text");
+    }
+
+    fn press(key: Key, code: Code, modifiers: keyboard::Modifiers, repeat: bool) -> Option<Message> {
+        let event = Event::Keyboard(keyboard::Event::KeyPressed {
+            key: key.clone(),
+            modified_key: key,
+            physical_key: Physical::Code(code),
+            location: keyboard::Location::Standard,
+            modifiers,
+            text: None,
+            repeat,
+        });
+        shortcut(event, event::Status::Ignored, window::Id::unique())
+    }
+
+    fn ctrl(key: &str, code: Code) -> Option<Message> {
+        press(Key::Character(key.into()), code, keyboard::Modifiers::CTRL, false)
+    }
+
+    #[test]
+    fn a_held_key_acts_once() {
+        let esc = |repeat| press(Key::Named(Named::Escape), Code::Escape, keyboard::Modifiers::empty(), repeat);
+        assert!(matches!(esc(false), Some(Message::Shortcut(Shortcut::Escape, _))));
+        let held = Physical::Code(Code::Escape);
+        let mut app = generating_app();
+        let _ = app.update(Message::Shortcut(Shortcut::Escape, held));
+        let _ = app.update(Message::Shortcut(Shortcut::Escape, held)); // auto-repeat, reported as a press
+        assert_eq!(app.popup.as_ref().map(Popup::phase), Some(Phase::Composing), "stopped, not closed");
+        let _ = app.update(Message::KeyReleased(held));
+        let _ = app.update(Message::Shortcut(Shortcut::Escape, held));
+        assert!(app.popup.is_none(), "a second press closes");
+    }
+
+    #[test]
+    fn shortcuts_follow_the_key_position_on_other_layouts() {
+        let is = |m: Option<Message>, want: Shortcut| matches!(m, Some(Message::Shortcut(s, _)) if std::mem::discriminant(&s) == std::mem::discriminant(&want));
+        assert!(is(ctrl("d", Code::KeyD), Shortcut::Diff));
+        assert!(is(ctrl("в", Code::KeyD), Shortcut::Diff)); // Russian
+        assert!(is(ctrl("я", Code::KeyZ), Shortcut::Undo));
+        assert!(matches!(ctrl("&", Code::Digit1), Some(Message::Shortcut(Shortcut::Preset(0), _)))); // AZERTY
+        assert!(matches!(ctrl("9", Code::Digit9), Some(Message::Shortcut(Shortcut::Preset(8), _))));
+        assert!(ctrl("c", Code::KeyC).is_none(), "Ctrl+C belongs to the text boxes");
+        assert!(ctrl("c", Code::Digit2).is_none(), "the character wins over the position");
+        assert!(matches!(ctrl("1", Code::Digit2), Some(Message::Shortcut(Shortcut::Preset(0), _))));
+        assert!(ctrl("0", Code::Digit0).is_none());
+    }
+
+    #[test]
+    fn presets_run_with_ctrl_digits_from_the_instruction_box_only() {
+        let (mut app, _) = App::boot(endpoint_config(), None);
+        let _ = app.update(Message::Ipc(Request::Show { input: Input::Text("their here".into()) }, reply()));
+        let _ = app.update(Message::Input("3".into())); // a lone digit is just text now
+        assert_eq!(app.popup.as_ref().unwrap().input, "3");
+        let _ = app.on_shortcut(Shortcut::Tab);
+        let _ = app.on_shortcut(Shortcut::Preset(0));
+        assert_eq!(app.popup.as_ref().unwrap().phase(), Phase::Composing, "ignored in the text box");
+        let _ = app.on_shortcut(Shortcut::Tab);
+        let _ = app.on_shortcut(Shortcut::Preset(0));
+        assert_eq!(app.popup.as_ref().unwrap().generation.as_ref().unwrap().label, "Proofread");
+    }
+
+    #[test]
+    fn a_chosen_diff_setting_outlives_preset_defaults() {
+        let mut app = reviewing_app(); // Proofread shows the diff by default
+        assert!(app.popup.as_ref().unwrap().show_diff);
+        let _ = app.on_shortcut(Shortcut::Diff);
+        let _ = app.on_shortcut(Shortcut::Preset(0));
+        let _ = app.update(Message::Gen(1, GenEvent::Delta("They are here.".into())));
+        let _ = app.update(Message::Gen(1, GenEvent::Done));
+        assert!(!app.popup.as_ref().unwrap().show_diff, "a new draft keeps the choice");
+        let _ = app.on_shortcut(Shortcut::Undo);
+        assert!(!app.popup.as_ref().unwrap().show_diff, "so does undo");
     }
 
     #[test]
@@ -1170,7 +1284,7 @@ mod tests {
         let mut app = generating_app();
         let _ = app.update(Message::Gen(0, GenEvent::Delta("They're".into())));
         let _ = app.update(Message::Gen(0, GenEvent::Error("connection reset".into())));
-        let _ = app.update(Message::Shortcut(Shortcut::Retry));
+        let _ = app.on_shortcut(Shortcut::Retry);
         let _ = app.update(Message::Gen(1, GenEvent::Delta("They're here.".into())));
         let _ = app.update(Message::Gen(1, GenEvent::Done));
         let p = app.popup.as_ref().unwrap();
@@ -1216,7 +1330,7 @@ mod tests {
     #[test]
     fn escape_stops_generation_without_closing_the_popup() {
         let mut app = generating_app();
-        let _ = app.update(Message::Shortcut(Shortcut::Escape));
+        let _ = app.on_shortcut(Shortcut::Escape);
         assert_eq!(app.popup.as_ref().unwrap().phase(), Phase::Composing);
         let _ = app.update(Message::Gen(0, GenEvent::Delta("late response".into())));
         assert_eq!(app.popup.as_ref().unwrap().phase(), Phase::Composing);

@@ -39,14 +39,7 @@ impl Server {
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        // SAFETY: prctl is async-signal-safe; this only asks the kernel to
-        // SIGTERM the child if the daemon dies without cleaning up.
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
-                Ok(())
-            });
-        }
+        die_with_parent(cmd.as_std_mut());
         let mut child = cmd.spawn().with_context(|| format!("spawning {bin}"))?;
         let log = Log::default();
         if let Some(stderr) = child.stderr.take() {
@@ -164,6 +157,23 @@ fn args(model: &Path, port: u16, cfg: &ModelConfig) -> Vec<String> {
     a
 }
 
+/// Ask the kernel to SIGKILL the child if the daemon dies without cleaning up.
+///
+/// Not SIGTERM: llama-server's graceful shutdown can stall until its next HTTP
+/// connection when the signal lands mid-request, and with the daemon gone none
+/// comes. A Ctrl+C or a `systemctl stop` signals both processes at once, so a
+/// SIGTERM here would merge with that one and leave the server running.
+fn die_with_parent(cmd: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: prctl is async-signal-safe and touches no memory of the parent.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+            Ok(())
+        });
+    }
+}
+
 fn free_port() -> anyhow::Result<u16> {
     let l = std::net::TcpListener::bind("127.0.0.1:0")?;
     Ok(l.local_addr()?.port())
@@ -179,5 +189,33 @@ async fn collect(stderr: tokio::process::ChildStderr, log: Log) {
             log.pop_front();
         }
         log.push_back(l);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::process::ExitStatusExt;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_child_that_ignores_sigterm_still_dies_with_its_parent() {
+        // The "parent" is the spawning thread: PR_SET_PDEATHSIG fires when it exits.
+        let mut child = std::thread::spawn(|| {
+            let mut cmd = std::process::Command::new("sh");
+            cmd.args(["-c", "trap '' TERM; sleep 30"]);
+            super::die_with_parent(&mut cmd);
+            cmd.spawn().expect("spawn sh")
+        })
+        .join()
+        .expect("spawning thread");
+        let start = Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("try_wait") {
+                break status;
+            }
+            assert!(start.elapsed() < Duration::from_secs(5), "child outlived its parent");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
     }
 }

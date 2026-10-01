@@ -73,12 +73,16 @@ capture() { # theme -> $work/review-<theme>.png
     unset WAYLAND_DISPLAY DISPLAY SWAYSOCK LD_LIBRARY_PATH
     sway -c "$work/sway.conf" > "$work/sway-$t.log" 2>&1 &
     sp=$!
+    # On any exit, stop this session too, or a failed run leaves sway and a daemon
+    # (with its llama-server) running where nothing else can see them.
+    trap 'kill "$sp" ${dp:+"$dp"} 2> /dev/null || true' EXIT
     for _ in $(seq 1 50); do [ -S "$run/wayland-1" ] && break; sleep 0.1; done
     [ -S "$run/wayland-1" ] || { echo "sway didn't start:" >&2; tail -n 15 "$work/sway-$t.log" >&2; exit 1; }
     export WAYLAND_DISPLAY=wayland-1
     visible() { "$q" status 2>/dev/null | grep -q 'popup:  visible'; }
 
     "$q" daemon > "$work/daemon-$t.log" 2>&1 &
+    dp=$!
     for _ in $(seq 1 90); do "$q" status 2>/dev/null | grep -q 'engine: ready' && break; sleep 1; done
     printf '%s' "$text" | wl-copy
     sleep 0.5

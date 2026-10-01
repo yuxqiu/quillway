@@ -11,7 +11,7 @@ use quillway_core::diff::{self, Change};
 use quillway_engine::download::human;
 
 use super::style::{Palette, RING};
-use super::{App, EngineState, INPUT_ID, Message, Phase, Popup, SOURCE_ID};
+use super::{App, EngineState, Field, INPUT_ID, Message, Phase, Popup, SOURCE_ID};
 
 const BODY_MAX_HEIGHT: f32 = 380.0;
 const SOURCE_MAX_HEIGHT: f32 = 170.0;
@@ -131,7 +131,7 @@ impl App {
 
     fn chips(&self, pal: Palette) -> Element<'_, Message> {
         let chips = self.presets.iter().enumerate().map(|(i, preset)| {
-            let key = if i < 9 { format!("{}", i + 1) } else { String::new() };
+            let key = if i < 9 { format!("^{}", i + 1) } else { String::new() };
             let label = row![text(key).size(11).color(pal.faint), text(preset.name.as_str()).size(13).color(pal.text)]
                 .spacing(6);
             mouse_area(container(label).padding([5, 10]).style(pal.chip(false))).on_press(Message::Preset(i)).into()
@@ -159,7 +159,9 @@ impl App {
         };
         let hints = match p.phase() {
             _ if self.needs_install(p) && self.active.catalog => "↵ install   esc close",
-            Phase::Composing => "↵ run   1–9 preset   ⇥ switch box   esc close",
+            // In the text box, ↵ is a new line and the Ctrl shortcuts are off.
+            Phase::Composing if p.field == Field::Source => "⇥ switch box   esc close",
+            Phase::Composing => "↵ run   ^1–9 preset   ⇥ switch box   esc close",
             Phase::Generating => "esc stop",
             Phase::Reviewing if p.editing() => "⇥ done editing   esc close",
             Phase::Reviewing if p.drafts.last().is_some_and(|d| d.edited) => {
@@ -196,9 +198,13 @@ fn editor<'a>(
         .padding(0)
         .max_height(max_height)
         .style(pal.editor())
-        // Tab switches boxes instead of inserting a tab.
+        // Tab switches boxes instead of inserting a tab. Keys pressed with Ctrl insert nothing:
+        // iced still reports the key's text under Ctrl, so Ctrl+1 would otherwise insert "1".
         .key_binding(|k| match k.key {
             Key::Named(Named::Tab) => None,
+            _ if k.modifiers.control() => {
+                text_editor::Binding::from_key_press(k).filter(|b| !matches!(b, text_editor::Binding::Insert(_)))
+            }
             _ => text_editor::Binding::from_key_press(k),
         })
         .into()

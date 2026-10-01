@@ -63,17 +63,19 @@ bindsym Mod4+space exec quillway toggle
 | Where | Key | Action |
 |---|---|---|
 | Compose | type, then ↵ | Run a custom instruction ("make it sound less formal") |
-| | `1`–`9` (empty box) or click a chip | Run a preset |
+| | Ctrl+1–9 or click a chip | Run a preset |
 | | Tab | Move between the instruction and the text box |
 | Writing | Esc | Stop |
-| Review | ↵ (empty box) / Ctrl+C | **Copy** the result and close |
+| Review | ↵ (empty box) | **Copy** the result and close |
 | | type, then ↵ | Refine the current draft ("warmer", "shorter") |
-| | `1`–`9` | Run another preset on the current draft |
+| | Ctrl+1–9 | Run another preset on the current draft |
 | | Tab | Move between the instruction and the result, to edit the result yourself |
-| | Ctrl+D | Toggle the word diff against the original (off while editing) |
+| | Ctrl+D | Toggle the word diff against the original (off while editing); the choice holds for later drafts |
 | | Ctrl+R | Retry (a variant at a higher temperature) |
 | | Ctrl+Z | Undo the last draft |
 | Anywhere | Esc | Close |
+
+The Ctrl shortcuts above work from the instruction box only; in a text box, Ctrl+C/X/V/A select and copy as usual. They follow the key's position, so they also work on non-Latin layouts.
 
 **Where the text comes from:**
 - If you copied something in the last minute (`behavior.recent_secs`), the popup starts with it, and you can still edit it.
