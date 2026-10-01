@@ -1,0 +1,20 @@
+[package]
+name = "quillway"
+description = "Shortcut-summoned local-LLM rewrite popup for Wayland (layer-shell)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+quillway-core.workspace = true
+quillway-engine.workspace = true
+quillway-wl.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+clap = { version = "4", features = ["derive"] }
+futures-util = "0.3"
+iced = { version = "0.14", features = ["tokio"] }
+iced_layershell = "=0.19.1"
+# iced_exdevtools 0.19.1 breaks on winit-core beta.3 (non-exhaustive NativeKeyCode); pin what upstream locks.
+winit-core = "=0.31.0-beta.2"

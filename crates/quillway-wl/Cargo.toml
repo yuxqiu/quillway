@@ -1,0 +1,13 @@
+[package]
+name = "quillway-wl"
+description = "Quillway Wayland clipboard I/O: read and write CLIPBOARD, track when it last changed"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+wl-clipboard-rs = "0.9"
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }

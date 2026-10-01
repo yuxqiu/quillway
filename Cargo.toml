@@ -1,0 +1,20 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+exclude = ["spikes"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/yuxqiu/quillway"
+
+[workspace.dependencies]
+quillway-core = { path = "crates/quillway-core" }
+quillway-engine = { path = "crates/quillway-engine" }
+quillway-wl = { path = "crates/quillway-wl" }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "process", "time", "fs", "sync"] }
