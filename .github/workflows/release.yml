@@ -69,7 +69,7 @@ jobs:
         run: |
           name="quillway-${TAG}-${{ matrix.arch }}-linux"
           mkdir "$name"
-          cp target/release/quillway README.md "$name/"
+          cp target/release/quillway README.md LICENSE-APACHE LICENSE-MIT "$name/"
           tar --create --gzip --file "$name.tar.gz" "$name"
           sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
           echo "files=$name.tar.gz $name.tar.gz.sha256" >> "$GITHUB_OUTPUT"

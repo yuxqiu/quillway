@@ -1,6 +1,13 @@
 # Quillway
 
-Quillway is a rewrite popup for Wayland that you open with a keyboard shortcut. Select some text, press the key, then pick a preset or type an instruction. A local model streams the rewrite in as it's generated, and ↵ copies the result.
+Quillway is a rewrite popup for Wayland that you open with a keyboard shortcut. Copy some text, press the key, then pick a preset or type an instruction. A local model streams the rewrite in as it's generated, and ↵ copies the result.
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/screenshot-dark.png">
+    <img src="assets/screenshot-light.png" width="830" alt="The Quillway popup after Proofread: a word diff of the copied text with corrections such as “their” → “there” and “tomorow” → “tomorrow”, the seven preset chips, and a footer with the timing and key hints.">
+  </picture>
+</p>
 
 - **Local only.** A supervised `llama-server` (llama.cpp) runs small writing models that Quillway downloads and verifies. You can also point it at any OpenAI-compatible endpoint, such as Ollama or LM Studio.
 - **Any layer-shell compositor.** Tested on niri; Hyprland, Sway, river, KDE and COSMIC should work. GNOME isn't supported because it has no layer-shell.
@@ -163,3 +170,9 @@ The code is split into four crates:
 | `quillway-engine` | OpenAI SSE client, llama-server supervisor, downloader |
 | `quillway-wl` | Clipboard I/O |
 | `quillway` | CLI, IPC, iced UI |
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT), at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in Quillway by you, as defined in the Apache-2.0 license, shall be dual-licensed as above, without any additional terms or conditions.
