@@ -110,6 +110,16 @@ impl Default for UiConfig {
     }
 }
 
+impl UiConfig {
+    /// `accent` as red, green and blue; `None` unless it is `#rrggbb`.
+    #[must_use]
+    pub fn accent_rgb(&self) -> Option<[u8; 3]> {
+        let hex = self.accent.strip_prefix('#').filter(|h| h.len() == 6 && h.bytes().all(|b| b.is_ascii_hexdigit()))?;
+        let channel = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
+        Some([channel(0)?, channel(2)?, channel(4)?])
+    }
+}
+
 /// `[behavior]`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -125,6 +135,13 @@ impl Default for Behavior {
     }
 }
 
+/// Temperature of a preset that sets none, and of typed instructions.
+pub const DEFAULT_TEMPERATURE: f32 = 0.7;
+
+const fn default_temperature() -> f32 {
+    DEFAULT_TEMPERATURE
+}
+
 /// `[[preset]]`: a one-key rewrite.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -133,9 +150,9 @@ pub struct Preset {
     pub name: String,
     /// The task given to the model.
     pub instruction: String,
-    /// Sampling temperature; 0.7 when unset. Low for proofreading, higher for rewording.
-    #[serde(default)]
-    pub temperature: Option<f32>,
+    /// Sampling temperature. Low for proofreading, higher for rewording.
+    #[serde(default = "default_temperature")]
+    pub temperature: f32,
     /// Open the result in the word-diff view.
     #[serde(default)]
     pub show_diff: bool,
@@ -166,14 +183,11 @@ impl Config {
                 if !Path::new(path).is_absolute() {
                     anyhow::bail!("`model.active`: the custom model path {path:?} must be absolute");
                 }
-            } else if catalog::find(active).is_none() {
-                let ids: Vec<_> = catalog::all().iter().map(|e| e.id.as_str()).collect();
-                anyhow::bail!("unknown model {active:?} in `model.active`; available: {}", ids.join(", "));
+            } else {
+                catalog::get(active)?;
             }
         }
-        let hex =
-            config.ui.accent.strip_prefix('#').filter(|h| h.len() == 6 && h.bytes().all(|b| b.is_ascii_hexdigit()));
-        if hex.is_none() {
+        if config.ui.accent_rgb().is_none() {
             anyhow::bail!("`ui.accent = {:?}` must be a colour like \"#7c6cf2\"", config.ui.accent);
         }
         for p in &config.presets {
@@ -200,7 +214,7 @@ pub fn default_presets() -> Vec<Preset> {
     let p = |name: &str, instruction: &str, temperature: f32, show_diff: bool| Preset {
         name: name.into(),
         instruction: instruction.into(),
-        temperature: Some(temperature),
+        temperature,
         show_diff,
     };
     vec![
@@ -246,6 +260,7 @@ mod tests {
         assert_eq!(c.ui.theme, ThemeChoice::Light);
         assert_eq!(c.presets().len(), 1);
         assert_eq!(c.presets()[0].name, "Pirate");
+        assert!((c.presets()[0].temperature - DEFAULT_TEMPERATURE).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -285,7 +300,8 @@ mod tests {
         for bad in ["purple", "#7c6cf", "#7c6cf2ff", "7c6cf2", "#zzzzzz"] {
             assert!(Config::parse(&format!("[ui]\naccent = '{bad}'")).is_err(), "{bad}");
         }
-        assert!(Config::parse("[ui]\naccent = '#7C6CF2'").is_ok());
+        let ok = Config::parse("[ui]\naccent = '#7C6CF2'").unwrap();
+        assert_eq!(ok.ui.accent_rgb(), Some([0x7c, 0x6c, 0xf2]));
     }
 
     #[test]

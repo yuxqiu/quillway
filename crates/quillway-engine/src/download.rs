@@ -32,10 +32,19 @@ pub struct Job<'a> {
     pub sha256: &'a str,
 }
 
-fn part_path(dest: &Path) -> PathBuf {
+/// `dest` with `suffix` appended to its file name.
+fn sibling(dest: &Path, suffix: &str) -> PathBuf {
     let mut p = dest.as_os_str().to_owned();
-    p.push(".part");
+    p.push(suffix);
     PathBuf::from(p)
+}
+
+fn part_path(dest: &Path) -> PathBuf {
+    sibling(dest, ".part")
+}
+
+fn lock_path(dest: &Path) -> PathBuf {
+    sibling(dest, ".lock")
 }
 
 /// Download `job`, resuming a previous `.part`, and verify it.
@@ -109,7 +118,7 @@ pub async fn download(job: Job<'_>, mut on_progress: impl FnMut(Progress)) -> an
     if have != job.size {
         bail!("size mismatch: got {have} bytes, expected {}", job.size);
     }
-    let digest = hex(&hasher.finalize());
+    let digest = format!("{:x}", hasher.finalize());
     if !digest.eq_ignore_ascii_case(job.sha256) {
         tokio::fs::remove_file(&part).await.ok();
         bail!("sha256 mismatch (got {digest}); the partial file was removed");
@@ -142,12 +151,6 @@ fn remove_if_present(path: &Path) -> anyhow::Result<bool> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
     }
-}
-
-fn lock_path(dest: &Path) -> PathBuf {
-    let mut p = dest.as_os_str().to_owned();
-    p.push(".lock");
-    PathBuf::from(p)
 }
 
 fn lock(dest: &Path) -> anyhow::Result<std::fs::File> {
@@ -207,14 +210,6 @@ pub fn human(bytes: u64) -> String {
     if b >= 1e9 { format!("{:.1} GB", b / 1e9) } else { format!("{:.0} MB", b / 1e6) }
 }
 
-fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
-        let _ = write!(s, "{b:02x}");
-        s
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,7 +248,7 @@ mod tests {
     }
 
     fn sha(data: &[u8]) -> String {
-        hex(&Sha256::digest(data))
+        format!("{:x}", Sha256::digest(data))
     }
 
     #[tokio::test]

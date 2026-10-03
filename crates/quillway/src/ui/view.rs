@@ -11,7 +11,7 @@ use quillway_core::diff::{self, Change};
 use quillway_engine::download::human;
 
 use super::style::{Palette, RING};
-use super::{App, EngineState, Field, INPUT_ID, Message, Phase, Popup, SOURCE_ID};
+use super::{App, EngineState, Field, INPUT_ID, Install, Message, Phase, Popup, SOURCE_ID};
 
 const BODY_MAX_HEIGHT: f32 = 380.0;
 const SOURCE_MAX_HEIGHT: f32 = 170.0;
@@ -27,7 +27,7 @@ impl App {
         let mut sections: Vec<Element<'_, Message>> = vec![self.input_row(p, pal)];
         sections.push(hairline(pal));
         sections.push(self.body(p, pal));
-        if matches!(p.phase(), Phase::Composing | Phase::Reviewing) && !self.needs_install(p) {
+        if matches!(p.phase(), Phase::Composing | Phase::Reviewing) && !self.needs_install() {
             sections.push(hairline(pal));
             sections.push(self.chips(pal));
         }
@@ -50,7 +50,7 @@ impl App {
 
     fn input_row<'a>(&'a self, p: &'a Popup, pal: Palette) -> Element<'a, Message> {
         let (placeholder, editable) = match p.phase() {
-            Phase::Composing if self.needs_install(p) => ("No model installed", false),
+            Phase::Composing if self.needs_install() => ("No model installed", false),
             Phase::Composing => ("Describe your change…", true),
             Phase::Generating => ("Writing…", false),
             Phase::Reviewing => ("Refine: make it warmer…   (↵ on empty copies)", true),
@@ -63,14 +63,14 @@ impl App {
         if editable {
             input = input.on_input(Message::Input).on_submit(Message::Submit);
         }
-        if self.needs_install(p) {
+        if self.needs_install() {
             input = input.on_submit(Message::Submit);
         }
         input.into()
     }
 
     fn body<'a>(&'a self, p: &'a Popup, pal: Palette) -> Element<'a, Message> {
-        if self.needs_install(p) {
+        if self.needs_install() {
             return self.install_card(pal);
         }
         let content: Element<'a, Message> = match p.phase() {
@@ -101,13 +101,12 @@ impl App {
     }
 
     fn install_card(&self, pal: Palette) -> Element<'_, Message> {
-        if !self.active.catalog {
+        let Some(entry) = self.active.entry else {
             let msg = format!("Model file not found: {}", self.active.path.display());
             return container(text(msg).size(13).color(pal.error)).padding([14, PAD_X]).width(Length::Fill).into();
-        }
-        let entry = quillway_core::catalog::find(&self.active.id).unwrap_or_else(quillway_core::catalog::default_entry);
+        };
         let line: Element<'_, Message> = match &self.install {
-            Some(i) if i.error.is_some() => text(i.error.clone().unwrap_or_default()).size(13).color(pal.error).into(),
+            Some(Install { error: Some(e), .. }) => text(e.as_str()).size(13).color(pal.error).into(),
             Some(i) => text(format!(
                 "Downloading {}… {} / {} ({}%)",
                 i.entry.name,
@@ -134,7 +133,7 @@ impl App {
             let key = if i < 9 { format!("^{}", i + 1) } else { String::new() };
             let label = row![text(key).size(11).color(pal.faint), text(preset.name.as_str()).size(13).color(pal.text)]
                 .spacing(6);
-            mouse_area(container(label).padding([5, 10]).style(pal.chip(false))).on_press(Message::Preset(i)).into()
+            mouse_area(container(label).padding([5, 10]).style(pal.chip())).on_press(Message::Preset(i)).into()
         });
         container(row(chips).spacing(8).wrap().vertical_spacing(8)).padding([12, PAD_X]).width(Length::Fill).into()
     }
@@ -158,13 +157,13 @@ impl App {
             }
         };
         let hints = match p.phase() {
-            _ if self.needs_install(p) && self.active.catalog => "↵ install   esc close",
+            _ if self.needs_install() && self.active.entry.is_some() => "↵ install   esc close",
             // In the text box, ↵ is a new line and the Ctrl shortcuts are off.
             Phase::Composing if p.field == Field::Source => "⇥ switch box   esc close",
             Phase::Composing => "↵ run   ^1–9 preset   ⇥ switch box   esc close",
             Phase::Generating => "esc stop",
             Phase::Reviewing if p.editing() => "⇥ done editing   esc close",
-            Phase::Reviewing if p.drafts.last().is_some_and(|d| d.edited) => {
+            Phase::Reviewing if p.drafts.last().is_some_and(super::Draft::edited) => {
                 "↵ copy   ⇥ edit   ^D diff   ^Z undo   esc"
             }
             Phase::Reviewing => "↵ copy   ⇥ edit   ^D diff   ^R retry   ^Z undo   esc",

@@ -52,8 +52,7 @@ async fn main() -> anyhow::Result<()> {
                 let r = Rewrite {
                     instruction: preset.instruction.clone(),
                     text: text.to_owned(),
-                    temperature: preset.temperature.unwrap_or(0.7),
-                    sampling: active.sampling,
+                    temperature: preset.temperature,
                     max_tokens: None,
                 };
                 let t0 = Instant::now();

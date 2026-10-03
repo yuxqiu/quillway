@@ -42,6 +42,23 @@ pub enum Input {
     Text(String),
 }
 
+/// How to reach an OpenAI-compatible model server, and how to sample from its model.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Endpoint {
+    /// OpenAI-compatible `/v1` URL.
+    pub base: String,
+    /// Bearer token.
+    pub api_key: Option<String>,
+    /// Model name for requests.
+    pub model: String,
+    /// Our own llama-server (exact token counts, llama.cpp fields).
+    pub llama: bool,
+    /// Context window in tokens.
+    pub context: u32,
+    /// Sampling defaults of the model.
+    pub sampling: Sampling,
+}
+
 /// The daemon's answer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
@@ -58,20 +75,7 @@ pub enum Response {
         engine: String,
     },
     /// Answer to [`Request::Connect`]: how to reach the daemon's model server.
-    Server {
-        /// OpenAI-compatible `/v1` URL.
-        base: String,
-        /// Bearer token.
-        api_key: Option<String>,
-        /// Model name for requests.
-        model: String,
-        /// Our own llama-server (exact token counts, llama.cpp fields).
-        llama: bool,
-        /// Context window in tokens.
-        context: u32,
-        /// Sampling defaults of the active model.
-        sampling: Sampling,
-    },
+    Server(Endpoint),
     /// The request failed.
     Error {
         /// What went wrong.
@@ -91,5 +95,16 @@ mod tests {
         assert_eq!(serde_json::from_str::<Request>(&s).unwrap(), r);
         let s = serde_json::to_string(&Request::Show { input: Input::Clipboard }).unwrap();
         assert_eq!(s, r#"{"cmd":"show","input":{"from":"clipboard"}}"#);
+        let server = Response::Server(Endpoint {
+            base: "http://h/v1".into(),
+            api_key: None,
+            model: "m".into(),
+            llama: true,
+            context: 8192,
+            sampling: Sampling::default(),
+        });
+        let s = serde_json::to_string(&server).unwrap();
+        assert!(s.starts_with(r#"{"status":"server","base":"http://h/v1","#), "{s}");
+        assert_eq!(serde_json::from_str::<Response>(&s).unwrap(), server);
     }
 }

@@ -9,7 +9,7 @@ use quillway_core::paths;
 use serde::{Deserialize, Serialize};
 
 /// The model requests will use.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct Active {
     /// Catalog id, or `custom:<path>`.
     pub id: String,
@@ -19,8 +19,8 @@ pub struct Active {
     pub path: PathBuf,
     /// Sampling defaults.
     pub sampling: Sampling,
-    /// A catalog entry (installable) rather than a custom path.
-    pub catalog: bool,
+    /// The catalog entry (installable); `None` for a custom path.
+    pub entry: Option<&'static catalog::Entry>,
 }
 
 /// Mutable choices made through the CLI (`models use`), kept apart from the
@@ -68,11 +68,11 @@ fn resolve(id: Option<&str>, models_dir: &Path) -> Active {
             name,
             path,
             sampling: Sampling { top_p: 0.9, top_k: 40, min_p: 0.05 },
-            catalog: false,
+            entry: None,
         };
     }
     let e = id.and_then(catalog::find).unwrap_or_else(catalog::default_entry);
-    Active { id: e.id.clone(), name: e.name.clone(), path: e.path_in(models_dir), sampling: e.sampling, catalog: true }
+    Active { id: e.id.clone(), name: e.name.clone(), path: e.path_in(models_dir), sampling: e.sampling, entry: Some(e) }
 }
 
 /// Whether the entry's file is downloaded.
@@ -92,7 +92,7 @@ mod tests {
         assert_eq!(resolve(None, dir).id, "qwen3.5-4b");
         assert_eq!(resolve(Some("no-such-model"), dir).id, "qwen3.5-4b");
         let c = resolve(Some("custom:/x/My-Model.gguf"), dir);
-        assert_eq!((c.name.as_str(), c.catalog), ("My-Model", false));
+        assert_eq!((c.name.as_str(), c.entry.is_none()), ("My-Model", true));
         assert_eq!(c.path, PathBuf::from("/x/My-Model.gguf"));
     }
 }

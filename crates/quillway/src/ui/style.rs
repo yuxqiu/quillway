@@ -31,7 +31,9 @@ pub struct Palette {
 
 impl Palette {
     pub fn new(ui: &UiConfig) -> Self {
-        let accent = parse_hex(&ui.accent).unwrap_or(Color::from_rgb8(0x7c, 0x6c, 0xf2));
+        // The config is validated on load, so the fallback is never used.
+        let [r, g, b] = ui.accent_rgb().unwrap_or([0x7c, 0x6c, 0xf2]);
+        let accent = Color::from_rgb8(r, g, b);
         let op = ui.opacity.clamp(0.2, 1.0);
         let (base, ink): (Color, Color) = match ui.theme {
             ThemeChoice::Dark => (Color::from_rgba8(28, 28, 32, op), Color::from_rgb8(0xed, 0xed, 0xf0)),
@@ -123,9 +125,9 @@ impl Palette {
         }
     }
 
-    pub fn chip(self, active: bool) -> impl Fn(&iced::Theme) -> container::Style {
+    pub fn chip(self) -> impl Fn(&iced::Theme) -> container::Style {
         move |_| container::Style {
-            background: Some(if active { Color { a: 0.22 * self.accent.a, ..self.accent } } else { self.chip }.into()),
+            background: Some(self.chip.into()),
             border: Border { radius: 8.0.into(), ..Border::default() },
             ..container::Style::default()
         }
@@ -155,16 +157,6 @@ impl Palette {
     pub fn hairline(self) -> impl Fn(&iced::Theme) -> rule::Style {
         move |_| rule::Style { color: self.hairline, radius: 0.0.into(), fill_mode: rule::FillMode::Full, snap: true }
     }
-}
-
-fn parse_hex(s: &str) -> Option<Color> {
-    let h = s.strip_prefix('#')?;
-    if h.len() != 6 {
-        return None;
-    }
-    let v = u32::from_str_radix(h, 16).ok()?;
-    let [_, r, g, b] = v.to_be_bytes();
-    Some(Color::from_rgb8(r, g, b))
 }
 
 /// Shift hue by `turns` (fraction of a full circle) in HSV space.
@@ -205,10 +197,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hex_and_hue() {
-        let c = parse_hex("#ff0000").unwrap();
-        assert_eq!((c.r, c.g, c.b), (1.0, 0.0, 0.0));
-        assert!(parse_hex("red").is_none());
+    fn rotates_hue() {
+        let c = Color::from_rgb8(0xff, 0, 0);
         let g = rotate_hue(c, 1.0 / 3.0);
         assert!((g.g - 1.0).abs() < 1e-4 && g.r.abs() < 1e-4, "{g:?}");
     }

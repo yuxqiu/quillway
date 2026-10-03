@@ -18,8 +18,8 @@ use iced::{Event, Size, Subscription, Task, event, task, window};
 use iced_layershell::reexport::{Anchor, KeyboardInteractivity, Layer, NewLayerShellSettings, OutputOption};
 use iced_layershell::settings::{LayerShellSettings, Settings, StartMode};
 use iced_layershell::to_layer_message;
-use quillway_core::catalog::{self, Entry};
-use quillway_core::config::{Config, Preset};
+use quillway_core::catalog::Entry;
+use quillway_core::config::{Config, DEFAULT_TEMPERATURE, Preset};
 use quillway_core::ipc::{Input, Request, Response};
 use quillway_core::{clean, paths, prompt};
 use quillway_engine::download::{self, Job};
@@ -99,6 +99,18 @@ pub enum EngineState {
     Failed(String),
 }
 
+impl EngineState {
+    /// For `quillway status`.
+    fn describe(&self) -> String {
+        match self {
+            Self::Starting => "starting".to_owned(),
+            Self::Ready => "ready".to_owned(),
+            Self::Missing => "model not installed".to_owned(),
+            Self::Failed(e) => format!("failed: {e}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
     Composing,
@@ -113,9 +125,14 @@ pub struct Draft {
     pub show_diff: bool,
     /// Generation failed part-way; this is what arrived.
     pub incomplete: bool,
-    /// Edited by hand; holds the request of the draft it was edited from.
-    pub edited: bool,
-    request: Rewrite,
+    /// What produced it; `None` for a hand edit, which has nothing to retry.
+    request: Option<Rewrite>,
+}
+
+impl Draft {
+    pub const fn edited(&self) -> bool {
+        self.request.is_none()
+    }
 }
 
 pub struct Generation {
@@ -130,6 +147,12 @@ pub struct Generation {
     started: Instant,
     first: Option<Instant>,
     deltas: usize,
+}
+
+impl Generation {
+    fn into_draft(self, text: String, stats: String, incomplete: bool) -> Draft {
+        Draft { text, label: self.label, stats, show_diff: self.show_diff, incomplete, request: Some(self.request) }
+    }
 }
 
 pub struct Popup {
@@ -180,7 +203,7 @@ impl Popup {
         self.error = None; // it was about the text before this edit
         let text = self.draft_editor.text();
         let Some(last) = self.drafts.last_mut() else { return };
-        if last.edited {
+        if last.edited() {
             last.text = text;
             return;
         }
@@ -193,10 +216,16 @@ impl Popup {
             stats: "by hand".into(),
             show_diff: last.show_diff,
             incomplete: false,
-            edited: true,
-            request: last.request.clone(),
+            request: None,
         };
         self.drafts.push(draft);
+    }
+
+    /// Unless Ctrl+D pinned it, the diff follows the latest draft's preset.
+    fn follow_diff(&mut self) {
+        if !self.diff_pinned {
+            self.show_diff = self.drafts.last().is_some_and(|d| d.show_diff);
+        }
     }
 }
 
@@ -304,8 +333,13 @@ impl App {
         (app, warm)
     }
 
+    /// Our own llama-server would have no model file to load.
+    fn model_missing(&self) -> bool {
+        self.config.model.endpoint.is_none() && !self.active.path.is_file()
+    }
+
     fn warm_up(&mut self) -> Task<Message> {
-        if self.config.model.endpoint.is_none() && !self.active.path.is_file() {
+        if self.model_missing() {
             self.engine_state = EngineState::Missing;
             return Task::none();
         }
@@ -407,9 +441,7 @@ impl App {
             Message::Engine(_, r) => {
                 self.engine_state = match r {
                     Ok(()) => EngineState::Ready,
-                    Err(_) if self.config.model.endpoint.is_none() && !self.active.path.is_file() => {
-                        EngineState::Missing
-                    }
+                    Err(_) if self.model_missing() => EngineState::Missing,
                     Err(e) => {
                         eprintln!("quillway: engine: {e}");
                         EngineState::Failed(e)
@@ -485,16 +517,12 @@ impl App {
                     self.active = models::active(&config);
                     self.palette = style::Palette::new(&config.ui);
                     self.config = config.clone();
-                    let engine = self.engine.clone();
-                    let reply = reply.clone();
-                    let reload = Task::perform(
-                        async move {
-                            engine.reload(config).await;
-                            reply.send(Response::Ok);
-                        },
-                        |()| Message::Tick(Instant::now()),
-                    );
-                    reload.chain(self.warm_up())
+                    let (engine, reply) = (self.engine.clone(), reply.clone());
+                    let reload = Task::future(async move {
+                        engine.reload(config).await;
+                        reply.send(Response::Ok);
+                    });
+                    reload.discard().chain(self.warm_up())
                 }
                 Err(e) => {
                     reply.send(Response::Error { message: format!("{e:#}") });
@@ -502,33 +530,19 @@ impl App {
                 }
             },
             Request::Status => {
-                let engine = match &self.engine_state {
-                    EngineState::Starting => "starting".to_owned(),
-                    EngineState::Ready => "ready".to_owned(),
-                    EngineState::Missing => "model not installed".to_owned(),
-                    EngineState::Failed(e) => format!("failed: {e}"),
-                };
+                let engine = self.engine_state.describe();
                 reply.send(Response::Status { visible: self.popup.is_some(), model: self.model_label(), engine });
                 Task::none()
             }
             Request::Connect => {
-                let (engine, reply, sampling) = (self.engine.clone(), reply.clone(), self.active.sampling);
-                Task::perform(
-                    async move {
-                        reply.send(match engine.client().await {
-                            Ok(c) => Response::Server {
-                                base: c.base().to_owned(),
-                                api_key: c.api_key().map(str::to_owned),
-                                model: c.model().to_owned(),
-                                llama: c.is_llama(),
-                                context: c.context(),
-                                sampling,
-                            },
-                            Err(e) => Response::Error { message: format!("{e:#}") },
-                        });
-                    },
-                    |()| Message::Tick(Instant::now()),
-                )
+                let (engine, reply) = (self.engine.clone(), reply.clone());
+                Task::future(async move {
+                    reply.send(match engine.client().await {
+                        Ok(c) => Response::Server(c.endpoint().clone()),
+                        Err(e) => Response::Error { message: format!("{e:#}") },
+                    });
+                })
+                .discard()
             }
             Request::Quit => {
                 reply.send(Response::Ok);
@@ -655,41 +669,28 @@ impl App {
     }
 
     fn submit(&mut self) -> Task<Message> {
-        let Some(p) = self.popup.as_ref() else { return Task::none() };
-        if self.needs_install(p) {
+        if self.needs_install() {
             return self.start_install();
         }
-        let Some(p) = self.popup.as_mut() else { return Task::none() };
-        match p.phase() {
-            Phase::Composing => {
-                let instruction = p.input.trim().to_owned();
-                if instruction.is_empty() {
-                    return Task::none();
-                }
-                self.generate("Custom".into(), instruction, 0.7, false)
-            }
-            Phase::Reviewing => {
-                let instruction = p.input.trim().to_owned();
-                if instruction.is_empty() {
-                    self.copy()
-                } else {
-                    self.generate("Refine".into(), instruction, 0.7, false)
-                }
-            }
-            Phase::Generating => Task::none(),
+        let Some(p) = self.popup.as_ref() else { return Task::none() };
+        let instruction = p.input.trim().to_owned();
+        match (p.phase(), instruction.is_empty()) {
+            (Phase::Reviewing, true) => self.copy(),
+            (Phase::Composing, false) => self.generate("Custom".into(), instruction, DEFAULT_TEMPERATURE, false),
+            (Phase::Reviewing, false) => self.generate("Refine".into(), instruction, DEFAULT_TEMPERATURE, false),
+            (Phase::Composing, true) | (Phase::Generating, _) => Task::none(),
         }
     }
 
     fn run_preset(&mut self, i: usize) -> Task<Message> {
         let Some(preset) = self.presets.get(i).cloned() else { return Task::none() };
-        if self.popup.as_ref().is_none_or(|p| p.generation.is_some() || self.needs_install(p)) {
+        if self.needs_install() || self.popup.as_ref().is_none_or(|p| p.generation.is_some()) {
             return Task::none();
         }
-        self.generate(preset.name, preset.instruction, preset.temperature.unwrap_or(0.7), preset.show_diff)
+        self.generate(preset.name, preset.instruction, preset.temperature, preset.show_diff)
     }
 
     fn generate(&mut self, label: String, instruction: String, temperature: f32, show_diff: bool) -> Task<Message> {
-        let sampling = self.active.sampling;
         let Some(p) = self.popup.as_mut() else { return Task::none() };
         let text = p.base();
         if text.trim().is_empty() {
@@ -701,7 +702,7 @@ impl App {
             return Task::none();
         }
         // The client counts tokens and rejects text too long for the context.
-        let request = Rewrite { instruction, max_tokens: None, text, temperature, sampling };
+        let request = Rewrite { instruction, max_tokens: None, text, temperature };
         if p.drafts.is_empty() {
             p.original.clone_from(&request.text);
         }
@@ -751,18 +752,8 @@ impl App {
                 let partial = clean::clean(&g.raw, &g.request.text, false).trim_end().to_owned();
                 // Keep what arrived, marked, unless a retry failed (its old draft stays).
                 if !partial.trim().is_empty() && !g.replace {
-                    if !p.diff_pinned {
-                        p.show_diff = g.show_diff;
-                    }
-                    p.drafts.push(Draft {
-                        text: partial,
-                        label: g.label,
-                        stats: "stopped early".into(),
-                        show_diff: g.show_diff,
-                        incomplete: true,
-                        edited: false,
-                        request: g.request,
-                    });
+                    p.drafts.push(g.into_draft(partial, "stopped early".into(), true));
+                    p.follow_diff();
                 }
                 p.error = Some(e);
             }
@@ -776,21 +767,11 @@ impl App {
                 let secs = g.started.elapsed().as_secs_f64();
                 let gen_secs = g.first.map_or(secs, |f| f.elapsed().as_secs_f64()).max(1e-3);
                 let rate = f64::from(u32::try_from(g.deltas.saturating_sub(1)).unwrap_or(u32::MAX)) / gen_secs;
-                if !p.diff_pinned {
-                    p.show_diff = g.show_diff;
-                }
                 if g.replace {
                     p.drafts.pop();
                 }
-                p.drafts.push(Draft {
-                    text,
-                    label: g.label,
-                    stats: format!("{secs:.1}s · {rate:.0} tok/s"),
-                    show_diff: g.show_diff,
-                    incomplete: false,
-                    edited: false,
-                    request: g.request,
-                });
+                p.drafts.push(g.into_draft(text, format!("{secs:.1}s · {rate:.0} tok/s"), false));
+                p.follow_diff();
             }
         }
         Task::none()
@@ -822,10 +803,9 @@ impl App {
                 p.diff_pinned = true;
                 Task::none()
             }
-            // An edited draft has no request of its own to retry.
-            (Shortcut::Retry, Phase::Reviewing) if p.drafts.last().is_some_and(|d| !d.edited) => {
-                let d = p.drafts.last().expect("reviewing has a draft");
-                let mut request = d.request.clone();
+            (Shortcut::Retry, Phase::Reviewing) => {
+                let Some(d) = p.drafts.last() else { return Task::none() };
+                let Some(mut request) = d.request.clone() else { return Task::none() };
                 request.temperature = (request.temperature + 0.3).min(1.2);
                 let (label, show_diff) = (d.label.clone(), d.show_diff);
                 self.start(label, request, show_diff, true)
@@ -833,9 +813,7 @@ impl App {
             (Shortcut::Undo, Phase::Reviewing) => {
                 p.drafts.pop();
                 p.error = None;
-                if !p.diff_pinned {
-                    p.show_diff = p.drafts.last().is_some_and(|d| d.show_diff);
-                }
+                p.follow_diff();
                 Task::none()
             }
             _ => Task::none(),
@@ -864,11 +842,7 @@ impl App {
         if self.install.as_ref().is_some_and(|i| i.error.is_none()) {
             return Task::none();
         }
-        let entry = if self.active.catalog {
-            catalog::find(&self.active.id).unwrap_or_else(catalog::default_entry)
-        } else {
-            return Task::none();
-        };
+        let Some(entry) = self.active.entry else { return Task::none() };
         if entry.license_notice {
             // Non-OSI licenses need an explicit, informed yes: use the CLI.
             self.install = Some(Install {
@@ -904,8 +878,8 @@ impl App {
     }
 
     /// The install card replaces the composer only before anything was generated.
-    pub fn needs_install(&self, p: &Popup) -> bool {
-        self.engine_state == EngineState::Missing && p.phase() == Phase::Composing
+    pub fn needs_install(&self) -> bool {
+        self.engine_state == EngineState::Missing && self.popup.as_ref().is_some_and(|p| p.phase() == Phase::Composing)
     }
 
     /// Name shown in the footer and `status`.
@@ -1013,17 +987,12 @@ async fn read_clipboard() -> (Option<String>, Option<String>) {
 }
 
 fn stream_rewrite(engine: Engine, req: Rewrite) -> impl Stream<Item = GenEvent> {
-    stream::once(async move {
-        match engine.client().await {
-            Ok(c) => c.stream(&req).await,
-            Err(e) => Err(e),
-        }
-    })
-    .flat_map(|r| match r {
-        Ok(s) => s.map(|d| d.map_or_else(|e| GenEvent::Error(format!("{e:#}")), GenEvent::Delta)).boxed(),
-        Err(e) => stream::once(async move { GenEvent::Error(format!("{e:#}")) }).boxed(),
-    })
-    .chain(stream::once(async { GenEvent::Done }))
+    stream::once(async move { engine.client().await?.stream(&req).await })
+        .flat_map(|r| match r {
+            Ok(s) => s.map(|d| d.map_or_else(|e| GenEvent::Error(format!("{e:#}")), GenEvent::Delta)).boxed(),
+            Err(e) => stream::once(async move { GenEvent::Error(format!("{e:#}")) }).boxed(),
+        })
+        .chain(stream::once(async { GenEvent::Done }))
 }
 
 fn install_stream(entry: &'static Entry) -> impl Stream<Item = InstallEvent> {

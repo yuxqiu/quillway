@@ -73,6 +73,18 @@ pub fn find(id: &str) -> Option<&'static Entry> {
     all().iter().find(|e| e.id == id)
 }
 
+/// The entry with this id, or an error listing the available ids.
+///
+/// # Errors
+///
+/// No entry has this id.
+pub fn get(id: &str) -> anyhow::Result<&'static Entry> {
+    find(id).ok_or_else(|| {
+        let ids: Vec<_> = all().iter().map(|e| e.id.as_str()).collect();
+        anyhow::anyhow!("unknown model {id:?}; available: {}", ids.join(", "))
+    })
+}
+
 /// The model used when nothing else is chosen.
 ///
 /// # Panics

@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, bail};
 use quillway_core::config::Config;
+use quillway_core::ipc::Endpoint;
 use tokio::sync::Mutex;
 
 pub use client::{Client, Rewrite};
@@ -56,14 +57,20 @@ impl Engine {
     pub async fn client(&self) -> anyhow::Result<Client> {
         let mut inner = self.inner.lock().await;
         let cfg = inner.config.model.clone();
-        if let Some(endpoint) = &cfg.endpoint {
-            drop(inner);
-            let model = cfg.endpoint_model.clone().unwrap_or_default();
-            return Ok(Client::new(endpoint, cfg.endpoint_api_key.clone(), model, false, cfg.context));
-        }
         let active = models::active(&inner.config);
+        if let Some(base) = cfg.endpoint {
+            drop(inner);
+            return Ok(Client::new(Endpoint {
+                base,
+                api_key: cfg.endpoint_api_key,
+                model: cfg.endpoint_model.unwrap_or_default(),
+                llama: false,
+                context: cfg.context,
+                sampling: active.sampling,
+            }));
+        }
         if !active.path.is_file() {
-            if !active.catalog {
+            if active.entry.is_none() {
                 bail!("model file not found: {}", active.path.display());
             }
             bail!("model {} is not installed (run `quillway models install {}`)", active.name, active.id);
@@ -83,8 +90,14 @@ impl Engine {
                 server::Server::start(&active.path, &cfg).await.context("starting llama-server")?
             }
         };
-        let client =
-            Client::new(&server.base_url(), Some(server.api_key().to_owned()), active.id, true, server.context());
+        let client = Client::new(Endpoint {
+            base: server.base_url(),
+            api_key: Some(server.api_key().to_owned()),
+            model: active.id,
+            llama: true,
+            context: server.context(),
+            sampling: active.sampling,
+        });
         inner.server = Some(server);
         Ok(client)
     }
@@ -98,7 +111,7 @@ impl Engine {
     pub async fn warm_up(&self) -> anyhow::Result<()> {
         let client = self.client().await?;
         if client.is_llama() {
-            client.warm_up(self.active().await.sampling).await?;
+            client.warm_up().await?;
         }
         Ok(())
     }

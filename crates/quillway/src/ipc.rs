@@ -20,9 +20,7 @@ pub async fn send(req: &Request) -> anyhow::Result<Response> {
         )
     })?;
     let (r, mut w) = stream.into_split();
-    let mut line = serde_json::to_string(req)?;
-    line.push('\n');
-    w.write_all(line.as_bytes()).await?;
+    write_line(&mut w, serde_json::to_string(req)?).await?;
     let mut resp = String::new();
     BufReader::new(r).read_line(&mut resp).await?;
     if resp.is_empty() {
@@ -105,9 +103,13 @@ async fn handle(stream: UnixStream, tx: mpsc::Sender<(Request, Reply)>) -> anyho
         }
         Err(e) => Response::Error { message: format!("bad request: {e}") },
     };
-    let mut out = serde_json::to_string(&resp)?;
-    out.push('\n');
-    w.write_all(out.as_bytes()).await?;
+    write_line(&mut w, serde_json::to_string(&resp)?).await
+}
+
+/// One JSON value per line.
+async fn write_line(w: &mut (impl AsyncWriteExt + Unpin), mut line: String) -> anyhow::Result<()> {
+    line.push('\n');
+    w.write_all(line.as_bytes()).await?;
     Ok(())
 }
 

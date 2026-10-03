@@ -6,7 +6,7 @@ use anyhow::{Context, bail};
 use clap::Subcommand;
 use quillway_core::catalog::{self, Entry};
 use quillway_core::config::Config;
-use quillway_core::ipc::Request;
+use quillway_core::ipc::{Request, Response};
 use quillway_core::paths;
 use quillway_engine::download::{self, Job, human};
 use quillway_engine::models::{self, State, is_installed};
@@ -45,7 +45,7 @@ pub async fn run(cmd: ModelsCmd) -> anyhow::Result<()> {
                     e.license
                 );
             }
-            if !active.catalog {
+            if active.entry.is_none() {
                 println!("★ ✓ {}", active.id);
             }
             if config.model.active.is_some() {
@@ -55,7 +55,7 @@ pub async fn run(cmd: ModelsCmd) -> anyhow::Result<()> {
         }
         ModelsCmd::Install { id, yes } => {
             let e = match id.as_deref() {
-                Some(id) => find(id)?,
+                Some(id) => catalog::get(id)?,
                 None => catalog::default_entry(),
             };
             if e.license_notice && !yes {
@@ -80,7 +80,7 @@ pub async fn run(cmd: ModelsCmd) -> anyhow::Result<()> {
                 }
                 format!("custom:{}", path.display())
             } else {
-                let e = find(&id)?;
+                let e = catalog::get(&id)?;
                 if !is_installed(e) {
                     bail!("{} is not installed; run `quillway models install {}` first", e.name, e.id);
                 }
@@ -95,7 +95,7 @@ pub async fn run(cmd: ModelsCmd) -> anyhow::Result<()> {
             Ok(())
         }
         ModelsCmd::Remove { id } => {
-            let e = find(&id)?;
+            let e = catalog::get(&id)?;
             let path = e.path_in(&paths::models_dir());
             if download::remove(&path)? {
                 println!("removed {}", path.display());
@@ -108,13 +108,6 @@ pub async fn run(cmd: ModelsCmd) -> anyhow::Result<()> {
             Ok(())
         }
     }
-}
-
-fn find(id: &str) -> anyhow::Result<&'static Entry> {
-    catalog::find(id).with_context(|| {
-        let ids: Vec<_> = catalog::all().iter().map(|e| e.id.as_str()).collect();
-        format!("unknown model {id:?}; available: {}", ids.join(", "))
-    })
 }
 
 fn confirm_license(e: &Entry) -> anyhow::Result<()> {
@@ -158,8 +151,8 @@ async fn install(e: &Entry) -> anyhow::Result<()> {
 /// Tell a running daemon to pick up the change; fine if none is running.
 async fn reload_daemon() {
     match crate::ipc::send(&Request::Reload).await {
-        Ok(quillway_core::ipc::Response::Ok) => println!("daemon reloaded"),
-        Ok(quillway_core::ipc::Response::Error { message }) => eprintln!("daemon reload failed: {message}"),
+        Ok(Response::Ok) => println!("daemon reloaded"),
+        Ok(Response::Error { message }) => eprintln!("daemon reload failed: {message}"),
         _ => {}
     }
 }

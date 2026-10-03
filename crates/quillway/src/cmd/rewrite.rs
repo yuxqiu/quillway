@@ -4,7 +4,7 @@ use std::io::{Read, Write};
 
 use anyhow::{Context, bail};
 use futures_util::StreamExt;
-use quillway_core::config::Config;
+use quillway_core::config::{Config, DEFAULT_TEMPERATURE};
 use quillway_core::ipc::{Request, Response};
 use quillway_core::{clean, paths, prompt};
 use quillway_engine::{Client, Engine, Rewrite};
@@ -29,13 +29,13 @@ pub async fn run(a: RewriteArgs) -> anyhow::Result<()> {
     let config = Config::load(&paths::config_file())?;
     let presets = config.presets();
     let (instruction, temperature) = match (&a.preset, &a.instruction) {
-        (_, Some(i)) => (i.clone(), 0.7),
+        (_, Some(i)) => (i.clone(), DEFAULT_TEMPERATURE),
         (Some(name), None) => {
             let p = presets
                 .iter()
                 .find(|p| p.name.eq_ignore_ascii_case(name))
                 .with_context(|| format!("no preset named {name:?}"))?;
-            (p.instruction.clone(), p.temperature.unwrap_or(0.7))
+            (p.instruction.clone(), p.temperature)
         }
         (None, None) => bail!("pass --preset or --instruction"),
     };
@@ -52,9 +52,7 @@ pub async fn run(a: RewriteArgs) -> anyhow::Result<()> {
     // Share the daemon's model server; load our own only when no daemon runs.
     // `_engine` keeps that own server alive until we finish.
     let daemon = match crate::ipc::send(&Request::Connect).await {
-        Ok(Response::Server { base, api_key, model, llama, context, sampling }) => {
-            Some((Client::new(&base, api_key, model.clone(), llama, context), model, sampling))
-        }
+        Ok(Response::Server(endpoint)) => Some(Client::new(endpoint)),
         // A daemon older than this command doesn't know `connect`.
         Ok(Response::Error { message }) if message.starts_with("bad request") => {
             eprintln!("quillway: the running daemon is outdated; restart it to share its model server");
@@ -64,15 +62,14 @@ pub async fn run(a: RewriteArgs) -> anyhow::Result<()> {
         Ok(other) => bail!("unexpected daemon response: {other:?}"),
         Err(_) => None,
     };
-    let (client, model, sampling, _engine) = if let Some((client, model, sampling)) = daemon {
-        (client, model, sampling, None)
+    let (client, _engine) = if let Some(client) = daemon {
+        (client, None)
     } else {
         let engine = Engine::new(config);
-        let active = engine.active().await;
-        (engine.client().await?, active.name, active.sampling, Some(engine))
+        (engine.client().await?, Some(engine))
     };
     let loaded = t0.elapsed();
-    let req = Rewrite { instruction, max_tokens: None, text: text.clone(), temperature, sampling };
+    let req = Rewrite { instruction, max_tokens: None, text: text.clone(), temperature };
     let t1 = std::time::Instant::now();
     let mut first = None;
     let mut deltas = 0usize;
@@ -100,7 +97,7 @@ pub async fn run(a: RewriteArgs) -> anyhow::Result<()> {
         let gen_secs = total.saturating_sub(first).as_secs_f64().max(1e-3);
         eprintln!(
             "model {} · startup {:.1}s · first token {:.2}s · {} tokens · {:.1} tok/s",
-            model,
+            client.endpoint().model,
             loaded.as_secs_f64(),
             first.as_secs_f64(),
             deltas,

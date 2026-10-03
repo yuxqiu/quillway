@@ -82,7 +82,7 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Response::Error { message } => anyhow::bail!(message),
-        Response::Server { .. } => anyhow::bail!("unexpected daemon response"),
+        Response::Server(_) => anyhow::bail!("unexpected daemon response"),
     }
 }
 
