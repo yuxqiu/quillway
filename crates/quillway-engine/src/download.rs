@@ -202,6 +202,10 @@ pub fn human(bytes: u64) -> String {
     bytesize::ByteSize(bytes).display().si().to_string()
 }
 
+/// How often a progress display redraws: often enough to look alive on a slow
+/// link, rarely enough not to flood a terminal or the UI.
+pub const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
+
 /// Download speed and time left from indicatif's estimator (on a hidden bar),
 /// so the CLI line and the popup card show the same numbers.
 #[derive(Debug, Clone, Default)]

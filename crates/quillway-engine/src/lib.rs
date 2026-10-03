@@ -10,7 +10,7 @@ mod server;
 
 use std::sync::Arc;
 
-use anyhow::{Context, bail};
+use anyhow::Context;
 use quillway_core::config::Config;
 use quillway_core::ipc::Endpoint;
 use tokio::sync::Mutex;
@@ -73,12 +73,7 @@ impl Engine {
                 sampling: active.sampling,
             }));
         }
-        if !active.path.is_file() {
-            if active.entry.is_none() {
-                bail!("model file not found: {}", active.path.display());
-            }
-            bail!("model {} is not installed (run `quillway models install {}`)", active.name, active.id);
-        }
+        active.ensure_installed()?;
         // The lock is held across startup on purpose: concurrent callers wait
         // for this server instead of starting their own.
         if let Some(s) = inner.server.as_mut()

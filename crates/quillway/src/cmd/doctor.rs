@@ -57,15 +57,8 @@ pub async fn run() -> anyhow::Result<()> {
             }
             Err(e) => check(false, "llama-server", format!("{bin}: {e}")),
         }
-        match models::active(&config) {
-            Ok(active) if active.path.is_file() => {
-                check(true, "model", format!("{} ({})", active.name, active.path.display()));
-            }
-            Ok(active) => check(
-                false,
-                "model",
-                format!("{} (not installed: run `quillway models install {}`)", active.name, active.id),
-            ),
+        match models::active(&config).and_then(|a| a.ensure_installed().map(|()| a)) {
+            Ok(active) => check(true, "model", format!("{} ({})", active.name, active.path.display())),
             Err(e) => check(false, "model", format!("{e:#}")),
         }
     }

@@ -1,6 +1,7 @@
 //! `quillway models …`
 
 use std::io::{IsTerminal, Write};
+use std::time::Instant;
 
 use anyhow::{Context, bail};
 use clap::Subcommand;
@@ -8,16 +9,16 @@ use quillway_core::catalog::{self, Entry};
 use quillway_core::config::Config;
 use quillway_core::ipc::{Request, Response};
 use quillway_core::paths;
-use quillway_engine::download::{self, Job, Rate, human};
+use quillway_engine::download::{PROGRESS_INTERVAL, Rate, human};
 use quillway_engine::models::{self, State, is_installed};
 
 #[derive(Subcommand)]
 pub enum ModelsCmd {
     /// List catalog models (★ = active, ✓ = installed).
     List,
-    /// Download a model (default: the catalog default), resumable and sha256-verified.
+    /// Download a model, resumable and sha256-verified (`quillway models list` shows the ids).
     Install {
-        id: Option<String>,
+        id: String,
         /// Accept a non-OSI license notice without prompting.
         #[arg(long)]
         yes: bool,
@@ -55,16 +56,17 @@ pub async fn run(cmd: ModelsCmd) -> anyhow::Result<()> {
             Ok(())
         }
         ModelsCmd::Install { id, yes } => {
-            let e = match id.as_deref() {
-                Some(id) => catalog::get(id)?,
-                None => catalog::default_entry(),
-            };
-            if e.license_notice && !yes {
-                confirm_license(e)?;
+            let e = catalog::get(&id)?;
+            if is_installed(e) {
+                println!("{} is already installed ({})", e.name, models::path(e).display());
+                return Ok(());
+            }
+            if let Some(warning) = e.license_warning().filter(|_| !yes) {
+                confirm_license(&warning)?;
             }
             install(e).await?;
-            println!("installed {} → {}", e.name, e.path_in(&paths::models_dir()).display());
-            if models::active(&config).is_ok_and(|a| a.id == e.id) {
+            println!("installed {} → {}", e.name, models::path(e).display());
+            if is_active(&config, e) {
                 // A daemon started before the download shows "not installed" until told.
                 reload_daemon().await;
             } else {
@@ -89,7 +91,9 @@ pub async fn run(cmd: ModelsCmd) -> anyhow::Result<()> {
             };
             State { active: Some(id.clone()) }.save()?;
             if config.model.active.is_some() {
-                eprintln!("note: `model.active` in the config overrides this choice");
+                // The daemon would reload into the same model.
+                eprintln!("note: saved, but `model.active` in the config overrides it until that line is removed");
+                return Ok(());
             }
             println!("active model: {id}");
             reload_daemon().await;
@@ -97,10 +101,9 @@ pub async fn run(cmd: ModelsCmd) -> anyhow::Result<()> {
         }
         ModelsCmd::Remove { id } => {
             let e = catalog::get(&id)?;
-            let path = e.path_in(&paths::models_dir());
-            if download::remove(&path)? {
-                println!("removed {}", path.display());
-                if models::active(&config).is_ok_and(|a| a.id == e.id) {
+            if models::remove(e)? {
+                println!("removed {}", models::path(e).display());
+                if is_active(&config, e) {
                     reload_daemon().await;
                 }
             } else {
@@ -111,11 +114,13 @@ pub async fn run(cmd: ModelsCmd) -> anyhow::Result<()> {
     }
 }
 
-fn confirm_license(e: &Entry) -> anyhow::Result<()> {
-    eprintln!("{} is distributed under the {}, which is not an OSI-approved license.", e.name, e.license);
-    if let Some(url) = &e.license_url {
-        eprintln!("Read it at {url}");
-    }
+/// Whether requests use `e`, so the daemon must pick up its install or removal.
+fn is_active(config: &Config, e: &Entry) -> bool {
+    models::active(config).is_ok_and(|a| a.id == e.id)
+}
+
+fn confirm_license(warning: &str) -> anyhow::Result<()> {
+    eprintln!("{warning}");
     if !std::io::stdin().is_terminal() {
         bail!("re-run with --yes to accept the license non-interactively");
     }
@@ -130,16 +135,20 @@ fn confirm_license(e: &Entry) -> anyhow::Result<()> {
 }
 
 async fn install(e: &Entry) -> anyhow::Result<()> {
-    let dest = e.path_in(&paths::models_dir());
-    let url = e.url();
     let tty = std::io::stderr().is_terminal();
-    let mut last_pct = u64::MAX;
+    let (mut last_pct, mut drawn_at) = (u64::MAX, None::<Instant>);
     let mut rate = Rate::default();
-    let result = download::download(Job { url: &url, dest: &dest, size: e.size, sha256: &e.sha256 }, |p| {
+    let result = models::install(e, |p| {
         rate.update(p.done, p.total);
         let pct = p.done * 100 / p.total.max(1);
-        if pct != last_pct && (tty || pct % 10 == 0) {
-            last_pct = pct;
+        // A terminal redraws on a timer, so a slow download still moves; logs get a line per 10%.
+        let due = if tty {
+            p.done == p.total || drawn_at.is_none_or(|t| t.elapsed() >= PROGRESS_INTERVAL)
+        } else {
+            pct != last_pct && pct % 10 == 0
+        };
+        if due {
+            (last_pct, drawn_at) = (pct, Some(Instant::now()));
             let speed = rate.describe().map_or_else(String::new, |r| format!("  {r}"));
             // On a terminal, redraw in place and clear what a longer previous line left.
             let end = if tty { "\x1b[K\r" } else { "\n" };

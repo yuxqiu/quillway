@@ -31,7 +31,7 @@ services.quillway = {
 This installs `quillway` and starts `quillway daemon` as a systemd user service (`quillway.service`) with your graphical session. Then download a model:
 
 ```sh
-quillway models install          # the default model, Qwen3.5 4B (2.7 GB)
+quillway models install qwen3.5-4b   # the default model, Qwen3.5 4B (2.7 GB)
 ```
 
 Or open the popup and press ↵ on the install card.
@@ -71,7 +71,7 @@ bindsym Mod4+space exec quillway toggle
 | | Ctrl+1–9 | Run another preset on the current draft |
 | | Tab | Move between the instruction and the result, to edit the result yourself |
 | | Ctrl+D | Toggle the word diff against the original (off while editing); the choice holds for later drafts |
-| | Ctrl+R | Retry (a variant at a higher temperature) |
+| | Ctrl+R | Retry (the same request again) |
 | | Ctrl+Z | Undo the last draft |
 | Anywhere | Esc | Close |
 
@@ -80,7 +80,7 @@ The Ctrl shortcuts above work from the instruction box only; in a text box, Ctrl
 **Where the text comes from:**
 - If you copied something in the last minute (`behavior.recent_secs`), the popup starts with it, and you can still edit it.
 - Otherwise the text box opens empty, ready for you to type or paste.
-- Quillway notices when you copy without reading the clipboard; it reads the text only when you open the popup.
+- Quillway notices when you copy without reading the clipboard; it reads the text only when you open the popup, or once when you run `quillway doctor` to check that the clipboard is readable.
 - An app can also send the text directly, without the clipboard:
 
 ```sh

@@ -22,7 +22,7 @@ use quillway_core::catalog::Entry;
 use quillway_core::config::{Config, DEFAULT_TEMPERATURE, Preset};
 use quillway_core::ipc::{Input, Request, Response};
 use quillway_core::{clean, paths};
-use quillway_engine::download::{self, Job};
+use quillway_engine::download;
 use quillway_engine::{Active, Chunk, Engine, Rewrite, Timing, models};
 
 use crate::ipc::{self, Reply};
@@ -243,6 +243,12 @@ pub struct Install {
     pub error: Option<String>,
 }
 
+impl Install {
+    fn new(entry: &'static Entry) -> Self {
+        Self { entry, done: 0, rate: download::Rate::default(), error: None }
+    }
+}
+
 pub struct App {
     config: Config,
     pub presets: Vec<Preset>,
@@ -293,11 +299,8 @@ pub enum InstallEvent {
 #[derive(Debug, Clone)]
 pub enum Message {
     Ipc(Request, Reply),
-    Captured {
-        id: u64,
-        text: Option<String>,
-        error: Option<String>,
-    },
+    /// A clipboard read: its text (`None` if empty), or why it failed.
+    Captured(u64, Result<Option<String>, String>),
     Input(String),
     Edit(text_editor::Action),
     Submit,
@@ -343,7 +346,7 @@ impl App {
 
     /// Our own llama-server would have no model file to load.
     fn model_missing(&self) -> bool {
-        self.config.model.endpoint.is_none() && !self.active.path.is_file()
+        self.config.model.endpoint.is_none() && !self.active.is_installed()
     }
 
     fn warm_up(&mut self) -> Task<Message> {
@@ -382,7 +385,7 @@ impl App {
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Ipc(req, reply) => self.ipc(req, &reply),
-            Message::Captured { id, text, error } => self.captured(id, text, error),
+            Message::Captured(id, result) => self.captured(id, result),
             Message::Input(s) => self.on_input(s),
             Message::Edit(action) => {
                 if let Some(p) = self.popup.as_mut() {
@@ -509,7 +512,7 @@ impl App {
                         let id = self.next_capture;
                         self.next_capture += 1;
                         self.capturing = Some(id);
-                        Task::perform(read_clipboard(), move |(text, error)| Message::Captured { id, text, error })
+                        Task::perform(read_clipboard(), move |result| Message::Captured(id, result))
                     }
                     Input::Clipboard => self.open(String::new(), Origin::Typed, None),
                 }
@@ -576,21 +579,22 @@ impl App {
         self.watch.as_ref().is_none_or(|w| w.last_change().is_some_and(|t| t.elapsed() < window))
     }
 
-    fn captured(&mut self, id: u64, text: Option<String>, error: Option<String>) -> Task<Message> {
+    fn captured(&mut self, id: u64, result: Result<Option<String>, String>) -> Task<Message> {
         if self.capturing != Some(id) || self.popup.is_some() {
             return Task::none(); // cancelled by a second toggle
         }
         self.capturing = None;
-        match text {
-            Some(t) => self.open(t, Origin::Clipboard, error),
-            _ => self.open(String::new(), Origin::Typed, error),
+        match result {
+            Ok(Some(text)) => self.open(text, Origin::Clipboard, None),
+            Ok(None) => self.open(String::new(), Origin::Typed, None),
+            Err(e) => self.open(String::new(), Origin::Typed, Some(e)),
         }
     }
 
     fn open(&mut self, text: String, origin: Origin, error: Option<String>) -> Task<Message> {
         // The model may have been installed since we last looked (copied in, or by a CLI
         // that couldn't reach us); start it instead of offering the install card.
-        let warm = if self.engine_state == EngineState::Missing && self.active.path.is_file() {
+        let warm = if self.engine_state == EngineState::Missing && self.active.is_installed() {
             self.warm_up()
         } else {
             Task::none()
@@ -719,12 +723,8 @@ impl App {
         let id = self.next_gen;
         self.next_gen += 1;
         let Some(p) = self.popup.as_mut() else { return Task::none() };
-        // A retry samples hotter for a different result. The draft keeps the
-        // original request, so retrying again doesn't compound the increase.
-        let temperature = if retry { (request.temperature + 0.3).min(1.2) } else { request.temperature };
-        let sent = Rewrite { temperature, ..request.clone() };
         let (task, handle) =
-            Task::run(stream_rewrite(self.engine.clone(), sent), move |ev| Message::Gen(id, ev)).abortable();
+            Task::run(stream_rewrite(self.engine.clone(), request.clone()), move |ev| Message::Gen(id, ev)).abortable();
         p.error = None;
         // The new draft is reviewed from the instruction box, even if this started while editing.
         p.field = Field::Instruction;
@@ -853,21 +853,9 @@ impl App {
         if self.install.as_ref().is_some_and(|i| i.error.is_none()) {
             return Task::none();
         }
+        // A license notice is shown on the install card, so ↵ there is an informed yes (DECISIONS #9).
         let Some(entry) = self.active.entry else { return Task::none() };
-        if entry.license_notice {
-            // Non-OSI licenses need an explicit, informed yes: use the CLI.
-            self.install = Some(Install {
-                entry,
-                done: 0,
-                rate: download::Rate::default(),
-                error: Some(format!(
-                    "{} needs license confirmation: run `quillway models install {}`",
-                    entry.name, entry.id
-                )),
-            });
-            return Task::none();
-        }
-        self.install = Some(Install { entry, done: 0, rate: download::Rate::default(), error: None });
+        self.install = Some(Install::new(entry));
         Task::run(install_stream(entry), Message::Install)
     }
 
@@ -897,10 +885,9 @@ impl App {
 
     /// Name shown in the footer and `status`.
     pub fn model_label(&self) -> String {
-        match &self.config.model.endpoint {
-            Some(_) => self.config.model.endpoint_model.clone().unwrap_or_else(|| "endpoint".into()),
-            None => self.active.name.clone(),
-        }
+        // The config requires `endpoint_model` with `endpoint`.
+        let endpoint_model = self.config.model.endpoint.as_ref().and(self.config.model.endpoint_model.as_ref());
+        endpoint_model.unwrap_or(&self.active.name).clone()
     }
 
     pub fn fade(&self) -> f32 {
@@ -986,16 +973,13 @@ fn focus(field: Field) -> Task<Message> {
     })
 }
 
-/// Returns (text, error).
-async fn read_clipboard() -> (Option<String>, Option<String>) {
+/// The clipboard text (`None` if empty), or why it couldn't be read.
+async fn read_clipboard() -> Result<Option<String>, String> {
     // The app that owns the clipboard sends the data; a hung one must not block the popup.
     match tokio::time::timeout(CLIPBOARD_TIMEOUT, tokio::task::spawn_blocking(quillway_wl::read)).await {
-        Ok(Ok(Ok(text))) => (text, None),
-        Ok(Ok(Err(e))) => (None, Some(format!("{e:#}"))),
-        Ok(Err(e)) => (None, Some(e.to_string())),
-        Err(_) => {
-            (None, Some("The app that owns the clipboard didn't respond; type or paste the text instead.".into()))
-        }
+        Ok(Ok(read)) => read.map_err(|e| format!("{e:#}")),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err("The app that owns the clipboard didn't respond; type or paste the text instead.".into()),
     }
 }
 
@@ -1010,14 +994,13 @@ fn stream_rewrite(engine: Engine, req: Rewrite) -> impl Stream<Item = GenEvent> 
 
 fn install_stream(entry: &'static Entry) -> impl Stream<Item = InstallEvent> {
     iced::stream::channel(32, async move |mut out: iced::futures::channel::mpsc::Sender<InstallEvent>| {
-        let dest = entry.path_in(&paths::models_dir());
-        let url = entry.url();
         let mut progress = out.clone();
-        let mut last = 0u64;
-        let r = download::download(Job { url: &url, dest: &dest, size: entry.size, sha256: &entry.sha256 }, |p| {
+        let (mut last, mut sent_at) = (0u64, None::<Instant>);
+        let r = models::install(entry, |p| {
             // `done` drops back to 0 when the server ignores the resume range.
-            if p.done < last || p.done - last >= 8 << 20 || p.done == p.total {
-                last = p.done;
+            let due = sent_at.is_none_or(|t| t.elapsed() >= download::PROGRESS_INTERVAL);
+            if due || p.done < last || p.done == p.total {
+                (last, sent_at) = (p.done, Some(Instant::now()));
                 let _ = progress.try_send(InstallEvent::Progress(p.done));
             }
         })
@@ -1290,7 +1273,7 @@ mod tests {
         let _ = app.update(Message::Ipc(Request::Show { input: Input::Clipboard }, reply()));
         let _ = app.update(Message::Ipc(Request::Show { input: Input::Text("from editor".into()) }, reply()));
         assert_eq!(app.popup.as_ref().unwrap().source.text(), "from editor");
-        let _ = app.update(Message::Captured { id: 0, text: Some("old clipboard".into()), error: None });
+        let _ = app.update(Message::Captured(0, Ok(Some("old clipboard".into()))));
         assert_eq!(app.popup.as_ref().unwrap().source.text(), "from editor");
     }
 
@@ -1322,17 +1305,31 @@ mod tests {
     }
 
     #[test]
-    fn retries_do_not_compound_the_temperature() {
+    fn a_retry_sends_the_same_request_at_the_same_temperature() {
         let mut app = reviewing_app(); // Proofread, temperature 0.2
         for id in 1..=3 {
             let _ = app.on_shortcut(Shortcut::Retry);
+            let sent = &app.popup.as_ref().unwrap().generation.as_ref().unwrap().request;
+            assert!((sent.temperature - 0.2).abs() < f32::EPSILON, "retry {id}: {}", sent.temperature);
             let _ = app.update(Message::Gen(id, text("They're here.")));
             let _ = app.update(Message::Gen(id, GenEvent::Done));
         }
-        let p = app.popup.as_ref().unwrap();
-        assert_eq!(p.drafts.len(), 1);
-        let base = p.drafts[0].request.as_ref().unwrap().temperature;
-        assert!((base - 0.2).abs() < f32::EPSILON, "{base}");
+        assert_eq!(app.popup.as_ref().unwrap().drafts.len(), 1, "each retry replaces the draft");
+    }
+
+    #[test]
+    fn a_license_model_installs_from_the_popup() {
+        let mut config = Config::default();
+        config.model.active = Some("lfm2.5-1.2b".into());
+        let mut app = boot(config);
+        if app.engine_state != EngineState::Missing {
+            return; // installed on this machine; the card isn't shown
+        }
+        let _ = app.update(Message::Ipc(Request::Show { input: Input::Text("hi".into()) }, reply()));
+        assert!(app.needs_install());
+        let _ = app.update(Message::Submit); // ↵ on the card that shows the license notice
+        let install = app.install.as_ref().expect("install started");
+        assert_eq!((install.entry.id.as_str(), install.error.as_deref()), ("lfm2.5-1.2b", None));
     }
 
     #[test]
@@ -1365,7 +1362,7 @@ mod tests {
         let mut app = boot(Config::default());
         let _ = app.update(Message::Ipc(Request::Show { input: Input::Clipboard }, reply()));
         let _ = app.update(Message::Ipc(Request::Hide, reply()));
-        let _ = app.update(Message::Captured { id: 0, text: Some("old clipboard".into()), error: None });
+        let _ = app.update(Message::Captured(0, Ok(Some("old clipboard".into()))));
         assert!(app.popup.is_none());
     }
 
@@ -1375,9 +1372,9 @@ mod tests {
         let _ = app.update(Message::Ipc(Request::Show { input: Input::Clipboard }, reply()));
         let _ = app.update(Message::Ipc(Request::Toggle { input: Input::Clipboard }, reply()));
         let _ = app.update(Message::Ipc(Request::Show { input: Input::Clipboard }, reply()));
-        let _ = app.update(Message::Captured { id: 0, text: Some("old clipboard".into()), error: None });
+        let _ = app.update(Message::Captured(0, Ok(Some("old clipboard".into()))));
         assert!(app.popup.is_none());
-        let _ = app.update(Message::Captured { id: 1, text: Some("new clipboard".into()), error: None });
+        let _ = app.update(Message::Captured(1, Ok(Some("new clipboard".into()))));
         assert_eq!(app.popup.as_ref().unwrap().source.text(), "new clipboard");
     }
 }

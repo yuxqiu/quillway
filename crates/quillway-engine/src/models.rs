@@ -6,6 +6,8 @@ use anyhow::Context;
 use quillway_core::catalog::{self, Sampling};
 use quillway_core::config::Config;
 use quillway_core::paths;
+
+use crate::download;
 use serde::{Deserialize, Serialize};
 
 /// The model requests will use.
@@ -89,10 +91,56 @@ fn resolve(id: Option<&str>, models_dir: &Path) -> anyhow::Result<Active> {
     })
 }
 
+impl Active {
+    /// Whether the model file is on disk.
+    #[must_use]
+    pub fn is_installed(&self) -> bool {
+        self.path.is_file()
+    }
+
+    /// An error saying how to get the model, if it isn't on disk.
+    ///
+    /// # Errors
+    ///
+    /// The model file doesn't exist.
+    pub fn ensure_installed(&self) -> anyhow::Result<()> {
+        match self.entry {
+            _ if self.is_installed() => Ok(()),
+            Some(e) => anyhow::bail!("model {} is not installed (run `quillway models install {}`)", e.name, e.id),
+            None => anyhow::bail!("model file not found: {}", self.path.display()),
+        }
+    }
+}
+
+/// Where a catalog model lives on disk.
+#[must_use]
+pub fn path(e: &catalog::Entry) -> PathBuf {
+    e.path_in(&paths::models_dir())
+}
+
 /// Whether the entry's file is downloaded.
 #[must_use]
 pub fn is_installed(e: &catalog::Entry) -> bool {
-    e.path_in(&paths::models_dir()).is_file()
+    path(e).is_file()
+}
+
+/// Download and verify `e` into the models directory, resuming a partial download.
+///
+/// # Errors
+///
+/// As [`download::download`].
+pub async fn install(e: &catalog::Entry, on_progress: impl FnMut(download::Progress)) -> anyhow::Result<()> {
+    let job = download::Job { url: &e.url(), dest: &path(e), size: e.size, sha256: &e.sha256 };
+    download::download(job, on_progress).await
+}
+
+/// Delete `e`'s files; `Ok(false)` if it wasn't installed.
+///
+/// # Errors
+///
+/// As [`download::remove`].
+pub fn remove(e: &catalog::Entry) -> anyhow::Result<bool> {
+    download::remove(&path(e))
 }
 
 #[cfg(test)]
@@ -107,6 +155,15 @@ mod tests {
         let c = resolve(Some("custom:/x/My-Model.gguf"), dir).unwrap();
         assert_eq!((c.name.as_str(), c.entry.is_none()), ("My-Model", true));
         assert_eq!(c.path, PathBuf::from("/x/My-Model.gguf"));
+    }
+
+    #[test]
+    fn a_missing_model_says_how_to_get_it() {
+        let dir = Path::new("/nonexistent");
+        let catalog = resolve(Some("gemma-4-e4b"), dir).unwrap().ensure_installed().unwrap_err();
+        assert!(catalog.to_string().contains("run `quillway models install gemma-4-e4b`"), "{catalog}");
+        let custom = resolve(Some("custom:/nonexistent/x.gguf"), dir).unwrap().ensure_installed().unwrap_err();
+        assert!(custom.to_string().contains("model file not found: /nonexistent/x.gguf"), "{custom}");
     }
 
     #[test]

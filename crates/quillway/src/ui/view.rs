@@ -118,13 +118,21 @@ impl App {
             .size(14)
             .color(pal.dim)
             .into(),
-            None => mouse_area(
-                text(format!("↵  Install {} ({}, {})", entry.name, human(entry.size), entry.license))
-                    .size(15)
-                    .color(pal.text),
-            )
-            .on_press(Message::InstallStart)
-            .into(),
+            // A non-OSI license is shown before ↵, which then accepts it (DECISIONS #9).
+            None => {
+                let size = human(entry.size);
+                let notice = entry.license_warning();
+                let action = if notice.is_some() {
+                    format!("↵  Accept the license and install {} ({size})", entry.name)
+                } else {
+                    format!("↵  Install {} ({size}, {})", entry.name, entry.license)
+                };
+                let mut card = column![].spacing(6);
+                if let Some(w) = notice {
+                    card = card.push(text(w).size(13).color(pal.dim));
+                }
+                card.push(mouse_area(text(action).size(15).color(pal.text)).on_press(Message::InstallStart)).into()
+            }
         };
         container(column![line].spacing(6)).padding([14, PAD_X]).width(Length::Fill).into()
     }

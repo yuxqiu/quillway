@@ -102,6 +102,18 @@ impl Entry {
         format!("https://huggingface.co/{}/resolve/{}/{}", self.repo, self.revision, self.file)
     }
 
+    /// For a non-OSI license, the notice to show before asking to install.
+    #[must_use]
+    pub fn license_warning(&self) -> Option<String> {
+        self.license_notice.then(|| {
+            let url = self.license_url.as_deref().map_or_else(String::new, |u| format!(" Read it at {u}"));
+            format!(
+                "{} is distributed under the {}, which is not an OSI-approved license.{url}",
+                self.name, self.license
+            )
+        })
+    }
+
     /// `<models_dir>/<owner>__<repo>/<revision>/<file>`
     #[must_use]
     pub fn path_in(&self, models_dir: &Path) -> PathBuf {
@@ -131,8 +143,9 @@ mod tests {
 
     #[test]
     fn lfm_requires_license_notice() {
-        assert!(find("lfm2.5-1.2b").unwrap().license_notice);
-        assert!(!find("qwen3.5-4b").unwrap().license_notice);
+        let warning = find("lfm2.5-1.2b").unwrap().license_warning().unwrap();
+        assert!(warning.contains("LFM Open License") && warning.contains("Read it at https://"), "{warning}");
+        assert_eq!(find("qwen3.5-4b").unwrap().license_warning(), None);
     }
 
     #[test]
