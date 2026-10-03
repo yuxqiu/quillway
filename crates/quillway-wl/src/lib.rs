@@ -5,7 +5,7 @@ mod watch;
 
 use std::io::Read;
 
-use anyhow::{Context, bail};
+use anyhow::Context;
 pub use watch::ClipboardWatch;
 use wl_clipboard_rs::copy::{self, Options};
 use wl_clipboard_rs::paste::{self, ClipboardType, Error, MimeType, Seat};
@@ -13,6 +13,18 @@ use wl_clipboard_rs::paste::{self, ClipboardType, Error, MimeType, Seat};
 /// Cap on text taken from the clipboard (and, in the CLI, from `--stdin`);
 /// larger contents aren't rewrite material.
 pub const MAX_BYTES: u64 = 1 << 20;
+
+/// The clipboard holds more text than [`MAX_BYTES`].
+#[derive(Debug)]
+pub struct TooLarge;
+
+impl std::fmt::Display for TooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("clipboard text is larger than the 1 MiB limit")
+    }
+}
+
+impl std::error::Error for TooLarge {}
 
 /// Text on the clipboard; `Ok(None)` when it is empty or non-text.
 ///
@@ -31,7 +43,7 @@ fn read_text(pipe: impl Read) -> anyhow::Result<Option<String>> {
     let mut buf = Vec::new();
     pipe.take(MAX_BYTES + 1).read_to_end(&mut buf).context("reading the clipboard")?;
     if buf.len() as u64 > MAX_BYTES {
-        bail!("clipboard text is larger than the 1 MiB limit");
+        return Err(TooLarge.into());
     }
     let text = String::from_utf8_lossy(&buf).into_owned();
     Ok((!text.trim().is_empty()).then_some(text))

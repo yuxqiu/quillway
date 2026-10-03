@@ -4,7 +4,7 @@ mod cmd;
 mod ipc;
 mod ui;
 
-use std::io::Read;
+use std::io::{Read, Write};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
@@ -65,6 +65,20 @@ impl SourceArg {
 }
 
 fn main() -> anyhow::Result<()> {
+    match run() {
+        // Output piped into something that stopped reading (`quillway models list | head -1`).
+        Err(e)
+            if e.chain().any(|c| {
+                c.downcast_ref::<std::io::Error>().is_some_and(|io| io.kind() == std::io::ErrorKind::BrokenPipe)
+            }) =>
+        {
+            Ok(())
+        }
+        result => result,
+    }
+}
+
+fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let request = match cli.command {
         Command::Daemon => return ui::run(),
@@ -81,7 +95,8 @@ fn main() -> anyhow::Result<()> {
     match runtime()?.block_on(ipc::send(&request))? {
         Response::Ok => Ok(()),
         Response::Status { visible, model, engine } => {
-            println!("popup:  {}\nmodel:  {model}\nengine: {engine}", if visible { "visible" } else { "hidden" });
+            let popup = if visible { "visible" } else { "hidden" };
+            writeln!(std::io::stdout(), "popup:  {popup}\nmodel:  {model}\nengine: {engine}")?;
             Ok(())
         }
         Response::Error { message } => anyhow::bail!(message),

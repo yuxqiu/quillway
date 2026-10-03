@@ -2,8 +2,8 @@
 //!
 //!     cargo run --release -p quillway-engine --example eval -- qwen3.5-4b gemma-4-e4b > eval.md
 //!
-//! Per model: how often raw output needed cleanup (preamble, think tags,
-//! quotes, fences), latency after warm-up, and every output for eyeballing.
+//! Per model: how often raw output differed from what's shown (a think block,
+//! trailing whitespace), latency after warm-up, and every output for eyeballing.
 
 use std::fmt::Write;
 
@@ -40,8 +40,9 @@ async fn main() -> anyhow::Result<()> {
         let mut config = Config::default();
         config.model.active = Some(id.clone());
         let active = models::active(&config)?;
-        let engine = Engine::new(config.model, active.clone());
-        engine.warm_up().await?;
+        let (engine, supervisor) = Engine::new(config.model, active.clone());
+        tokio::spawn(supervisor.run());
+        // Waits for the start and warm-up.
         let client = engine.client().await?;
 
         let (mut cleaned, mut think, mut firsts, mut rates) = (0, 0, Vec::new(), Vec::new());
@@ -56,7 +57,7 @@ async fn main() -> anyhow::Result<()> {
                 let (raw, timing) = client.complete(&r).await?;
                 firsts.push(timing.first_token().unwrap_or_default().as_secs_f64());
                 rates.push(timing.rate());
-                let out = clean::clean(&raw, text, true);
+                let out = clean::clean(&raw, text);
                 let needed = out.trim() != raw.trim();
                 cleaned += usize::from(needed);
                 think += usize::from(raw.contains("<think>"));

@@ -32,17 +32,15 @@ pub enum ModelsCmd {
 pub async fn run(cmd: ModelsCmd) -> anyhow::Result<()> {
     let config = Config::load_user()?;
     match cmd {
-        ModelsCmd::List => {
-            list(&config);
-            Ok(())
-        }
+        ModelsCmd::List => Ok(list(&config)?),
         ModelsCmd::Install { id, yes } => install(&config, catalog::get(&id)?, yes).await,
         ModelsCmd::Use { id } => use_model(&config, &id).await,
         ModelsCmd::Remove { id } => remove(&config, catalog::get(&id)?).await,
     }
 }
 
-fn list(config: &Config) {
+fn list(config: &Config) -> std::io::Result<()> {
+    let mut out = std::io::stdout().lock();
     // Still list the catalog when the choice is broken: it's where a new one comes from.
     let active = models::active(config).inspect_err(|e| eprintln!("warning: {e:#}")).ok();
     // With `model.endpoint`, requests go there, not to any model listed here.
@@ -50,17 +48,18 @@ fn list(config: &Config) {
     for e in catalog::all() {
         let star = if local.is_some_and(|a| a.id == e.id) { "★" } else { " " };
         let tick = if is_installed(e) { "✓" } else { " " };
-        println!("{star} {tick} {:<14} {:<13} {:>8}  {:<8}  {}", e.id, e.name, human(e.size), e.tier, e.license);
+        writeln!(out, "{star} {tick} {:<14} {:<13} {:>8}  {:<8}  {}", e.id, e.name, human(e.size), e.tier, e.license)?;
     }
     if let Some(custom) = local.filter(|a| a.entry.is_none()) {
-        println!("★ {} {}", if custom.is_installed() { "✓" } else { " " }, custom.id);
+        writeln!(out, "★ {} {}", if custom.is_installed() { "✓" } else { " " }, custom.id)?;
     }
     if let (Some(url), Some(model)) = (&config.model.endpoint, &config.model.endpoint_model) {
-        println!("★   {model} at {url} (`model.endpoint`)");
+        writeln!(out, "★   {model} at {url} (`model.endpoint`)")?;
     }
     if config.model.active.is_some() {
-        println!("\n(active model is pinned by `model.active` in {})", paths::config_file().display());
+        writeln!(out, "\n(active model is pinned by `model.active` in {})", paths::config_file().display())?;
     }
+    Ok(())
 }
 
 async fn install(config: &Config, e: &Entry, yes: bool) -> anyhow::Result<()> {
@@ -98,9 +97,13 @@ async fn use_model(config: &Config, id: &str) -> anyhow::Result<()> {
         id.to_owned()
     };
     State { active: Some(id.clone()) }.save()?;
+    // In both cases the daemon would reload into the same setup.
     if config.model.active.is_some() {
-        // The daemon would reload into the same model.
         eprintln!("note: saved, but `model.active` in the config overrides it until that line is removed");
+        return Ok(());
+    }
+    if config.model.endpoint.is_some() {
+        eprintln!("note: saved, but requests go to `model.endpoint` until that line is removed");
         return Ok(());
     }
     println!("active model: {id}");
@@ -173,6 +176,8 @@ async fn reload_daemon() {
     match crate::ipc::send(&Request::Reload).await {
         Ok(Response::Ok) => println!("daemon reloaded"),
         Ok(Response::Error { message }) => eprintln!("daemon reload failed: {message}"),
-        _ => {}
+        Ok(other) => eprintln!("daemon reload: unexpected response {other:?}"),
+        Err(e) if e.downcast_ref::<crate::ipc::DaemonNotRunning>().is_some() => {} // it reads the change on start
+        Err(e) => eprintln!("daemon reload failed: {e:#}"),
     }
 }

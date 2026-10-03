@@ -59,7 +59,10 @@ impl State {
         if let Some(dir) = p.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        std::fs::write(&p, toml::to_string(self)?).with_context(|| format!("writing {}", p.display()))
+        // Write and rename, so a daemon reading it never sees a half-written file.
+        let tmp = p.with_extension("toml.tmp");
+        std::fs::write(&tmp, toml::to_string(self)?).with_context(|| format!("writing {}", tmp.display()))?;
+        std::fs::rename(&tmp, &p).with_context(|| format!("replacing {}", p.display()))
     }
 }
 

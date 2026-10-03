@@ -23,7 +23,7 @@ use quillway_core::clean;
 use quillway_core::config::{Config, DEFAULT_TEMPERATURE};
 use quillway_core::ipc::{Input, Request, Response};
 use quillway_engine::download;
-use quillway_engine::{Active, Chunk, Engine, Rewrite, Timing, models};
+use quillway_engine::{Active, Chunk, Engine, EngineState, Rewrite, Timing, models};
 
 use crate::ipc::{self, Reply};
 
@@ -108,26 +108,6 @@ enum Field {
     Source,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum EngineState {
-    Starting,
-    Ready,
-    Missing,
-    Failed(String),
-}
-
-impl EngineState {
-    /// For `quillway status`.
-    fn describe(&self) -> String {
-        match self {
-            Self::Starting => "starting".to_owned(),
-            Self::Ready => "ready".to_owned(),
-            Self::Missing => "model not installed".to_owned(),
-            Self::Failed(e) => format!("failed: {e}"),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Composing,
@@ -164,8 +144,6 @@ struct Generation {
     /// The instruction box's text, if this was started from it; given back if it fails without a draft.
     typed: Option<String>,
     timing: Timing,
-    /// `raw` cleaned for display, updated as chunks arrive rather than on every frame.
-    shown: Option<String>,
 }
 
 impl Generation {
@@ -222,6 +200,12 @@ impl Popup {
         let Some(last) = self.drafts.last_mut() else { return };
         if last.edited() {
             last.text = text;
+            // Edited back to the text before it: drop the step, so Ctrl+Z isn't a no-op.
+            if let [.., before, edited] = self.drafts.as_slice()
+                && before.text == edited.text
+            {
+                self.drafts.pop();
+            }
             return;
         }
         if last.text == text {
@@ -241,7 +225,7 @@ impl Popup {
     /// End `g` with `error`: keep what arrived as an incomplete draft (unless a
     /// retry failed: its old draft stays), else give back the typed instruction.
     fn fail(&mut self, g: Generation, error: String) {
-        let partial = clean::clean(&g.raw, &g.request.text, false).trim_end().to_owned();
+        let partial = clean::visible(&g.raw).trim_end().to_owned();
         if !partial.is_empty() && !g.retry {
             self.drafts.push(g.into_draft(partial, "stopped early".into(), true));
         } else if let Some(typed) = g.typed {
@@ -285,7 +269,6 @@ struct App {
     now: Instant,
     next_gen: u64,
     /// The latest warm-up; results of earlier ones (superseded by a reload) are ignored.
-    warm_id: u64,
     /// `None` if the compositor can't report clipboard changes.
     watch: Option<quillway_wl::ClipboardWatch>,
     /// The current clipboard read; older results are ignored after cancellation.
@@ -338,16 +321,17 @@ enum Message {
     Focused(window::Id, Option<Field>),
     Resized(window::Id, Size),
     Tick(Instant),
-    Engine(u64, Result<(), String>),
+    /// The engine's state changed (from its supervisor).
+    EngineState(EngineState),
     InstallStart,
-    Install(InstallEvent),
+    Install(&'static Entry, InstallEvent),
     WindowClosed(window::Id),
 }
 
 impl App {
     fn boot(config: Config, active: Active, watch: Option<quillway_wl::ClipboardWatch>) -> (Self, Task<Message>) {
-        let engine = Engine::new(config.model.clone(), active.clone());
-        let mut app = Self {
+        let (engine, supervisor) = Engine::new(config.model.clone(), active.clone());
+        let app = Self {
             active,
             palette: style::Palette::new(&config.ui),
             engine_state: EngineState::Starting,
@@ -357,49 +341,19 @@ impl App {
             install: None,
             now: Instant::now(),
             next_gen: 0,
-            warm_id: 0,
             watch,
             capturing: None,
             next_capture: 0,
             held: None,
         };
-        let warm = app.warm_up(None);
-        (app, warm)
-    }
-
-    /// Our own llama-server would have no model file to load.
-    fn model_missing(&self) -> bool {
-        self.config.model.endpoint.is_none() && !self.active.is_installed()
-    }
-
-    /// Start the model server and warm it up; `reply` (from `quillway reload`)
-    /// gets the outcome, so a model that fails to start is reported.
-    fn warm_up(&mut self, reply: Option<Reply>) -> Task<Message> {
-        if self.model_missing() {
-            self.engine_state = EngineState::Missing;
-            if let Some(reply) = reply {
-                let message = self.active.ensure_installed().err().map_or_else(String::new, |e| format!("{e:#}"));
-                reply.send(Response::Error { message });
-            }
-            return Task::none();
-        }
-        self.engine_state = EngineState::Starting;
-        self.warm_id += 1;
-        let id = self.warm_id;
-        let engine = self.engine.clone();
-        let warm = async move {
-            let result = engine.warm_up().await.map_err(|e| format!("{e:#}"));
-            if let Some(reply) = reply {
-                reply.send(result.clone().map_or_else(|message| Response::Error { message }, |()| Response::Ok));
-            }
-            result
-        };
-        Task::perform(warm, move |result| Message::Engine(id, result))
+        // The supervisor brings the model server up as soon as it runs.
+        (app, Task::future(supervisor.run()).discard())
     }
 
     fn subscription(&self) -> Subscription<Message> {
         let mut subs = vec![
             Subscription::run(ipc_stream).map(|(req, reply)| Message::Ipc(req, reply)),
+            Subscription::run_with(self.engine.clone(), engine_states),
             event::listen_with(shortcut),
             event::listen_with(|event, _, id| {
                 matches!(event, Event::Mouse(iced::mouse::Event::ButtonPressed(_))).then_some(Message::Clicked(id))
@@ -444,13 +398,9 @@ impl App {
                 self.now = now;
                 Task::none()
             }
-            Message::Engine(id, _) if id != self.warm_id => Task::none(), // superseded by a reload
-            Message::Engine(_, result) => {
-                self.on_warmed_up(result);
-                Task::none()
-            }
+            Message::EngineState(state) => self.on_engine_state(state),
             Message::InstallStart => self.start_install(),
-            Message::Install(ev) => self.on_install(ev),
+            Message::Install(entry, ev) => self.on_install(entry, ev),
             Message::WindowClosed(id) => {
                 if self.popup.as_ref().is_some_and(|p| p.id == id) {
                     self.abort_generation();
@@ -510,15 +460,19 @@ impl App {
         }
     }
 
-    fn on_warmed_up(&mut self, result: Result<(), String>) {
-        self.engine_state = match result {
-            Ok(()) => EngineState::Ready,
-            Err(_) if self.model_missing() => EngineState::Missing,
-            Err(e) => {
-                eprintln!("quillway: engine: {e}");
-                EngineState::Failed(e)
+    fn on_engine_state(&mut self, state: EngineState) -> Task<Message> {
+        if let EngineState::Failed(e) = &state {
+            eprintln!("quillway: engine: {e}");
+        }
+        self.engine_state = state;
+        // Switched to a missing model while typing in the text box: the install card has none.
+        match self.popup.as_mut() {
+            Some(p) if self.engine_state == EngineState::Missing && p.phase() == Phase::Composing => {
+                p.field = Field::Instruction;
+                focus(Field::Instruction)
             }
-        };
+            _ => Task::none(),
+        }
     }
 
     fn ipc(&mut self, req: Request, reply: &Reply) -> Task<Message> {
@@ -581,10 +535,14 @@ impl App {
                         g.handle.abort();
                         p.fail(g, "Stopped: the model server is restarting for a reload. Run it again.".into());
                     }
-                    let (engine, active) = (self.engine.clone(), self.active.clone());
-                    let reload = Task::future(async move { engine.reload(config.model, active).await });
-                    // The reply waits for the warm-up, so `quillway reload` reports a model that fails to start.
-                    reload.discard().chain(self.warm_up(Some(reply.clone())))
+                    // Sent now, so reloads apply in the order they arrived; the reply waits
+                    // until the new server is up, so a model that fails to start is reported.
+                    let done = self.engine.reload(config.model, self.active.clone());
+                    let reply = reply.clone();
+                    Task::future(async move {
+                        reply.send(done.await.map_or_else(|message| Response::Error { message }, |()| Response::Ok));
+                    })
+                    .discard()
                 }
                 Err(e) => {
                     reply.send(Response::Error { message: format!("{e:#}") });
@@ -649,11 +607,9 @@ impl App {
     fn open(&mut self, text: &str, origin: Origin, error: Option<String>) -> Task<Message> {
         // The model may have been installed since we last looked (copied in, or by a CLI
         // that couldn't reach us); start it instead of offering the install card.
-        let warm = if self.engine_state == EngineState::Missing && self.active.is_installed() {
-            self.warm_up(None)
-        } else {
-            Task::none()
-        };
+        if self.engine_state == EngineState::Missing && self.active.is_installed() {
+            self.engine.warm_up();
+        }
         // A key held as the last popup closed was released elsewhere.
         self.held = None;
         let id = window::Id::unique();
@@ -662,7 +618,12 @@ impl App {
         self.now = Instant::now();
         self.popup = Some(Popup {
             id,
-            field: if text.trim().is_empty() { Field::Source } else { Field::Instruction },
+            // The install card has no text box; ↵ there goes to the instruction box.
+            field: if text.trim().is_empty() && self.engine_state != EngineState::Missing {
+                Field::Source
+            } else {
+                Field::Instruction
+            },
             source: editor_content(text),
             origin,
             input: String::new(),
@@ -675,7 +636,7 @@ impl App {
             size,
             opened: Instant::now(),
         });
-        let open = Task::done(Message::NewLayerShell {
+        Task::done(Message::NewLayerShell {
             settings: NewLayerShellSettings {
                 size: Some(size),
                 layer: Layer::Overlay,
@@ -688,8 +649,7 @@ impl App {
                 namespace: Some(namespace()),
             },
             id,
-        });
-        Task::batch([warm, open])
+        })
     }
 
     fn hide(&mut self) -> Task<Message> {
@@ -774,7 +734,11 @@ impl App {
         let Some(p) = self.popup.as_mut() else { return Task::none() };
         let text = p.base();
         if text.trim().is_empty() {
-            p.error = Some("Nothing to rewrite: type or paste the text into the box (Tab switches boxes).".into());
+            p.error = Some(if p.drafts.is_empty() {
+                "Nothing to rewrite: type or paste the text into the box (Tab switches boxes).".into()
+            } else {
+                "Nothing to rewrite: the text is empty. Ctrl+Z restores the previous draft.".into()
+            });
             return Task::none();
         }
         // The client counts tokens and rejects text too long for the context.
@@ -808,7 +772,6 @@ impl App {
             request,
             typed: from_input.then(|| std::mem::take(&mut p.input)),
             timing: Timing::start(),
-            shown: None,
         });
         Task::batch([task, focus(Field::Instruction)])
     }
@@ -818,14 +781,9 @@ impl App {
         let Some(g) = p.generation.as_mut().filter(|g| g.id == id) else { return Task::none() };
         match ev {
             GenEvent::Chunk(chunk) => {
-                // Text is flowing, so whatever failed before has recovered.
-                if matches!(self.engine_state, EngineState::Failed(_) | EngineState::Starting) {
-                    self.engine_state = EngineState::Ready;
-                }
                 g.timing.record(&chunk);
                 if let Chunk::Text(t) = chunk {
                     g.raw.push_str(&t);
-                    g.shown = clean::ready(&g.raw, false).then(|| clean::clean(&g.raw, &g.request.text, false));
                 }
             }
             GenEvent::Error(e) => {
@@ -834,23 +792,24 @@ impl App {
             }
             GenEvent::Done => {
                 let g = p.generation.take().expect("matched above");
-                let text = clean::clean(&g.raw, &g.request.text, true);
+                let text = clean::clean(&g.raw, &g.request.text);
                 if text.trim().is_empty() {
                     if let Some(typed) = g.typed {
                         p.input = typed;
                     }
                     p.error = Some("The model returned nothing. Run it again, or try another preset.".into());
-                    return Task::none();
+                } else {
+                    let secs = g.timing.started().elapsed().as_secs_f64();
+                    let rate = g.timing.rate();
+                    if g.retry {
+                        p.drafts.pop();
+                    }
+                    p.drafts.push(g.into_draft(text, format!("{secs:.1}s · {rate:.0} tok/s"), false));
                 }
-                let secs = g.timing.started().elapsed().as_secs_f64();
-                let rate = g.timing.rate();
-                if g.retry {
-                    p.drafts.pop();
-                }
-                p.drafts.push(g.into_draft(text, format!("{secs:.1}s · {rate:.0} tok/s"), false));
             }
         }
-        Task::none()
+        // A click while writing may have taken the keyboard from the disabled box: give it back.
+        if p.generation.is_none() { focus(p.field) } else { Task::none() }
     }
 
     fn on_shortcut(&mut self, s: Shortcut) -> Task<Message> {
@@ -859,7 +818,8 @@ impl App {
         match (s, p.phase()) {
             (Shortcut::Escape, Phase::Generating) => {
                 self.abort_generation();
-                Task::none()
+                // iced's text_input also took the Esc and dropped its focus.
+                focus(Field::Instruction)
             }
             (Shortcut::Escape, _) => self.hide(),
             // The install card has no text box to move to; ↵ must keep working.
@@ -915,17 +875,23 @@ impl App {
     }
 
     fn start_install(&mut self) -> Task<Message> {
-        if self.install.as_ref().is_some_and(|i| i.error.is_none()) {
-            return Task::none();
-        }
         // A license notice is shown on the install card, so ↵ there is an informed yes (DECISIONS #9).
         let Some(entry) = self.active.entry else { return Task::none() };
+        if self.installing(entry).is_some_and(|i| i.error.is_none()) {
+            return Task::none();
+        }
+        // A download of a model a reload switched away from finishes on its own; its events are ignored.
         self.install = Some(Install::new(entry));
-        Task::run(install_stream(entry), Message::Install)
+        Task::run(install_stream(entry), move |ev| Message::Install(entry, ev))
     }
 
-    fn on_install(&mut self, ev: InstallEvent) -> Task<Message> {
-        let Some(i) = self.install.as_mut() else { return Task::none() };
+    /// The install of `entry`, if that's the one the card tracks.
+    fn installing(&self, entry: &Entry) -> Option<&Install> {
+        self.install.as_ref().filter(|i| i.entry.id == entry.id)
+    }
+
+    fn on_install(&mut self, entry: &'static Entry, ev: InstallEvent) -> Task<Message> {
+        let Some(i) = self.install.as_mut().filter(|i| i.entry.id == entry.id) else { return Task::none() };
         match ev {
             InstallEvent::Progress(done) => {
                 i.done = done;
@@ -934,7 +900,8 @@ impl App {
             }
             InstallEvent::Done(Ok(())) => {
                 self.install = None;
-                self.warm_up(None)
+                self.engine.warm_up();
+                Task::none()
             }
             InstallEvent::Done(Err(e)) => {
                 i.error = Some(e);
@@ -970,7 +937,7 @@ impl App {
     }
 
     fn streaming_text(&self) -> Option<&str> {
-        self.popup.as_ref()?.generation.as_ref()?.shown.as_deref()
+        Some(clean::visible(&self.popup.as_ref()?.generation.as_ref()?.raw)).filter(|t| !t.is_empty())
     }
 }
 
@@ -1016,6 +983,17 @@ const fn preset_index(key: Physical) -> Option<usize> {
         Code::Digit8 => 7,
         Code::Digit9 => 8,
         _ => return None,
+    })
+}
+
+/// The engine's state now, then each change.
+fn engine_states(engine: &Engine) -> impl Stream<Item = Message> + use<> {
+    stream::unfold((engine.state(), true), |(mut state, first)| async move {
+        if !first {
+            state.changed().await.ok()?;
+        }
+        let now = state.borrow_and_update().clone();
+        Some((Message::EngineState(now), (state, false)))
     })
 }
 
@@ -1301,31 +1279,6 @@ mod tests {
     }
 
     #[test]
-    fn opening_the_popup_notices_a_model_installed_meanwhile() {
-        let path = std::env::temp_dir().join(format!("quillway-test-{}.gguf", std::process::id()));
-        let _ = std::fs::remove_file(&path);
-        let mut config = Config::default();
-        config.model.active = Some(format!("custom:{}", path.display()));
-        let mut app = boot(config);
-        assert_eq!(app.engine_state, EngineState::Missing);
-        std::fs::write(&path, b"gguf").unwrap();
-        let _ = app.update(Message::Ipc(Request::Show { input: Input::Text("hi".into()) }, reply()));
-        std::fs::remove_file(&path).unwrap();
-        assert_eq!(app.engine_state, EngineState::Starting);
-    }
-
-    #[test]
-    fn superseded_warm_up_result_is_ignored() {
-        let mut app = boot(endpoint_config());
-        let first = app.warm_id;
-        let _ = app.warm_up(None); // a reload
-        let _ = app.update(Message::Engine(first, Err("killed by the reload".into())));
-        assert_eq!(app.engine_state, EngineState::Starting);
-        let _ = app.update(Message::Engine(app.warm_id, Ok(())));
-        assert_eq!(app.engine_state, EngineState::Ready);
-    }
-
-    #[test]
     fn error_keeps_partial_output_as_an_incomplete_draft() {
         let mut app = generating_app();
         let _ = app.update(Message::Gen(0, text("They're here, and")));
@@ -1406,9 +1359,7 @@ mod tests {
         let mut config = Config::default();
         config.model.active = Some("lfm2.5-1.2b".into());
         let mut app = boot(config);
-        if app.engine_state != EngineState::Missing {
-            return; // installed on this machine; the card isn't shown
-        }
+        let _ = app.update(Message::EngineState(EngineState::Missing)); // as the engine reports it
         let _ = app.update(Message::Ipc(Request::Show { input: Input::Text("hi".into()) }, reply()));
         assert!(app.needs_install());
         let _ = app.update(Message::Submit); // ↵ on the card that shows the license notice
@@ -1446,6 +1397,7 @@ mod tests {
         let mut config = Config::default();
         config.model.active = Some(format!("custom:{}", path.display()));
         let mut app = boot(config);
+        let _ = app.update(Message::EngineState(EngineState::Missing));
         let _ = app.update(Message::Ipc(Request::Show { input: Input::Text("hi".into()) }, reply()));
         assert!(app.needs_install());
         let _ = app.on_shortcut(Shortcut::Tab);
@@ -1453,21 +1405,37 @@ mod tests {
     }
 
     #[test]
-    fn a_reload_replies_after_the_warm_up() {
+    fn the_install_card_opened_empty_keeps_the_keyboard_on_the_instruction() {
         let path = std::env::temp_dir().join(format!("quillway-missing-{}.gguf", std::process::id()));
+        let mut config = Config::default();
+        config.model.active = Some(format!("custom:{}", path.display()));
+        let mut app = boot(config);
+        let _ = app.update(Message::EngineState(EngineState::Missing));
+        let _ = app.update(Message::Ipc(Request::Show { input: Input::Text(String::new()) }, reply()));
+        assert!(app.needs_install());
+        assert_eq!(app.popup.as_ref().unwrap().field, Field::Instruction);
+    }
+
+    #[test]
+    fn install_events_for_another_model_are_ignored() {
         let mut app = boot(endpoint_config());
-        let (tx, mut rx) = tokio::sync::oneshot::channel();
-        // A model that can't start is reported to `quillway reload` instead of "ok".
-        app.active = models::active(&{
-            let mut c = Config::default();
-            c.model.active = Some(format!("custom:{}", path.display()));
-            c
-        })
-        .unwrap();
-        app.config.model.endpoint = None;
-        let _ = app.warm_up(Some(Reply::new(tx)));
-        let Ok(Response::Error { message }) = rx.try_recv() else { panic!("expected an error reply") };
-        assert!(message.contains("model file not found"), "{message}");
+        let qwen = quillway_core::catalog::get("qwen3.5-2b").unwrap();
+        let gemma = quillway_core::catalog::get("gemma-4-e4b").unwrap();
+        app.install = Some(Install::new(qwen));
+        let _ = app.update(Message::Install(gemma, InstallEvent::Progress(42)));
+        assert_eq!(app.install.as_ref().unwrap().done, 0);
+        let _ = app.update(Message::Install(qwen, InstallEvent::Progress(42)));
+        assert_eq!(app.install.as_ref().unwrap().done, 42);
+    }
+
+    #[test]
+    fn editing_back_to_the_model_text_drops_the_edited_step() {
+        let mut app = reviewing_app();
+        let _ = app.on_shortcut(Shortcut::Tab);
+        type_char(&mut app, '!');
+        assert_eq!(app.popup.as_ref().unwrap().drafts.len(), 2);
+        let _ = app.update(Message::Edit(text_editor::Action::Edit(text_editor::Edit::Backspace)));
+        assert_eq!(app.popup.as_ref().unwrap().drafts.len(), 1, "back to the model's text");
     }
 
     #[test]

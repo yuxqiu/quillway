@@ -115,6 +115,9 @@ pub async fn download(job: Job<'_>, mut on_progress: impl FnMut(Progress)) -> an
         file.sync_all().await?;
     }
 
+    if have < job.size {
+        bail!("the download ended early at {have} of {} bytes; run the install again to resume", job.size);
+    }
     if have != job.size {
         bail!("size mismatch: got {have} bytes, expected {}", job.size);
     }

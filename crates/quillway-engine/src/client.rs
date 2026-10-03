@@ -5,7 +5,7 @@ use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
-use eventsource_stream::Eventsource;
+use eventsource_stream::{EventStreamError, Eventsource};
 use futures_util::{Stream, StreamExt};
 use quillway_core::ipc::Endpoint;
 use quillway_core::prompt::{self, ChatMessage};
@@ -216,7 +216,11 @@ impl Client {
         let tokens = v["tokens"].as_array().context("tokenize: no tokens")?;
         Ok(tokens
             .iter()
-            .map(|t| Token { id: t["id"].as_u64(), piece: t["piece"].as_str().map(str::to_owned) })
+            // With pieces, each token is `{"id", "piece"}`; servers that ignore `with_pieces` send bare ids.
+            .map(|t| Token {
+                id: t.as_u64().or_else(|| t["id"].as_u64()),
+                piece: t["piece"].as_str().map(str::to_owned),
+            })
             .collect())
     }
 
@@ -277,15 +281,21 @@ impl Client {
             loop {
                 let Some(next) = pending.pop_front() else {
                     // The server stopped sending: without `[DONE]`, the output may be cut short.
-                    let cause = match events.next().await {
+                    let error = match events.next().await {
                         Some(Ok(event)) => {
                             pending.extend(parse_data(&event.data));
                             continue;
                         }
-                        None => "incomplete response: stream ended before [DONE]".to_owned(),
-                        Some(Err(e)) => e.to_string(),
+                        None => {
+                            anyhow::Error::new(Interrupted).context("incomplete response: stream ended before [DONE]")
+                        }
+                        Some(Err(EventStreamError::Transport(e))) => {
+                            anyhow::Error::new(Interrupted).context(e.to_string())
+                        }
+                        // Invalid UTF-8 or SSE framing: the server misbehaved, it didn't stop.
+                        Some(Err(e)) => anyhow::anyhow!("malformed SSE stream: {e}"),
                     };
-                    return Some((Err(anyhow::Error::new(Interrupted).context(cause)), (events, pending, true)));
+                    return Some((Err(error), (events, pending, true)));
                 };
                 return match next {
                     Sse::Chunk(c) => Some((Ok(c), (events, pending, false))),
@@ -406,7 +416,8 @@ fn parse_data(data: &str) -> Vec<Sse> {
         Ok(v) => v,
         Err(e) => return vec![Sse::Error(format!("malformed SSE data: {e}"))],
     };
-    if let Some(e) = v.get("error") {
+    // Some proxies send `"error": null` in normal chunks.
+    if let Some(e) = v.get("error").filter(|e| !e.is_null()) {
         return vec![Sse::Error(e.get("message").and_then(Value::as_str).unwrap_or("server error").to_owned())];
     }
     let mut out = Vec::new();
@@ -618,6 +629,18 @@ mod tests {
         assert_eq!(chat["max_tokens"], 1024);
     }
 
+    #[tokio::test]
+    async fn bare_token_ids_still_catch_a_control_token() {
+        // A server that ignores `with_pieces` and answers with plain ids.
+        let (base, _server) = serve(vec![
+            ("/tokenize", "\"parse_special\":false", json!({ "tokens": [1, 2, 3, 4, 5] }).to_string()),
+            ("/tokenize", "", json!({ "tokens": [1, 9, 5] }).to_string()),
+        ])
+        .await;
+        let error = client(&base, None, true).complete(&request()).await.unwrap_err();
+        assert!(error.to_string().contains("control token"), "{error}");
+    }
+
     #[test]
     fn control_token_needs_a_difference_between_tokenizations() {
         let t = |id, piece: &str| Token { id: Some(id), piece: Some(piece.into()) };
@@ -687,6 +710,7 @@ mod tests {
         assert_eq!(parse_data("[DONE]"), [Sse::Done]);
         assert_eq!(parse_data(r#"{"choices":[{"delta":{"role":"assistant"}}]}"#), []);
         assert_eq!(parse_data(r#"{"error":{"message":"boom"}}"#), [Sse::Error("boom".into())]);
+        assert_eq!(parse_data(r#"{"choices":[{"delta":{"content":"Hi"}}],"error":null}"#), [text("Hi")]);
         // Text that arrives with a truncating ending is delivered before the error.
         let last = parse_data(r#"{"choices":[{"delta":{"content":"end"},"finish_reason":"length"}]}"#);
         assert!(matches!(last.as_slice(), [Sse::Chunk(Chunk::Text(t)), Sse::Error(_)] if t == "end"), "{last:?}");

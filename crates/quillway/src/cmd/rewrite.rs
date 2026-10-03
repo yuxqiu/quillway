@@ -52,14 +52,16 @@ pub async fn run(a: RewriteArgs) -> anyhow::Result<()> {
         })?;
     let rate = timing.rate();
 
-    let out = if a.raw { raw } else { clean::clean(&raw, &text, true) };
+    let out = if a.raw { raw } else { clean::clean(&raw, &text) };
     if out.trim().is_empty() {
         bail!("the model returned nothing after cleanup");
     }
-    std::io::stdout().write_all(out.as_bytes())?;
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(out.as_bytes())?;
     if !out.ends_with('\n') {
-        println!();
+        stdout.write_all(b"\n")?;
     }
+    drop(stdout);
     if a.stats {
         eprintln!(
             "model {} · startup {:.1}s · first token {:.2}s · {} tokens · {rate:.1} tok/s",
@@ -97,8 +99,11 @@ async fn connect(config: Config) -> anyhow::Result<(Client, Option<Engine>)> {
         }
         Ok(Response::Error { message }) => bail!("daemon: {message}"),
         Ok(other) => bail!("unexpected daemon response: {other:?}"),
-        Err(_) => {} // no daemon
+        Err(e) if e.downcast_ref::<crate::ipc::DaemonNotRunning>().is_some() => {}
+        // A daemon is there but didn't answer usably: don't load a second copy of the model beside it.
+        Err(e) => return Err(e.context("asking the daemon for its model server")),
     }
-    let engine = Engine::new(config.model.clone(), models::active(&config)?);
+    let (engine, supervisor) = Engine::new(config.model.clone(), models::active(&config)?);
+    tokio::spawn(supervisor.run()); // stops, with its server, when `engine` is dropped
     Ok((engine.client().await?, Some(engine)))
 }

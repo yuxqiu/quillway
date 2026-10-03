@@ -107,7 +107,7 @@ impl App {
             let msg = format!("Model file not found: {}", self.active.path.display());
             return container(text(msg).size(13).color(pal.error)).padding([14, PAD_X]).width(Length::Fill).into();
         };
-        let line: Element<'_, Message> = match &self.install {
+        let line: Element<'_, Message> = match self.installing(entry) {
             Some(Install { error: Some(e), .. }) => text(e.as_str()).size(13).color(pal.error).into(),
             Some(i) => text(format!(
                 "Downloading {}… {} / {} ({}%){}",

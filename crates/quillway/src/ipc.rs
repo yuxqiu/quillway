@@ -18,14 +18,32 @@ const MAX_REQUEST: u64 = 8 << 20;
 /// A client has this long to send its request; the CLI sends it at once.
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// No daemon listens on the socket (it is missing, or nothing accepts on it).
+#[derive(Debug)]
+pub struct DaemonNotRunning(std::path::PathBuf);
+
+impl std::fmt::Display for DaemonNotRunning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the daemon isn't running ({}).\nStart it with `systemctl --user start quillway` or `quillway daemon`; \
+             if it won't start, see `quillway doctor` or `journalctl --user -u quillway`",
+            self.0.display()
+        )
+    }
+}
+
+impl std::error::Error for DaemonNotRunning {}
+
 pub async fn send(req: &Request) -> anyhow::Result<Response> {
     let path = paths::socket();
-    let stream = UnixStream::connect(&path).await.with_context(|| {
-        format!(
-            "the daemon isn't running ({}).\nStart it with `systemctl --user start quillway` or `quillway daemon`",
-            path.display()
-        )
-    })?;
+    let stream = match UnixStream::connect(&path).await {
+        Ok(stream) => stream,
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused) => {
+            return Err(DaemonNotRunning(path).into());
+        }
+        Err(e) => return Err(e).with_context(|| format!("connecting to the daemon at {}", path.display())),
+    };
     let (r, mut w) = stream.into_split();
     write_line(&mut w, serde_json::to_string(req)?).await?;
     let mut resp = String::new();

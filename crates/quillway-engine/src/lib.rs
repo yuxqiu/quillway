@@ -2,69 +2,272 @@
 //!
 //! [`Engine`] hands out a [`Client`] for either the supervised llama-server
 //! (default) or a user-configured OpenAI-compatible endpoint.
+//!
+//! One task, the [`Supervisor`], owns the configuration and the llama-server
+//! and handles commands one at a time; [`Engine`] handles send it commands and
+//! watch its [`EngineState`]. So reloads apply in the order they're sent, a
+//! reload during a start just drops that start (killing the half-started
+//! process), and everyone waiting on a start gets its outcome.
 
 pub mod client;
 pub mod download;
 pub mod models;
 mod server;
 
-use std::sync::Arc;
+use std::future::Future;
+use std::pin::Pin;
 
-use anyhow::{Context, bail};
 use quillway_core::config::ModelConfig;
 use quillway_core::ipc::Endpoint;
-use tokio::sync::{Mutex, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 
 pub use client::{Chunk, Client, Interrupted, Rewrite, Timing};
 pub use models::Active;
 
-/// Shared handle to the model backend; clones share one server.
+/// Where the model backend is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EngineState {
+    /// llama-server is starting and warming up.
+    Starting,
+    /// Requests are served (our llama-server, or the configured endpoint).
+    Ready,
+    /// The model file isn't on disk.
+    Missing,
+    /// The last start failed.
+    Failed(String),
+}
+
+impl EngineState {
+    /// For `quillway status`.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Starting => "starting".to_owned(),
+            Self::Ready => "ready".to_owned(),
+            Self::Missing => "model not installed".to_owned(),
+            Self::Failed(e) => format!("failed: {e}"),
+        }
+    }
+}
+
+/// A handle to the model backend; clones talk to the same [`Supervisor`].
 #[derive(Clone)]
 pub struct Engine {
-    shared: Arc<Shared>,
+    commands: mpsc::UnboundedSender<Command>,
+    state: watch::Receiver<EngineState>,
 }
 
-struct Shared {
-    /// Held only briefly, so `reload` never waits for a llama-server start.
-    state: Mutex<State>,
-    /// One llama-server start at a time: concurrent requests wait for it rather
-    /// than loading a second copy of the model (DECISIONS #20).
-    starting: Mutex<()>,
-    /// The current [`State::epoch`]; a start in progress gives up when it changes.
-    reloads: watch::Sender<u64>,
+/// There is one engine, as far as an iced subscription keyed on it is concerned.
+impl std::hash::Hash for Engine {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        "quillway-engine".hash(state);
+    }
 }
 
-struct State {
+type Done = oneshot::Sender<Result<(), String>>;
+
+enum Command {
+    /// Switch config: stop the server and bring up the new one.
+    Reload { change: Box<(ModelConfig, Active)>, done: Done },
+    /// Bring the server up if it isn't, e.g. after the model was installed.
+    WarmUp,
+    /// A client for the running server, starting it if needed.
+    Client(oneshot::Sender<Result<Client, String>>),
+}
+
+const CANCELLED: &str = "cancelled: the model server was reloaded";
+const STOPPED: &str = "the engine stopped";
+
+impl Engine {
+    /// An engine for the `[model]` config and its active model, and the
+    /// supervisor to run on the async runtime (`tokio::spawn`, an iced task).
+    /// The supervisor brings the server up as soon as it runs.
+    #[must_use]
+    pub fn new(config: ModelConfig, active: Active) -> (Self, Supervisor) {
+        let (commands, inbox) = mpsc::unbounded_channel();
+        let (state_tx, state) = watch::channel(EngineState::Starting);
+        let supervisor = Supervisor {
+            inbox,
+            state: state_tx,
+            config,
+            active,
+            server: None,
+            starting: None,
+            waiting: Vec::new(),
+            reloads: Vec::new(),
+        };
+        (Self { commands, state }, supervisor)
+    }
+
+    /// Switch to `config` and `active`, in the order of calls. The returned
+    /// future resolves once the new server is up (or failed), or with the
+    /// outcome of a later reload that replaced this one.
+    ///
+    /// # Errors
+    ///
+    /// The future resolves to why the server couldn't come up: the model is
+    /// missing or llama-server failed to start.
+    pub fn reload(&self, config: ModelConfig, active: Active) -> impl Future<Output = Result<(), String>> + use<> {
+        let (done, outcome) = oneshot::channel();
+        let _ = self.commands.send(Command::Reload { change: Box::new((config, active)), done });
+        async { outcome.await.unwrap_or_else(|_| Err(STOPPED.into())) }
+    }
+
+    /// Bring the server up if it isn't running or starting.
+    pub fn warm_up(&self) {
+        let _ = self.commands.send(Command::WarmUp);
+    }
+
+    /// A client ready to accept requests, starting llama-server if needed.
+    ///
+    /// # Errors
+    ///
+    /// The model isn't installed, llama-server fails to start, or a reload
+    /// replaced the server.
+    pub async fn client(&self) -> anyhow::Result<Client> {
+        let (reply, client) = oneshot::channel();
+        self.commands.send(Command::Client(reply)).map_err(|_| anyhow::anyhow!(STOPPED))?;
+        client.await.map_err(|_| anyhow::anyhow!(STOPPED))?.map_err(anyhow::Error::msg)
+    }
+
+    /// The supervisor's state, to watch for changes.
+    #[must_use]
+    pub fn state(&self) -> watch::Receiver<EngineState> {
+        self.state.clone()
+    }
+}
+
+/// Starting llama-server and warming it up, as one future the supervisor can drop.
+type Start = Pin<Box<dyn Future<Output = anyhow::Result<server::Server>> + Send>>;
+
+/// Owns the config and llama-server; see the crate docs.
+pub struct Supervisor {
+    inbox: mpsc::UnboundedReceiver<Command>,
+    state: watch::Sender<EngineState>,
     config: ModelConfig,
-    /// Resolved once per config ([`models::active`]), so every request uses the
-    /// model the caller showed to the user.
     active: Active,
     server: Option<server::Server>,
-    /// Bumped by each reload.
-    epoch: u64,
+    starting: Option<Start>,
+    /// Clients waiting for the start in progress.
+    waiting: Vec<oneshot::Sender<Result<Client, String>>>,
+    /// Reloads waiting for the start in progress.
+    reloads: Vec<Done>,
 }
 
-impl State {
+impl Supervisor {
+    /// Handle commands until every [`Engine`] handle is gone.
+    pub async fn run(mut self) {
+        self.bring_up();
+        loop {
+            let started = async {
+                match self.starting.as_mut() {
+                    Some(start) => start.await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                command = self.inbox.recv() => match command {
+                    Some(command) => self.handle(command),
+                    None => return,
+                },
+                started = started => {
+                    self.starting = None;
+                    match started {
+                        Ok(server) => {
+                            self.server = Some(server);
+                            self.settle(EngineState::Ready, &Ok(()));
+                        }
+                        Err(e) => {
+                            let message = format!("starting llama-server: {e:#}");
+                            eprintln!("quillway: {message}");
+                            self.settle(EngineState::Failed(message.clone()), &Err(message));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn handle(&mut self, command: Command) {
+        match command {
+            Command::Reload { change, done } => {
+                (self.config, self.active) = *change;
+                // Dropping them stops the old server and a start in progress.
+                (self.server, self.starting) = (None, None);
+                for client in self.waiting.drain(..) {
+                    let _ = client.send(Err(CANCELLED.into()));
+                }
+                self.reloads.push(done);
+                self.bring_up();
+            }
+            Command::WarmUp => {
+                if self.ready_client().is_none() && self.starting.is_none() {
+                    self.bring_up();
+                }
+            }
+            Command::Client(reply) => {
+                if let Some(client) = self.ready_client() {
+                    let _ = reply.send(Ok(client));
+                    return;
+                }
+                self.waiting.push(reply);
+                if self.starting.is_none() {
+                    self.bring_up();
+                }
+            }
+        }
+    }
+
     /// A client for the endpoint or the running llama-server, if there is one.
-    fn ready_client(&mut self) -> anyhow::Result<Option<Client>> {
+    fn ready_client(&mut self) -> Option<Client> {
         if let Some(base) = &self.config.endpoint {
-            return Ok(Some(Client::new(Endpoint {
+            return Some(Client::new(Endpoint {
                 base: base.clone(),
                 api_key: self.config.endpoint_api_key.clone(),
                 model: self.config.endpoint_model.clone().unwrap_or_default(),
                 llama: false,
                 context: self.config.context,
                 sampling: self.active.sampling,
-            })));
+            }));
         }
-        self.active.ensure_installed()?;
         if let Some(s) = self.server.as_mut()
             && !s.is_alive()
         {
             eprintln!("quillway: llama-server exited; restarting. Its last output:\n{}", s.log_tail());
             self.server = None;
         }
-        Ok(self.server.as_ref().map(|server| llama_client(server, &self.active)))
+        self.server.as_ref().map(|server| llama_client(server, &self.active))
+    }
+
+    /// Start (and warm up) llama-server, or settle at once: an endpoint needs
+    /// no server, and a missing model can't start.
+    fn bring_up(&mut self) {
+        if self.config.endpoint.is_some() {
+            return self.settle(EngineState::Ready, &Ok(()));
+        }
+        if let Err(e) = self.active.ensure_installed() {
+            return self.settle(EngineState::Missing, &Err(format!("{e:#}")));
+        }
+        self.state.send_replace(EngineState::Starting);
+        let (config, active) = (self.config.clone(), self.active.clone());
+        self.starting = Some(Box::pin(async move {
+            let server = server::Server::start(&active.path, &config).await?;
+            // GPU pipelines get built and the fixed prompt prefix cached before the first real rewrite.
+            llama_client(&server, &active).warm_up().await?;
+            Ok(server)
+        }));
+    }
+
+    /// Publish `state` and answer everyone waiting on the start.
+    fn settle(&mut self, state: EngineState, outcome: &Result<(), String>) {
+        self.state.send_replace(state);
+        let client = outcome.clone().map(|()| self.ready_client());
+        for reply in self.waiting.drain(..) {
+            let _ = reply.send(client.clone().and_then(|c| c.ok_or_else(|| CANCELLED.into())));
+        }
+        for done in self.reloads.drain(..) {
+            let _ = done.send(outcome.clone());
+        }
     }
 }
 
@@ -79,96 +282,20 @@ fn llama_client(server: &server::Server, active: &Active) -> Client {
     })
 }
 
-impl Engine {
-    /// An engine for the `[model]` config and its active model; nothing starts
-    /// until the first request.
-    #[must_use]
-    pub fn new(config: ModelConfig, active: Active) -> Self {
-        let state = State { config, active, server: None, epoch: 0 };
-        let shared = Shared { state: Mutex::new(state), starting: Mutex::new(()), reloads: watch::Sender::new(0) };
-        Self { shared: Arc::new(shared) }
-    }
-
-    /// Swap the config and stop the server, including one still starting; the
-    /// next request starts the new one. Never waits for a start.
-    pub async fn reload(&self, config: ModelConfig, active: Active) {
-        let mut state = self.shared.state.lock().await;
-        let epoch = state.epoch + 1;
-        *state = State { config, active, server: None, epoch };
-        // Publish while holding the state lock: overlapping reloads must not
-        // announce older epochs after newer ones, or cancel the new start.
-        self.shared.reloads.send_replace(epoch);
-        drop(state);
-    }
-
-    /// A client ready to accept requests, starting llama-server if needed.
-    ///
-    /// # Errors
-    ///
-    /// The model isn't installed, llama-server fails to start, or a reload
-    /// cancelled the start.
-    pub async fn client(&self) -> anyhow::Result<Client> {
-        let epoch = {
-            let mut state = self.shared.state.lock().await;
-            if let Some(client) = state.ready_client()? {
-                return Ok(client);
-            }
-            state.epoch
-        };
-        let _one_start = self.shared.starting.lock().await;
-        // Another request may have started it, or a reload replaced it, while we waited.
-        let (config, active) = {
-            let mut state = self.shared.state.lock().await;
-            if state.epoch != epoch {
-                bail!("cancelled: the model server was reloaded");
-            }
-            if let Some(client) = state.ready_client()? {
-                return Ok(client);
-            }
-            (state.config.clone(), state.active.clone())
-        };
-        let mut reloads = self.shared.reloads.subscribe();
-        let server = tokio::select! {
-            server = server::Server::start(&active.path, &config) => server.context("starting llama-server")?,
-            // Dropping the start kills the half-started llama-server.
-            _ = reloads.wait_for(|&e| e != epoch) => bail!("cancelled: the model server was reloaded"),
-        };
-        let mut state = self.shared.state.lock().await;
-        if state.epoch != epoch {
-            bail!("cancelled: the model server was reloaded"); // dropping `server` stops it
-        }
-        let client = llama_client(&server, &state.active);
-        state.server = Some(server);
-        drop(state);
-        Ok(client)
-    }
-
-    /// Start the server and run one tiny request, so GPU pipelines are built
-    /// and the fixed prompt prefix is cached before the first real rewrite.
-    ///
-    /// # Errors
-    ///
-    /// As [`Engine::client`], or the warm-up request fails.
-    pub async fn warm_up(&self) -> anyhow::Result<()> {
-        self.client().await?.warm_up().await
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::time::Duration;
 
     use quillway_core::config::Config;
 
     use super::*;
 
-    /// A model file and a "llama-server" that never becomes ready.
-    fn hanging_server(dir: &std::path::Path) -> (ModelConfig, Active) {
+    /// A model file and a "llama-server" running `script`; each run is logged to `runs`.
+    fn fake_server(dir: &std::path::Path, script: &str) -> (ModelConfig, Active) {
         let model = dir.join("model.gguf");
         std::fs::write(&model, b"gguf").unwrap();
         let bin = dir.join("llama-server");
-        std::fs::write(&bin, "#!/bin/sh\nexec sleep 60\n").unwrap();
+        std::fs::write(&bin, format!("#!/bin/sh\necho run >> {}\n{script}\n", dir.join("runs").display())).unwrap();
         std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
         let mut config = Config::default();
         config.model.active = Some(format!("custom:{}", model.display()));
@@ -177,43 +304,107 @@ mod tests {
         (config.model, active)
     }
 
+    fn runs(dir: &std::path::Path) -> usize {
+        std::fs::read_to_string(dir.join("runs")).map_or(0, |s| s.lines().count())
+    }
+
+    fn start(config: ModelConfig, active: Active) -> Engine {
+        let (engine, supervisor) = Engine::new(config, active);
+        tokio::spawn(supervisor.run());
+        engine
+    }
+
     #[tokio::test]
     async fn a_reload_cancels_a_start_instead_of_waiting_for_it() {
         let dir = tempfile::tempdir().unwrap();
-        let (config, active) = hanging_server(dir.path());
-        let engine = Engine::new(config.clone(), active.clone());
-        let starting = tokio::spawn({
+        let (config, active) = fake_server(dir.path(), "exec sleep 60");
+        let engine = start(config.clone(), active.clone());
+        let waiting = tokio::spawn({
             let engine = engine.clone();
             async move { engine.client().await }
         });
         tokio::time::sleep(Duration::from_millis(300)).await; // the start is waiting for /health
-        tokio::time::timeout(Duration::from_secs(1), engine.reload(config, active))
-            .await
-            .expect("a reload doesn't wait for the start");
-        let error = tokio::time::timeout(Duration::from_secs(2), starting).await.unwrap().unwrap().unwrap_err();
+        drop(engine.reload(config, active)); // sent now; its outcome isn't needed here
+        let error = tokio::time::timeout(Duration::from_secs(2), waiting).await.unwrap().unwrap().unwrap_err();
         assert!(error.to_string().contains("reloaded"), "{error}");
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn concurrent_reloads_publish_the_latest_epoch() {
+    #[tokio::test]
+    async fn requests_waiting_for_a_failed_start_share_its_failure() {
         let dir = tempfile::tempdir().unwrap();
-        let (config, active) = hanging_server(dir.path());
-        let engine = Engine::new(config.clone(), active.clone());
-        let barrier = Arc::new(tokio::sync::Barrier::new(65));
-        let mut tasks = Vec::new();
-        for _ in 0..64 {
-            let (engine, config, active, barrier) = (engine.clone(), config.clone(), active.clone(), barrier.clone());
-            tasks.push(tokio::spawn(async move {
-                barrier.wait().await;
-                engine.reload(config, active).await;
-            }));
-        }
-        barrier.wait().await;
-        for task in tasks {
-            task.await.unwrap();
-        }
-        let state = engine.shared.state.lock().await;
-        assert_eq!(state.epoch, 64);
-        assert_eq!(*engine.shared.reloads.borrow(), state.epoch);
+        let (config, active) = fake_server(dir.path(), "sleep 0.3; exit 1");
+        let engine = start(config, active);
+        let (a, b) = tokio::join!(engine.client(), engine.client());
+        assert!(a.is_err() && b.is_err());
+        assert_eq!(runs(dir.path()), 1, "one start, not one per waiting request");
+        assert!(matches!(*engine.state().borrow(), EngineState::Failed(_)));
+        // A request after the failure tries again.
+        assert!(engine.client().await.is_err());
+        assert_eq!(runs(dir.path()), 2);
+    }
+
+    #[tokio::test]
+    async fn a_caller_giving_up_does_not_end_the_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, active) = fake_server(dir.path(), "exec sleep 60");
+        let engine = start(config, active);
+        let first = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.client().await }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        first.abort(); // e.g. Esc on the popup during the first rewrite
+        let second = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.client().await }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(runs(dir.path()), 1, "the second request waits for the same start");
+        second.abort();
+    }
+
+    #[tokio::test]
+    async fn overlapping_reloads_apply_in_order_and_all_get_the_last_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, active) = fake_server(dir.path(), "exec sleep 60");
+        let engine = start(config.clone(), active.clone());
+        // The first reload would hang; the last switches to a model that isn't there.
+        let mut missing = Config::default();
+        missing.model.active = Some(format!("custom:{}", dir.path().join("gone.gguf").display()));
+        let first = engine.reload(config, active);
+        let last = engine.reload(missing.model.clone(), models::active(&missing).unwrap());
+        let (first, last) =
+            tokio::time::timeout(Duration::from_secs(2), async { tokio::join!(first, last) }).await.unwrap();
+        assert!(last.as_ref().is_err_and(|e| e.contains("model file not found")), "{last:?}");
+        assert_eq!(first, last, "a replaced reload reports the latest outcome");
+        assert_eq!(*engine.state().borrow(), EngineState::Missing);
+    }
+
+    #[tokio::test]
+    async fn warm_up_starts_a_model_installed_meanwhile() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, active) = fake_server(dir.path(), "exec sleep 60");
+        std::fs::remove_file(&active.path).unwrap();
+        let engine = start(config, active.clone());
+        let mut state = engine.state();
+        state.wait_for(|s| *s == EngineState::Missing).await.unwrap();
+        std::fs::write(&active.path, b"gguf").unwrap(); // e.g. `quillway models install`
+        engine.warm_up();
+        tokio::time::timeout(Duration::from_secs(2), state.wait_for(|s| *s == EngineState::Starting))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_endpoint_is_ready_at_once() {
+        let mut config = Config::default();
+        config.model.endpoint = Some("http://127.0.0.1:1/v1".into());
+        config.model.endpoint_model = Some("m".into());
+        let active = models::active(&config).unwrap();
+        let engine = start(config.model.clone(), active.clone());
+        assert_eq!(engine.client().await.unwrap().endpoint().model, "m");
+        assert_eq!(engine.reload(config.model, active).await, Ok(()));
+        assert_eq!(*engine.state().borrow(), EngineState::Ready);
     }
 }

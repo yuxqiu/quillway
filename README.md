@@ -152,8 +152,9 @@ quillway daemon                       run the daemon (normally the systemd servi
 quillway toggle|show [--stdin]
 quillway hide | reload | status | quit
 quillway models list|install|use|remove
-quillway rewrite -p proofread < in    rewrite stdin to stdout, without the popup; uses the daemon's model server if it runs (--stats for timing)
-quillway doctor                       check protocols, llama-server, model, daemon
+quillway rewrite -p proofread < in    rewrite stdin to stdout, without the popup; uses the daemon's model server if it runs
+                                      (-i "instruction" instead of a preset, --raw without cleanup, --stats for timing)
+quillway doctor                       check config, Wayland, clipboard, llama-server, model, daemon
 ```
 
 ## Development

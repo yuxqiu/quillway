@@ -35,9 +35,16 @@ pub async fn run() -> anyhow::Result<()> {
         if wayland.is_empty() { "WAYLAND_DISPLAY is not set".into() } else { wayland },
     );
 
-    match quillway_wl::read() {
-        Ok(t) => check(true, "clipboard", format!("readable ({} chars)", t.map_or(0, |t| t.chars().count()))),
-        Err(e) => check(false, "clipboard", format!("{e:#}")),
+    // The app that owns the clipboard sends the data; a hung one mustn't hang `doctor`.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || tx.send(quillway_wl::read()));
+    match rx.recv_timeout(std::time::Duration::from_secs(2)) {
+        Ok(Ok(t)) => check(true, "clipboard", format!("readable ({} chars)", t.map_or(0, |t| t.chars().count()))),
+        Ok(Err(e)) if e.downcast_ref::<quillway_wl::TooLarge>().is_some() => {
+            check(true, "clipboard", "readable (its text is over the 1 MiB limit)".into());
+        }
+        Ok(Err(e)) => check(false, "clipboard", format!("{e:#}")),
+        Err(_) => check(false, "clipboard", "the app that owns the clipboard didn't answer within 2 s".into()),
     }
     match quillway_wl::ClipboardWatch::start() {
         Ok(_) => check(true, "clipboard watch", "copy times are tracked".into()),
@@ -74,7 +81,10 @@ pub async fn run() -> anyhow::Result<()> {
             check(matches!(engine.as_str(), "ready" | "starting"), "daemon", format!("running, {engine}"));
         }
         Ok(other) => check(false, "daemon", format!("{other:?}")),
-        Err(_) => check(false, "daemon", format!("not running ({})", paths::socket().display())),
+        Err(e) if e.downcast_ref::<crate::ipc::DaemonNotRunning>().is_some() => {
+            check(false, "daemon", format!("not running ({})", paths::socket().display()));
+        }
+        Err(e) => check(false, "daemon", format!("not answering: {e:#}")),
     }
 
     if !ok {
