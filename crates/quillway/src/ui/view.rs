@@ -148,23 +148,28 @@ impl App {
     }
 
     fn footer<'a>(&'a self, p: &'a Popup, pal: Palette) -> Element<'a, Message> {
-        let left = match (p.phase(), &self.engine_state) {
-            (_, EngineState::Starting) => format!("{} · loading…", self.model_label()),
-            (Phase::Generating, _) => {
+        let loading = self.engine_state == EngineState::Starting;
+        let mut left = match p.phase() {
+            Phase::Composing if loading => format!("{} · loading…", self.model_label()),
+            Phase::Composing => {
+                let n = p.source.text().chars().count();
+                format!("{} · {} · {} chars", self.model_label(), p.origin.label(), n)
+            }
+            Phase::Generating => {
                 format!("{} · {}", self.model_label(), p.generation.as_ref().map_or("", |g| g.label.as_str()))
             }
-            (Phase::Reviewing, _) => {
+            Phase::Reviewing => {
                 let d = p.drafts.last().expect("reviewing has a draft");
                 let n = p.drafts.len();
                 let steps = if n > 1 { format!(" ({n})") } else { String::new() };
                 let incomplete = if d.incomplete { " (incomplete)" } else { "" };
                 format!("{}{incomplete}{} · {}", d.label, steps, d.stats)
             }
-            (Phase::Composing, _) => {
-                let n = p.source.text().chars().count();
-                format!("{} · {} · {} chars", self.model_label(), p.origin.label(), n)
-            }
         };
+        // While generating or reviewing, the draft's details stay; the warm-up is a note.
+        if loading && p.phase() != Phase::Composing {
+            left.push_str(" · model loading…");
+        }
         let hints = match p.phase() {
             _ if self.needs_install() && self.active.entry.is_some() => "↵ install   esc close",
             // A missing custom model file: nothing to install, run or switch to.
