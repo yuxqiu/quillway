@@ -4,7 +4,6 @@ use std::io::{Read, Write};
 use std::time::Instant;
 
 use anyhow::{Context, bail};
-use quillway_core::clean;
 use quillway_core::config::{Config, DEFAULT_TEMPERATURE};
 use quillway_core::ipc::{Request, Response};
 use quillway_engine::{Client, Engine, Interrupted, Rewrite, models};
@@ -18,9 +17,6 @@ pub struct RewriteArgs {
     /// Free-form instruction instead of a preset.
     #[arg(long, short)]
     instruction: Option<String>,
-    /// Print the raw model output without cleanup.
-    #[arg(long)]
-    raw: bool,
     /// Report timing on stderr.
     #[arg(long)]
     stats: bool,
@@ -52,15 +48,10 @@ pub async fn run(a: RewriteArgs) -> anyhow::Result<()> {
         })?;
     let rate = timing.rate();
 
-    let out = if a.raw { raw } else { clean::clean(&raw, &text) };
-    if out.trim().is_empty() {
-        bail!("the model returned nothing after cleanup");
-    }
+    // The model's text as it wrote it (`complete` refuses an empty one).
     let mut stdout = std::io::stdout().lock();
-    stdout.write_all(out.as_bytes())?;
-    if !out.ends_with('\n') {
-        stdout.write_all(b"\n")?;
-    }
+    stdout.write_all(raw.trim().as_bytes())?;
+    stdout.write_all(b"\n")?;
     drop(stdout);
     if a.stats {
         eprintln!(

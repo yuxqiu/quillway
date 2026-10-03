@@ -1,6 +1,6 @@
 [package]
 name = "quillway-core"
-description = "Pure logic for Quillway: config, presets, prompts, output cleanup, diff, catalog, IPC types"
+description = "Pure logic for Quillway: config, presets, prompts, diff, catalog, IPC types"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

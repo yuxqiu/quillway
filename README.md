@@ -153,7 +153,7 @@ quillway toggle|show [--stdin]
 quillway hide | reload | status | quit
 quillway models list|install|use|remove
 quillway rewrite -p proofread < in    rewrite stdin to stdout, without the popup; uses the daemon's model server if it runs
-                                      (-i "instruction" instead of a preset, --raw without cleanup, --stats for timing)
+                                      (-i "instruction" instead of a preset, --stats for timing)
 quillway doctor                       check config, Wayland, clipboard, llama-server, model, daemon
 ```
 
@@ -172,7 +172,7 @@ The code is split into four crates:
 
 | Crate | Contents |
 |---|---|
-| `quillway-core` | Pure logic: config, presets, prompts, output cleanup, diff, catalog, IPC types |
+| `quillway-core` | Pure logic: config, presets, prompts, diff, catalog, IPC types |
 | `quillway-engine` | OpenAI SSE client, llama-server supervisor, downloader |
 | `quillway-wl` | Clipboard I/O |
 | `quillway` | CLI, IPC, iced UI |

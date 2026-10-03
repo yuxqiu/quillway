@@ -19,7 +19,6 @@ use iced_layershell::reexport::{Anchor, KeyboardInteractivity, Layer, NewLayerSh
 use iced_layershell::settings::{LayerShellSettings, Settings, StartMode};
 use iced_layershell::to_layer_message;
 use quillway_core::catalog::Entry;
-use quillway_core::clean;
 use quillway_core::config::{Config, DEFAULT_TEMPERATURE};
 use quillway_core::ipc::{Input, Request, Response};
 use quillway_engine::download;
@@ -225,7 +224,7 @@ impl Popup {
     /// End `g` with `error`: keep what arrived as an incomplete draft (unless a
     /// retry failed: its old draft stays), else give back the typed instruction.
     fn fail(&mut self, g: Generation, error: String) {
-        let partial = clean::visible(&g.raw).trim_end().to_owned();
+        let partial = g.raw.trim().to_owned();
         if !partial.is_empty() && !g.retry {
             self.drafts.push(g.into_draft(partial, "stopped early".into(), true));
         } else if let Some(typed) = g.typed {
@@ -792,7 +791,7 @@ impl App {
             }
             GenEvent::Done => {
                 let g = p.generation.take().expect("matched above");
-                let text = clean::clean(&g.raw, &g.request.text);
+                let text = g.raw.trim().to_owned();
                 if text.trim().is_empty() {
                     if let Some(typed) = g.typed {
                         p.input = typed;
@@ -937,7 +936,7 @@ impl App {
     }
 
     fn streaming_text(&self) -> Option<&str> {
-        Some(clean::visible(&self.popup.as_ref()?.generation.as_ref()?.raw)).filter(|t| !t.is_empty())
+        Some(self.popup.as_ref()?.generation.as_ref()?.raw.trim_start()).filter(|t| !t.is_empty())
     }
 }
 

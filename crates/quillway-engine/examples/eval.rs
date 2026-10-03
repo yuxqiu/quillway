@@ -2,12 +2,11 @@
 //!
 //!     cargo run --release -p quillway-engine --example eval -- qwen3.5-4b gemma-4-e4b > eval.md
 //!
-//! Per model: how often raw output differed from what's shown (a think block,
-//! trailing whitespace), latency after warm-up, and every output for eyeballing.
+//! Per model: think-tag leaks (expected 0), latency after warm-up, and every
+//! output for eyeballing.
 
 use std::fmt::Write;
 
-use quillway_core::clean;
 use quillway_core::config::Config;
 use quillway_engine::{Engine, Rewrite, models};
 
@@ -32,8 +31,8 @@ async fn main() -> anyhow::Result<()> {
     let proofread = &presets[0];
     let professional = &presets[3];
 
-    println!("| model | cases | needed cleanup | think leak | first token (median) | tok/s (median) |");
-    println!("|---|---|---|---|---|---|");
+    println!("| model | cases | think leak | first token (median) | tok/s (median) |");
+    println!("|---|---|---|---|---|");
     let mut details = String::new();
 
     for id in &ids {
@@ -45,7 +44,7 @@ async fn main() -> anyhow::Result<()> {
         // Waits for the start and warm-up.
         let client = engine.client().await?;
 
-        let (mut cleaned, mut think, mut firsts, mut rates) = (0, 0, Vec::new(), Vec::new());
+        let (mut think, mut firsts, mut rates) = (0, Vec::new(), Vec::new());
         let _ = write!(details, "\n## {}\n\n", active.name);
         for text in TEXTS {
             for preset in [proofread, professional] {
@@ -57,27 +56,19 @@ async fn main() -> anyhow::Result<()> {
                 let (raw, timing) = client.complete(&r).await?;
                 firsts.push(timing.first_token().unwrap_or_default().as_secs_f64());
                 rates.push(timing.rate());
-                let out = clean::clean(&raw, text);
-                let needed = out.trim() != raw.trim();
-                cleaned += usize::from(needed);
+                // A canary: our llama-server never sends thoughts in `content` (DECISIONS #42).
                 think += usize::from(raw.contains("<think>"));
                 let _ = write!(
                     details,
-                    "- **{}**: `{}`\n  → {}{}\n",
+                    "- **{}**: `{}`\n  → {}\n",
                     preset.name,
                     text.replace('\n', "⏎"),
-                    out.trim().replace('\n', "⏎"),
-                    if needed { format!("  _(raw: `{}`)_", raw.trim().replace('\n', "⏎")) } else { String::new() }
+                    raw.trim().replace('\n', "⏎")
                 );
             }
         }
         let cases = TEXTS.len() * 2;
-        println!(
-            "| {} | {cases} | {cleaned} | {think} | {:.2}s | {:.0} |",
-            active.name,
-            median(&mut firsts),
-            median(&mut rates)
-        );
+        println!("| {} | {cases} | {think} | {:.2}s | {:.0} |", active.name, median(&mut firsts), median(&mut rates));
     }
     println!("{details}");
     Ok(())
