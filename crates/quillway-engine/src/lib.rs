@@ -92,13 +92,13 @@ impl Engine {
     /// Swap the config and stop the server, including one still starting; the
     /// next request starts the new one. Never waits for a start.
     pub async fn reload(&self, config: ModelConfig, active: Active) {
-        let epoch = {
-            let mut state = self.shared.state.lock().await;
-            let epoch = state.epoch + 1;
-            *state = State { config, active, server: None, epoch };
-            epoch
-        };
+        let mut state = self.shared.state.lock().await;
+        let epoch = state.epoch + 1;
+        *state = State { config, active, server: None, epoch };
+        // Publish while holding the state lock: overlapping reloads must not
+        // announce older epochs after newer ones, or cancel the new start.
         self.shared.reloads.send_replace(epoch);
+        drop(state);
     }
 
     /// A client ready to accept requests, starting llama-server if needed.
@@ -156,6 +156,7 @@ impl Engine {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::time::Duration;
 
     use quillway_core::config::Config;
@@ -191,5 +192,28 @@ mod tests {
             .expect("a reload doesn't wait for the start");
         let error = tokio::time::timeout(Duration::from_secs(2), starting).await.unwrap().unwrap().unwrap_err();
         assert!(error.to_string().contains("reloaded"), "{error}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_reloads_publish_the_latest_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, active) = hanging_server(dir.path());
+        let engine = Engine::new(config.clone(), active.clone());
+        let barrier = Arc::new(tokio::sync::Barrier::new(65));
+        let mut tasks = Vec::new();
+        for _ in 0..64 {
+            let (engine, config, active, barrier) = (engine.clone(), config.clone(), active.clone(), barrier.clone());
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                engine.reload(config, active).await;
+            }));
+        }
+        barrier.wait().await;
+        for task in tasks {
+            task.await.unwrap();
+        }
+        let state = engine.shared.state.lock().await;
+        assert_eq!(state.epoch, 64);
+        assert_eq!(*engine.shared.reloads.borrow(), state.epoch);
     }
 }

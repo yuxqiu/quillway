@@ -336,7 +336,7 @@ enum Message {
     Clicked(window::Id),
     /// The box that has the keyboard after a click; `None` if the click unfocused both.
     Focused(window::Id, Option<Field>),
-    Resized(Size),
+    Resized(window::Id, Size),
     Tick(Instant),
     Engine(u64, Result<(), String>),
     InstallStart,
@@ -439,7 +439,7 @@ impl App {
             }
             Message::Clicked(id) => self.on_click(id),
             Message::Focused(id, field) => self.on_focused(id, field),
-            Message::Resized(size) => self.on_resize(size),
+            Message::Resized(id, size) => self.on_resize(id, size),
             Message::Tick(now) => {
                 self.now = now;
                 Task::none()
@@ -711,10 +711,10 @@ impl App {
         clippy::cast_sign_loss,
         reason = "layout heights are small and positive"
     )]
-    fn on_resize(&mut self, panel: Size) -> Task<Message> {
+    fn on_resize(&mut self, id: window::Id, panel: Size) -> Task<Message> {
         let mut tasks = Vec::new();
         let want = self.surface_size(panel.height.ceil() as u32);
-        let Some(p) = self.popup.as_mut() else { return Task::none() };
+        let Some(p) = self.popup.as_mut().filter(|p| p.id == id) else { return Task::none() };
         if !p.focus_given {
             p.focus_given = true;
             tasks.push(focus(p.field));
@@ -1193,6 +1193,25 @@ mod tests {
         assert_ne!(old, current);
         let _ = app.update(Message::Focused(old, Some(Field::Source)));
         assert_eq!(app.popup.as_ref().unwrap().field, Field::Instruction);
+    }
+
+    #[test]
+    fn a_late_resize_cannot_focus_or_resize_a_new_popup() {
+        let mut app = boot(endpoint_config());
+        let _ = app.update(Message::Ipc(Request::Show { input: Input::Text("old".into()) }, reply()));
+        let old = app.popup.as_ref().unwrap().id;
+        let _ = app.update(Message::Ipc(Request::Hide, reply()));
+        let _ = app.update(Message::Ipc(Request::Show { input: Input::Text("new".into()) }, reply()));
+        let (current, initial_size) = {
+            let p = app.popup.as_ref().unwrap();
+            (p.id, p.size)
+        };
+        let _ = app.update(Message::Resized(old, Size::new(680.0, 320.0)));
+        let p = app.popup.as_ref().unwrap();
+        assert!(!p.focus_given);
+        assert_eq!(p.size, initial_size);
+        let _ = app.update(Message::Resized(current, Size::new(680.0, 320.0)));
+        assert!(app.popup.as_ref().unwrap().focus_given);
     }
 
     #[test]

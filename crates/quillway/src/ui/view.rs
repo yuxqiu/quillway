@@ -37,7 +37,9 @@ impl App {
         let panel = container(column(sections)).width(Length::Fill).style(pal.panel());
         let width = f32::from(u16::try_from(self.config.ui.width).unwrap_or(u16::MAX));
         let ring = container(panel).padding(RING).width(width).style(pal.ring(self.shimmer()));
-        let measured = sensor(ring).on_show(Message::Resized).on_resize(Message::Resized);
+        let measured = sensor(ring)
+            .on_show(move |size| Message::Resized(id, size))
+            .on_resize(move |size| Message::Resized(id, size));
 
         container(
             scrollable(measured)
