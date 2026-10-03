@@ -1,10 +1,35 @@
 //! `quillway`: a shortcut-summoned rewrite popup for Wayland, backed by local models.
 
+/// `println!` for CLI output: a closed stdout becomes [`StdoutClosed`] instead of a panic.
+macro_rules! say {
+    ($($arg:tt)*) => { $crate::say(format_args!($($arg)*))? };
+}
+
 mod cmd;
 mod ipc;
 mod ui;
 
 use std::io::{Read, Write};
+
+/// Stdout was closed by whatever reads it; `main` stops quietly.
+#[derive(Debug)]
+struct StdoutClosed;
+
+impl std::fmt::Display for StdoutClosed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("stdout was closed")
+    }
+}
+
+impl std::error::Error for StdoutClosed {}
+
+/// Write one line to stdout; see [`say!`].
+fn say(line: std::fmt::Arguments<'_>) -> anyhow::Result<()> {
+    writeln!(std::io::stdout().lock(), "{line}").map_err(|e| match e.kind() {
+        std::io::ErrorKind::BrokenPipe => anyhow::Error::new(StdoutClosed),
+        _ => e.into(),
+    })
+}
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
@@ -55,25 +80,20 @@ impl SourceArg {
         if !self.stdin {
             return Ok(Input::Clipboard);
         }
-        let mut s = String::new();
-        std::io::stdin().take(quillway_wl::MAX_BYTES + 1).read_to_string(&mut s).context("reading stdin")?;
-        if s.len() as u64 > quillway_wl::MAX_BYTES {
+        // Bytes first: a cap can split a character, which isn't the error to report.
+        let mut bytes = Vec::new();
+        std::io::stdin().take(quillway_wl::MAX_BYTES + 1).read_to_end(&mut bytes).context("reading stdin")?;
+        if bytes.len() as u64 > quillway_wl::MAX_BYTES {
             anyhow::bail!("stdin text is larger than the 1 MiB limit");
         }
-        Ok(Input::Text(s))
+        Ok(Input::Text(String::from_utf8(bytes).context("stdin isn't UTF-8 text")?))
     }
 }
 
 fn main() -> anyhow::Result<()> {
     match run() {
         // Output piped into something that stopped reading (`quillway models list | head -1`).
-        Err(e)
-            if e.chain().any(|c| {
-                c.downcast_ref::<std::io::Error>().is_some_and(|io| io.kind() == std::io::ErrorKind::BrokenPipe)
-            }) =>
-        {
-            Ok(())
-        }
+        Err(e) if e.downcast_ref::<StdoutClosed>().is_some() => Ok(()),
         result => result,
     }
 }
@@ -96,7 +116,7 @@ fn run() -> anyhow::Result<()> {
         Response::Ok => Ok(()),
         Response::Status { visible, model, engine } => {
             let popup = if visible { "visible" } else { "hidden" };
-            writeln!(std::io::stdout(), "popup:  {popup}\nmodel:  {model}\nengine: {engine}")?;
+            say!("popup:  {popup}\nmodel:  {model}\nengine: {engine}");
             Ok(())
         }
         Response::Error { message } => anyhow::bail!(message),

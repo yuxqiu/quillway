@@ -96,7 +96,10 @@ impl App {
         if let Some(e) = &p.error {
             col = col.push(text(e.as_str()).size(13).color(pal.error));
         }
-        if let EngineState::Failed(e) = &self.engine_state {
+        // Unless the error above already says it (a request whose start failed).
+        if let EngineState::Failed(e) = &self.engine_state
+            && p.error.is_none()
+        {
             col = col.push(text(format!("Model server failed: {}", preview(e, 200))).size(13).color(pal.error));
         }
         container(col).padding([12, PAD_X]).width(Length::Fill).into()
@@ -168,7 +171,7 @@ impl App {
                 format!("{}{incomplete}{} · {}", d.label, steps, d.stats)
             }
         };
-        // While generating or reviewing, the draft's details stay; the warm-up is a note.
+        // While generating or reviewing, the draft's details stay; the model loading is a note.
         if loading && p.phase() != Phase::Composing {
             left.push_str(" · model loading…");
         }

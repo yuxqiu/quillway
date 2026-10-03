@@ -2,7 +2,7 @@
 //!
 //!     cargo run --release -p quillway-engine --example eval -- qwen3.5-4b gemma-4-e4b > eval.md
 //!
-//! Per model: think-tag leaks (expected 0), latency after warm-up, and every
+//! Per model: think-tag leaks (expected 0), latency once the server is up, and every
 //! output for eyeballing.
 
 use std::fmt::Write;
@@ -41,7 +41,7 @@ async fn main() -> anyhow::Result<()> {
         let active = models::active(&config)?;
         let (engine, supervisor) = Engine::new(config.model, active.clone());
         tokio::spawn(supervisor.run());
-        // Waits for the start and warm-up.
+        // Waits for the server to start.
         let client = engine.client().await?;
 
         let (mut think, mut firsts, mut rates) = (0, Vec::new(), Vec::new());

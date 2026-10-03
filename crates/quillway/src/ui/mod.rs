@@ -267,7 +267,6 @@ struct App {
     install: Option<Install>,
     now: Instant,
     next_gen: u64,
-    /// The latest warm-up; results of earlier ones (superseded by a reload) are ignored.
     /// `None` if the compositor can't report clipboard changes.
     watch: Option<quillway_wl::ClipboardWatch>,
     /// The current clipboard read; older results are ignored after cancellation.
@@ -460,9 +459,6 @@ impl App {
     }
 
     fn on_engine_state(&mut self, state: EngineState) -> Task<Message> {
-        if let EngineState::Failed(e) = &state {
-            eprintln!("quillway: engine: {e}");
-        }
         self.engine_state = state;
         // Switched to a missing model while typing in the text box: the install card has none.
         match self.popup.as_mut() {
@@ -528,20 +524,23 @@ impl App {
                     self.palette = style::Palette::new(&config.ui);
                     self.config = config.clone();
                     // The server this generation streams from is about to stop: say so, not "incomplete response".
-                    if let Some(p) = self.popup.as_mut()
+                    let refocus = if let Some(p) = self.popup.as_mut()
                         && let Some(g) = p.generation.take()
                     {
                         g.handle.abort();
                         p.fail(g, "Stopped: the model server is restarting for a reload. Run it again.".into());
-                    }
+                        focus(p.field) // a click while writing may have taken it
+                    } else {
+                        Task::none()
+                    };
                     // Sent now, so reloads apply in the order they arrived; the reply waits
                     // until the new server is up, so a model that fails to start is reported.
                     let done = self.engine.reload(config.model, self.active.clone());
                     let reply = reply.clone();
-                    Task::future(async move {
+                    let answer = Task::future(async move {
                         reply.send(done.await.map_or_else(|message| Response::Error { message }, |()| Response::Ok));
-                    })
-                    .discard()
+                    });
+                    Task::batch([answer.discard(), refocus])
                 }
                 Err(e) => {
                     reply.send(Response::Error { message: format!("{e:#}") });
@@ -549,7 +548,8 @@ impl App {
                 }
             },
             Request::Status => {
-                let engine = self.engine_state.describe();
+                // From the engine itself: the app's copy arrives as a message, maybe after this request.
+                let engine = self.engine.state().borrow().describe();
                 reply.send(Response::Status { visible: self.popup.is_some(), model: self.model_label(), engine });
                 Task::none()
             }
@@ -607,7 +607,7 @@ impl App {
         // The model may have been installed since we last looked (copied in, or by a CLI
         // that couldn't reach us); start it instead of offering the install card.
         if self.engine_state == EngineState::Missing && self.active.is_installed() {
-            self.engine.warm_up();
+            self.engine.start();
         }
         // A key held as the last popup closed was released elsewhere.
         self.held = None;
@@ -618,11 +618,7 @@ impl App {
         self.popup = Some(Popup {
             id,
             // The install card has no text box; ↵ there goes to the instruction box.
-            field: if text.trim().is_empty() && self.engine_state != EngineState::Missing {
-                Field::Source
-            } else {
-                Field::Instruction
-            },
+            field: if text.trim().is_empty() && !self.model_missing() { Field::Source } else { Field::Instruction },
             source: editor_content(text),
             origin,
             input: String::new(),
@@ -713,11 +709,6 @@ impl App {
         if self.needs_install() || self.popup.as_ref().is_none_or(|p| p.generation.is_some()) {
             return Task::none();
         }
-        // A preset clears the instruction box. That also drops the digit a Ctrl+digit key
-        // typed there: iced's `text_input` inserts it even with Ctrl held.
-        if let Some(p) = self.popup.as_mut() {
-            p.input.clear();
-        }
         self.generate(preset.name, preset.instruction, preset.temperature, preset.show_diff, false)
     }
 
@@ -739,6 +730,11 @@ impl App {
                 "Nothing to rewrite: the text is empty. Ctrl+Z restores the previous draft.".into()
             });
             return Task::none();
+        }
+        if !from_input {
+            // A preset clears the instruction box. That also drops the digit a Ctrl+digit key
+            // typed there: iced's `text_input` inserts it even with Ctrl held.
+            p.input.clear();
         }
         // The client counts tokens and rejects text too long for the context.
         let request = Rewrite { instruction, text, temperature };
@@ -899,7 +895,7 @@ impl App {
             }
             InstallEvent::Done(Ok(())) => {
                 self.install = None;
-                self.engine.warm_up();
+                self.engine.start();
                 Task::none()
             }
             InstallEvent::Done(Err(e)) => {
@@ -911,7 +907,13 @@ impl App {
 
     /// The install card replaces the composer only before anything was generated.
     fn needs_install(&self) -> bool {
-        self.engine_state == EngineState::Missing && self.popup.as_ref().is_some_and(|p| p.phase() == Phase::Composing)
+        self.model_missing() && self.popup.as_ref().is_some_and(|p| p.phase() == Phase::Composing)
+    }
+
+    /// The engine said the model is missing, and it still is: after an install or a
+    /// reload to an installed model, the card goes before the engine's next state arrives.
+    fn model_missing(&self) -> bool {
+        self.engine_state == EngineState::Missing && !self.active.is_installed()
     }
 
     /// Name shown in the footer and `status`.
@@ -986,13 +988,15 @@ const fn preset_index(key: Physical) -> Option<usize> {
 }
 
 /// The engine's state now, then each change.
+/// The engine's state now, then each change; if its supervisor stops, `Failed` once.
 fn engine_states(engine: &Engine) -> impl Stream<Item = Message> + use<> {
-    stream::unfold((engine.state(), true), |(mut state, first)| async move {
-        if !first {
-            state.changed().await.ok()?;
+    stream::unfold((Some(engine.state()), true), |(state, first)| async move {
+        let mut state = state?;
+        if !first && state.changed().await.is_err() {
+            return Some((Message::EngineState(EngineState::Failed("the engine stopped".into())), (None, false)));
         }
         let now = state.borrow_and_update().clone();
-        Some((Message::EngineState(now), (state, false)))
+        Some((Message::EngineState(now), (Some(state), false)))
     })
 }
 
@@ -1435,6 +1439,33 @@ mod tests {
         assert_eq!(app.popup.as_ref().unwrap().drafts.len(), 2);
         let _ = app.update(Message::Edit(text_editor::Action::Edit(text_editor::Edit::Backspace)));
         assert_eq!(app.popup.as_ref().unwrap().drafts.len(), 1, "back to the model's text");
+    }
+
+    #[test]
+    fn a_preset_refused_for_empty_text_keeps_the_typed_instruction() {
+        let mut app = boot(endpoint_config());
+        let _ = app.update(Message::Ipc(Request::Show { input: Input::Text(String::new()) }, reply()));
+        let _ = app.update(Message::Input("make it formal".into()));
+        let _ = app.update(Message::Preset(0));
+        let p = app.popup.as_ref().unwrap();
+        assert!(p.error.as_deref().is_some_and(|e| e.starts_with("Nothing to rewrite")));
+        assert_eq!(p.input, "make it formal");
+    }
+
+    #[test]
+    fn the_install_card_goes_once_the_model_exists() {
+        let path = std::env::temp_dir().join(format!("quillway-card-{}.gguf", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut config = Config::default();
+        config.model.active = Some(format!("custom:{}", path.display()));
+        let mut app = boot(config);
+        let _ = app.update(Message::EngineState(EngineState::Missing));
+        let _ = app.update(Message::Ipc(Request::Show { input: Input::Text("hi".into()) }, reply()));
+        assert!(app.needs_install());
+        std::fs::write(&path, b"gguf").unwrap(); // installed; the engine's next state is still on its way
+        let installed = !app.needs_install();
+        std::fs::remove_file(&path).unwrap();
+        assert!(installed);
     }
 
     #[test]

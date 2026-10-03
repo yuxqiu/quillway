@@ -248,23 +248,10 @@ impl Client {
         &self,
         r: &Rewrite,
     ) -> anyhow::Result<impl Stream<Item = anyhow::Result<Chunk>> + Send + use<>> {
-        self.send(r, None).await
-    }
-
-    /// [`Client::stream`] with an explicit `max_tokens`; `None` fills the
-    /// context left after the prompt.
-    async fn send(
-        &self,
-        r: &Rewrite,
-        max_tokens: Option<u32>,
-    ) -> anyhow::Result<impl Stream<Item = anyhow::Result<Chunk>> + Send + use<>> {
         if r.text.contains(prompt::STOP) {
             bail!("the text contains `{}`, which Quillway uses as a delimiter", prompt::STOP);
         }
-        let max_tokens = match max_tokens {
-            Some(n) => n,
-            None => self.budget(r).await?,
-        };
+        let max_tokens = self.budget(r).await?;
         let base = &self.endpoint.base;
         let resp = self
             .post(&format!("{base}/chat/completions"))
@@ -304,28 +291,6 @@ impl Client {
                 };
             }
         }))
-    }
-
-    /// On our own llama-server, run one tiny request, so GPU pipelines are
-    /// built and the fixed prompt prefix is cached; other servers are left
-    /// alone. It is cut at one token on purpose, so the first delta is success
-    /// and the token-limit ending that follows is ignored.
-    ///
-    /// # Errors
-    ///
-    /// As [`Client::stream`], or the server fails before the first token.
-    pub async fn warm_up(&self) -> anyhow::Result<()> {
-        if !self.endpoint.llama {
-            return Ok(());
-        }
-        let r = Rewrite { instruction: "Proofread.".into(), text: "ok".into(), temperature: 0.0 };
-        let mut s = std::pin::pin!(self.send(&r, Some(1)).await?);
-        while let Some(chunk) = s.next().await {
-            if let Chunk::Text(_) = chunk? {
-                return Ok(());
-            }
-        }
-        bail!("warm-up produced no token")
     }
 
     /// Collect a whole response, with its timing (`quillway rewrite`, the eval).
@@ -681,24 +646,6 @@ mod tests {
         assert!(received(&server).await.is_empty());
     }
 
-    #[tokio::test]
-    async fn warm_up_ignores_its_own_token_limit() {
-        let (base, _server) = serve_sse(
-            "data: {\"choices\":[{\"delta\":{\"content\":\"Ok\"}}]}\n\n\
-             data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n\
-             data: [DONE]\n\n",
-        )
-        .await;
-        client(&base, None, true).warm_up().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn warm_up_requires_a_token() {
-        let (base, _server) = serve_sse("data: [DONE]\n\n").await;
-        let error = client(&base, None, true).warm_up().await.unwrap_err();
-        assert!(error.to_string().contains("no token"), "{error}");
-    }
-
     #[test]
     fn parses_event_data() {
         let text = |t: &str| Sse::Chunk(Chunk::Text(t.into()));
@@ -714,23 +661,6 @@ mod tests {
         // Text that arrives with a truncating ending is delivered before the error.
         let last = parse_data(r#"{"choices":[{"delta":{"content":"end"},"finish_reason":"length"}]}"#);
         assert!(matches!(last.as_slice(), [Sse::Chunk(Chunk::Text(t)), Sse::Error(_)] if t == "end"), "{last:?}");
-    }
-
-    #[tokio::test]
-    async fn warm_up_accepts_a_token_sent_with_its_token_limit_ending() {
-        let (base, _server) = serve_sse(
-            "data: {\"choices\":[{\"delta\":{\"content\":\"Ok\"},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n",
-        )
-        .await;
-        client(&base, None, true).warm_up().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn warm_up_needs_a_token_not_just_usage() {
-        let (base, _server) =
-            serve_sse("data: {\"choices\":[],\"usage\":{\"completion_tokens\":0}}\n\ndata: [DONE]\n\n").await;
-        let error = client(&base, None, true).warm_up().await.unwrap_err();
-        assert!(error.to_string().contains("no token"), "{error}");
     }
 
     #[tokio::test]

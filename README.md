@@ -36,7 +36,7 @@ quillway models install qwen3.5-4b   # the default model, Qwen3.5 4B (2.7 GB)
 
 Or open the popup and press ↵ on the install card.
 
-Without home-manager: `nix profile install .#default`, then run `quillway daemon` from your compositor's autostart.
+Without home-manager: `nix profile install github:yuxqiu/quillway`, then run `quillway daemon` from your compositor's autostart.
 
 ### Without Nix
 
@@ -116,7 +116,7 @@ Other options:
 
 ```toml
 [model]
-active = "qwen3.5-4b"         # catalog id or "custom:/path.gguf"; default: `models use` choice, then qwen3.5-4b
+# active = "qwen3.5-4b"       # catalog id or "custom:/path.gguf"; pins the model over `models use` (default: its choice, then qwen3.5-4b)
 # endpoint = "http://127.0.0.1:11434/v1"   # OpenAI-compatible server instead of the built-in llama-server
 # endpoint_model = "qwen3.5:4b"            # required with endpoint
 # endpoint_api_key = "…"

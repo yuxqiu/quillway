@@ -73,11 +73,18 @@ impl State {
 /// The chosen id isn't in the catalog, e.g. a `models use` choice that a
 /// newer version dropped.
 pub fn active(config: &Config) -> anyhow::Result<Active> {
-    let (chosen, source) = match &config.model.active {
-        Some(id) => (Some(id.clone()), "`model.active`"),
-        None => (State::load()?.active, "`quillway models use`"),
-    };
-    resolve(chosen.as_deref(), &paths::models_dir()).with_context(|| format!("the model chosen with {source}"))
+    let chosen = config.model.active.clone().map_or_else(
+        || State::load().map(|state| (state.active, "`quillway models use`")),
+        |id| Ok((Some(id), "`model.active`")),
+    );
+    let active = chosen.and_then(|(chosen, source)| {
+        resolve(chosen.as_deref(), &paths::models_dir()).with_context(|| format!("the model chosen with {source}"))
+    });
+    match active {
+        // With `model.endpoint`, the local model only lends its sampling defaults: a broken choice doesn't matter.
+        Err(_) if config.model.endpoint.is_some() => resolve(None, &paths::models_dir()),
+        active => active,
+    }
 }
 
 fn resolve(id: Option<&str>, models_dir: &Path) -> anyhow::Result<Active> {
@@ -175,6 +182,15 @@ mod tests {
         assert!(catalog.to_string().contains("run `quillway models install gemma-4-e4b`"), "{catalog}");
         let custom = resolve(Some("custom:/nonexistent/x.gguf"), dir).unwrap().ensure_installed().unwrap_err();
         assert!(custom.to_string().contains("model file not found: /nonexistent/x.gguf"), "{custom}");
+    }
+
+    #[test]
+    fn an_endpoint_ignores_a_broken_model_choice() {
+        let mut config = Config::default();
+        config.model.active = Some("dropped-model".into()); // e.g. left in `state.toml`
+        assert!(active(&config).is_err());
+        config.model.endpoint = Some("http://127.0.0.1:1/v1".into());
+        assert_eq!(active(&config).unwrap().id, "qwen3.5-4b", "only its sampling defaults are used");
     }
 
     #[test]

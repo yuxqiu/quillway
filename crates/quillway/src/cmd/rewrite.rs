@@ -1,6 +1,6 @@
 //! `quillway rewrite`: stdin → model → stdout, without the popup.
 
-use std::io::{Read, Write};
+use std::io::Read;
 use std::time::Instant;
 
 use anyhow::{Context, bail};
@@ -49,10 +49,7 @@ pub async fn run(a: RewriteArgs) -> anyhow::Result<()> {
     let rate = timing.rate();
 
     // The model's text as it wrote it (`complete` refuses an empty one).
-    let mut stdout = std::io::stdout().lock();
-    stdout.write_all(raw.trim().as_bytes())?;
-    stdout.write_all(b"\n")?;
-    drop(stdout);
+    say!("{}", raw.trim());
     if a.stats {
         eprintln!(
             "model {} · startup {:.1}s · first token {:.2}s · {} tokens · {rate:.1} tok/s",

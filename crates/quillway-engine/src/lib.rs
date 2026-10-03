@@ -27,7 +27,7 @@ pub use models::Active;
 /// Where the model backend is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EngineState {
-    /// llama-server is starting and warming up.
+    /// llama-server is starting.
     Starting,
     /// Requests are served (our llama-server, or the configured endpoint).
     Ready,
@@ -70,7 +70,7 @@ enum Command {
     /// Switch config: stop the server and bring up the new one.
     Reload { change: Box<(ModelConfig, Active)>, done: Done },
     /// Bring the server up if it isn't, e.g. after the model was installed.
-    WarmUp,
+    Start,
     /// A client for the running server, starting it if needed.
     Client(oneshot::Sender<Result<Client, String>>),
 }
@@ -114,8 +114,8 @@ impl Engine {
     }
 
     /// Bring the server up if it isn't running or starting.
-    pub fn warm_up(&self) {
-        let _ = self.commands.send(Command::WarmUp);
+    pub fn start(&self) {
+        let _ = self.commands.send(Command::Start);
     }
 
     /// A client ready to accept requests, starting llama-server if needed.
@@ -137,7 +137,7 @@ impl Engine {
     }
 }
 
-/// Starting llama-server and warming it up, as one future the supervisor can drop.
+/// Starting llama-server, as a future the supervisor can drop.
 type Start = Pin<Box<dyn Future<Output = anyhow::Result<server::Server>> + Send>>;
 
 /// Owns the config and llama-server; see the crate docs.
@@ -165,6 +165,12 @@ impl Supervisor {
                     None => std::future::pending().await,
                 }
             };
+            let exited = async {
+                match self.server.as_mut() {
+                    Some(server) => server.exited().await,
+                    None => std::future::pending().await,
+                }
+            };
             tokio::select! {
                 command = self.inbox.recv() => match command {
                     Some(command) => self.handle(command),
@@ -173,16 +179,21 @@ impl Supervisor {
                 started = started => {
                     self.starting = None;
                     match started {
-                        Ok(server) => {
-                            self.server = Some(server);
-                            self.settle(EngineState::Ready, &Ok(()));
+                        Ok(mut server) => {
+                            if server.is_alive() {
+                                self.server = Some(server);
+                                self.settle(EngineState::Ready, &Ok(()));
+                            } else {
+                                self.fail(format!("llama-server exited right after starting:\n{}", server.log_tail()));
+                            }
                         }
-                        Err(e) => {
-                            let message = format!("starting llama-server: {e:#}");
-                            eprintln!("quillway: {message}");
-                            self.settle(EngineState::Failed(message.clone()), &Err(message));
-                        }
+                        Err(e) => self.fail(format!("starting llama-server: {e:#}")),
                     }
+                }
+                // Noticed at once, so the state (and `quillway status`) don't claim it's ready.
+                status = exited => {
+                    let tail = self.server.take().map(|s| s.log_tail()).unwrap_or_default();
+                    self.fail(format!("llama-server exited ({status}); the next request restarts it. Its last output:\n{tail}"));
                 }
             }
         }
@@ -192,15 +203,16 @@ impl Supervisor {
         match command {
             Command::Reload { change, done } => {
                 (self.config, self.active) = *change;
-                // Dropping them stops the old server and a start in progress.
-                (self.server, self.starting) = (None, None);
+                // Dropping a start in progress kills its process; the old server is
+                // stopped by the next start (bring_up), which waits for it to exit.
+                self.starting = None;
                 for client in self.waiting.drain(..) {
                     let _ = client.send(Err(CANCELLED.into()));
                 }
                 self.reloads.push(done);
                 self.bring_up();
             }
-            Command::WarmUp => {
+            Command::Start => {
                 if self.ready_client().is_none() && self.starting.is_none() {
                     self.bring_up();
                 }
@@ -242,25 +254,41 @@ impl Supervisor {
     /// Start (and warm up) llama-server, or settle at once: an endpoint needs
     /// no server, and a missing model can't start.
     fn bring_up(&mut self) {
+        let old = self.server.take();
         if self.config.endpoint.is_some() {
             return self.settle(EngineState::Ready, &Ok(()));
         }
         if let Err(e) = self.active.ensure_installed() {
             return self.settle(EngineState::Missing, &Err(format!("{e:#}")));
         }
-        self.state.send_replace(EngineState::Starting);
+        self.publish(EngineState::Starting);
         let (config, active) = (self.config.clone(), self.active.clone());
         self.starting = Some(Box::pin(async move {
-            let server = server::Server::start(&active.path, &config).await?;
-            // GPU pipelines get built and the fixed prompt prefix cached before the first real rewrite.
-            llama_client(&server, &active).warm_up().await?;
-            Ok(server)
+            // Wait for the old process to go, so two models never share the GPU's memory.
+            if let Some(old) = old {
+                old.stop().await;
+            }
+            server::Server::start(&active.path, &config).await
         }));
+    }
+
+    fn fail(&mut self, message: String) {
+        eprintln!("quillway: {message}");
+        self.settle(EngineState::Failed(message.clone()), &Err(message));
+    }
+
+    /// Publish `state` if it changed (watchers act on each publish).
+    fn publish(&self, state: EngineState) {
+        self.state.send_if_modified(|current| {
+            let changed = *current != state;
+            *current = state;
+            changed
+        });
     }
 
     /// Publish `state` and answer everyone waiting on the start.
     fn settle(&mut self, state: EngineState, outcome: &Result<(), String>) {
-        self.state.send_replace(state);
+        self.publish(state);
         let client = outcome.clone().map(|()| self.ready_client());
         for reply in self.waiting.drain(..) {
             let _ = reply.send(client.clone().and_then(|c| c.ok_or_else(|| CANCELLED.into())));
@@ -381,7 +409,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn warm_up_starts_a_model_installed_meanwhile() {
+    async fn start_brings_up_a_model_installed_meanwhile() {
         let dir = tempfile::tempdir().unwrap();
         let (config, active) = fake_server(dir.path(), "exec sleep 60");
         std::fs::remove_file(&active.path).unwrap();
@@ -389,7 +417,7 @@ mod tests {
         let mut state = engine.state();
         state.wait_for(|s| *s == EngineState::Missing).await.unwrap();
         std::fs::write(&active.path, b"gguf").unwrap(); // e.g. `quillway models install`
-        engine.warm_up();
+        engine.start();
         tokio::time::timeout(Duration::from_secs(2), state.wait_for(|s| *s == EngineState::Starting))
             .await
             .unwrap()

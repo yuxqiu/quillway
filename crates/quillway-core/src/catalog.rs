@@ -41,8 +41,9 @@ pub struct Entry {
 }
 
 /// Per-model sampling parameters sent with each request.
+/// No `deny_unknown_fields`: it's also on the wire (`Response::Server`), where
+/// an older CLI must accept fields a newer daemon adds.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Sampling {
     /// Nucleus sampling cutoff.
     pub top_p: f32,

@@ -229,7 +229,7 @@ impl Config {
         }
         if config.model.context < 1024 {
             anyhow::bail!(
-                "`model.context = {}` must be at least 1024: the fixed instructions alone take ~450 tokens",
+                "`model.context = {}` must be at least 1024: the fixed instructions alone take ~400 tokens",
                 config.model.context
             );
         }

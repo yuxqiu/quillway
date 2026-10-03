@@ -107,9 +107,12 @@ pub async fn download(job: Job<'_>, mut on_progress: impl FnMut(Progress)) -> an
         let mut body = resp.bytes_stream();
         while let Some(chunk) = body.next().await {
             let chunk = chunk.context("download interrupted; run the install again to resume")?;
+            have += chunk.len() as u64;
+            if have > job.size {
+                bail!("the server sent more than the expected {} bytes", job.size);
+            }
             hasher.update(&chunk);
             file.write_all(&chunk).await?;
-            have += chunk.len() as u64;
             on_progress(Progress { done: have, total: job.size });
         }
         file.sync_all().await?;

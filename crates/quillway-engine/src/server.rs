@@ -107,6 +107,16 @@ impl Server {
         matches!(self.child.try_wait(), Ok(None))
     }
 
+    /// Resolves when the process exits (cancel-safe).
+    pub async fn exited(&mut self) -> String {
+        self.child.wait().await.map_or_else(|e| e.to_string(), |status| status.to_string())
+    }
+
+    /// Kill the process and wait until it's gone, so its GPU memory is free.
+    pub async fn stop(mut self) {
+        let _ = self.child.kill().await;
+    }
+
     #[must_use]
     pub fn base_url(&self) -> String {
         format!("http://127.0.0.1:{}/v1", self.port)
