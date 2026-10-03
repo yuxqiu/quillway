@@ -14,12 +14,16 @@ toml.workspace = true
 tokio.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 futures-util = "0.3"
+eventsource-stream = "0.2"
+bytesize = "2"
+indicatif = { version = "0.18", default-features = false }
 sha2 = "0.10"
-libc = "0.2"
-fastrand = "2"
+getrandom = "0.3"
+rustix = { version = "1", features = ["fs", "process"] }
 
 [dev-dependencies]
 tempfile = "3"
+wiremock = "0.6"
 
 [lints]
 workspace = true

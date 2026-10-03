@@ -1,8 +1,9 @@
 //! Streaming `/v1/chat/completions` client (llama-server, Ollama, LM Studio, …).
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
+use eventsource_stream::Eventsource;
 use futures_util::{Stream, StreamExt};
 use quillway_core::ipc::Endpoint;
 use quillway_core::prompt::{self, ChatMessage};
@@ -26,6 +27,69 @@ pub struct Rewrite {
     pub temperature: f32,
     /// Upper bound on generated tokens; `None` fills the context left after the prompt.
     pub max_tokens: Option<u32>,
+}
+
+/// One piece of a streamed response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Chunk {
+    /// Generated text.
+    Text(String),
+    /// Tokens generated, as the server counts them; sent once, at the end.
+    Usage(u32),
+}
+
+/// Timing of one streamed response, for a tokens-per-second figure.
+#[derive(Debug, Clone, Copy)]
+pub struct Timing {
+    started: Instant,
+    first: Option<Instant>,
+    texts: u32,
+    usage: Option<u32>,
+}
+
+impl Timing {
+    /// Starts the clock.
+    #[must_use]
+    pub fn start() -> Self {
+        Self { started: Instant::now(), first: None, texts: 0, usage: None }
+    }
+
+    /// Note a chunk as it arrives.
+    pub fn record(&mut self, chunk: &Chunk) {
+        match chunk {
+            Chunk::Text(_) => {
+                self.first.get_or_insert_with(Instant::now);
+                self.texts += 1;
+            }
+            Chunk::Usage(n) => self.usage = Some(*n),
+        }
+    }
+
+    /// When the request started.
+    #[must_use]
+    pub const fn started(&self) -> Instant {
+        self.started
+    }
+
+    /// From the start to the first text.
+    #[must_use]
+    pub fn first_token(&self) -> Option<Duration> {
+        Some(self.first? - self.started)
+    }
+
+    /// Tokens generated: the server's count, else the number of text chunks
+    /// (one token each on llama-server, possibly more elsewhere).
+    #[must_use]
+    pub fn tokens(&self) -> u32 {
+        self.usage.unwrap_or(self.texts)
+    }
+
+    /// Tokens per second from the first token until now.
+    #[must_use]
+    pub fn rate(&self) -> f64 {
+        let secs = self.first.unwrap_or(self.started).elapsed().as_secs_f64().max(1e-3);
+        f64::from(self.tokens().saturating_sub(1)) / secs
+    }
 }
 
 impl Client {
@@ -75,6 +139,7 @@ impl Client {
             "top_p": sampling.top_p,
             "max_tokens": max_tokens,
             "stop": [prompt::STOP],
+            "stream_options": { "include_usage": true },
         });
         if *llama && let Value::Object(o) = &mut body {
             o.insert("top_k".into(), json!(sampling.top_k));
@@ -163,16 +228,20 @@ impl Client {
         Ok(resp.json().await?)
     }
 
-    /// Stream content deltas. Dropping the stream cancels the request.
+    /// Stream the response. Dropping the stream cancels the request.
     ///
     /// # Errors
     ///
-    /// The text doesn't fit the context, or the server is unreachable or
-    /// rejects the request; later failures arrive as stream items.
+    /// The text contains the prompt's delimiter or doesn't fit the context,
+    /// or the server is unreachable or rejects the request; later failures
+    /// arrive as stream items.
     pub async fn stream(
         &self,
         r: &Rewrite,
-    ) -> anyhow::Result<impl Stream<Item = anyhow::Result<String>> + Send + use<>> {
+    ) -> anyhow::Result<impl Stream<Item = anyhow::Result<Chunk>> + Send + use<>> {
+        if r.text.contains(prompt::STOP) {
+            bail!("the text contains `{}`, which Quillway uses as a delimiter", prompt::STOP);
+        }
         let max_tokens = match r.max_tokens {
             Some(n) => n,
             None => self.budget(r).await?,
@@ -189,32 +258,24 @@ impl Client {
             let text = resp.text().await.unwrap_or_default();
             bail!("{status}: {}", text.chars().take(300).collect::<String>());
         }
-        let state = (resp.bytes_stream(), Vec::<u8>::new(), false);
-        Ok(futures_util::stream::unfold(state, |(mut bytes, mut buf, done)| async move {
+        let state = (resp.bytes_stream().eventsource(), false);
+        Ok(futures_util::stream::unfold(state, |(mut events, done)| async move {
             if done {
                 return None;
             }
             loop {
-                // Drain complete lines before reading more bytes.
-                while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
-                    let line: Vec<u8> = buf.drain(..=nl).collect();
-                    match parse_sse_line(&String::from_utf8_lossy(&line)) {
-                        Sse::Delta(d) => return Some((Ok(d), (bytes, buf, false))),
+                let error = match events.next().await {
+                    // Without `[DONE]`, the output may be cut short.
+                    None => anyhow::anyhow!("incomplete response: stream ended before [DONE]"),
+                    Some(Err(e)) => e.into(),
+                    Some(Ok(event)) => match parse_data(&event.data) {
+                        Sse::Chunk(c) => return Some((Ok(c), (events, false))),
                         Sse::Done => return None,
-                        Sse::Error(e) => return Some((Err(anyhow::anyhow!(e)), (bytes, buf, true))),
-                        Sse::Skip => {}
-                    }
-                }
-                match bytes.next().await {
-                    None => {
-                        return Some((
-                            Err(anyhow::anyhow!("incomplete response: stream ended before [DONE]")),
-                            (bytes, buf, true),
-                        ));
-                    }
-                    Some(Ok(chunk)) => buf.extend_from_slice(&chunk),
-                    Some(Err(e)) => return Some((Err(e.into()), (bytes, buf, true))),
-                }
+                        Sse::Error(e) => anyhow::anyhow!(e),
+                        Sse::Skip => continue,
+                    },
+                };
+                return Some((Err(error), (events, true)));
             }
         }))
     }
@@ -244,8 +305,10 @@ impl Client {
     pub async fn complete(&self, r: &Rewrite) -> anyhow::Result<String> {
         let mut s = std::pin::pin!(self.stream(r).await?);
         let mut out = String::new();
-        while let Some(d) = s.next().await {
-            out.push_str(&d?);
+        while let Some(chunk) = s.next().await {
+            if let Chunk::Text(t) = chunk? {
+                out.push_str(&t);
+            }
         }
         if out.trim().is_empty() {
             bail!("the model returned nothing");
@@ -283,15 +346,14 @@ fn control_token(parsed: &[Token], plain: &[Token]) -> Option<String> {
 
 #[derive(Debug, PartialEq)]
 enum Sse {
-    Delta(String),
+    Chunk(Chunk),
     Done,
     Error(String),
     Skip,
 }
 
-fn parse_sse_line(line: &str) -> Sse {
-    let Some(data) = line.trim_end().strip_prefix("data:") else { return Sse::Skip };
-    let data = data.trim_start();
+/// One event's `data`, which the SSE parser has already unframed.
+fn parse_data(data: &str) -> Sse {
     if data.is_empty() {
         return Sse::Skip;
     }
@@ -314,16 +376,22 @@ fn parse_sse_line(line: &str) -> Sse {
         }
         _ => {}
     }
-    match v.pointer("/choices/0/delta/content").and_then(Value::as_str) {
-        Some(s) if !s.is_empty() => Sse::Delta(s.to_owned()),
-        _ => Sse::Skip,
+    if let Some(s) = v.pointer("/choices/0/delta/content").and_then(Value::as_str)
+        && !s.is_empty()
+    {
+        return Sse::Chunk(Chunk::Text(s.to_owned()));
     }
+    v.pointer("/usage/completion_tokens")
+        .and_then(Value::as_u64)
+        .map_or(Sse::Skip, |n| Sse::Chunk(Chunk::Usage(u32::try_from(n).unwrap_or(u32::MAX))))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use quillway_core::catalog::Sampling;
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn client(base: &str, api_key: Option<&str>, llama: bool) -> Client {
         Client::new(Endpoint {
@@ -336,54 +404,30 @@ mod tests {
         })
     }
 
-    type Requests = std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>>;
-
     /// Answer each `POST <path>` with the first route whose path matches and
-    /// whose needle is in the request body; record every request.
-    async fn serve(routes: Vec<(&'static str, &'static str, String)>) -> (String, Requests) {
-        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}/v1", listener.local_addr().unwrap());
-        let requests = Requests::default();
-        let seen = requests.clone();
-        tokio::spawn(async move {
-            loop {
-                let (socket, _) = listener.accept().await.unwrap();
-                let (reader, mut writer) = socket.into_split();
-                let mut reader = tokio::io::BufReader::new(reader);
-                let mut request_line = String::new();
-                reader.read_line(&mut request_line).await.unwrap();
-                let path = request_line.split_whitespace().nth(1).unwrap_or_default().to_owned();
-                let mut content_length = 0;
-                loop {
-                    let mut line = String::new();
-                    reader.read_line(&mut line).await.unwrap();
-                    if line == "\r\n" {
-                        break;
-                    }
-                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                        content_length = value.trim().parse().unwrap();
-                    }
-                }
-                let mut request_body = vec![0; content_length];
-                reader.read_exact(&mut request_body).await.unwrap();
-                let raw = String::from_utf8_lossy(&request_body).into_owned();
-                seen.lock().unwrap().push((path.clone(), serde_json::from_str(&raw).unwrap()));
-                let body = routes
-                    .iter()
-                    .find(|(p, needle, _)| *p == path && raw.contains(needle))
-                    .map_or("", |(_, _, b)| b.as_str());
-                let response =
-                    format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
-                writer.write_all(response.as_bytes()).await.unwrap();
-            }
-        });
-        (base, requests)
+    /// whose needle is in the request body (mocks with equal priority match in
+    /// mount order); anything else gets a 404. The server stops when dropped.
+    async fn serve(routes: Vec<(&'static str, &'static str, String)>) -> (String, MockServer) {
+        let server = MockServer::start().await;
+        for (p, needle, body) in routes {
+            Mock::given(method("POST"))
+                .and(path(p))
+                .and(body_string_contains(needle))
+                .respond_with(ResponseTemplate::new(200).set_body_string(body))
+                .mount(&server)
+                .await;
+        }
+        (format!("{}/v1", server.uri()), server)
     }
 
-    async fn serve_sse(body: &'static str) -> String {
-        serve(vec![("/v1/chat/completions", "", body.to_owned())]).await.0
+    async fn serve_sse(body: &'static str) -> (String, MockServer) {
+        serve(vec![("/v1/chat/completions", "", body.to_owned())]).await
+    }
+
+    /// Every request the server received, as (path, JSON body).
+    async fn received(server: &MockServer) -> Vec<(String, Value)> {
+        let requests = server.received_requests().await.unwrap();
+        requests.iter().map(|r| (r.url.path().to_owned(), r.body_json().unwrap())).collect()
     }
 
     const DONE: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"Ok\"}}]}\n\ndata: [DONE]\n\n";
@@ -394,14 +438,14 @@ mod tests {
 
     #[tokio::test]
     async fn incomplete_stream_is_an_error() {
-        let base = serve_sse("data: {\"choices\":[{\"delta\":{\"content\":\"Partial\"}}]}\n\n").await;
+        let (base, _server) = serve_sse("data: {\"choices\":[{\"delta\":{\"content\":\"Partial\"}}]}\n\n").await;
         let error = client(&base, None, false).complete(&request()).await.unwrap_err();
         assert!(error.to_string().contains("incomplete"), "{error}");
     }
 
     #[tokio::test]
     async fn token_limit_is_an_error() {
-        let base = serve_sse(
+        let (base, _server) = serve_sse(
             "data: {\"choices\":[{\"delta\":{\"content\":\"Partial\"}}]}\n\n\
              data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n\
              data: [DONE]\n\n",
@@ -413,7 +457,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_stop_finish_reason_is_an_error() {
-        let base = serve_sse(
+        let (base, _server) = serve_sse(
             "data: {\"choices\":[{\"delta\":{\"content\":\"Partial\"}}]}\n\n\
              data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"content_filter\"}]}\n\n\
              data: [DONE]\n\n",
@@ -429,7 +473,7 @@ mod tests {
             let body = format!(
                 "data: {{\"choices\":[{{\"delta\":{{\"content\":\"Done\"}},\"finish_reason\":\"{reason}\"}}]}}\n\ndata: [DONE]\n\n"
             );
-            let base = serve(vec![("/v1/chat/completions", "", body)]).await.0;
+            let (base, _server) = serve(vec![("/v1/chat/completions", "", body)]).await;
             let text = client(&base, None, false).complete(&request()).await.unwrap();
             assert_eq!(text, "Done", "{reason:?}");
         }
@@ -437,7 +481,7 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_data_after_a_delta_is_an_error() {
-        let base = serve_sse(
+        let (base, _server) = serve_sse(
             "data: {\"choices\":[{\"delta\":{\"content\":\"Partial\"}}]}\n\n\
              data: {bad json}\n\n\
              data: [DONE]\n\n",
@@ -449,21 +493,22 @@ mod tests {
 
     #[tokio::test]
     async fn complete_stream_returns_text() {
-        let base = serve_sse("data: {\"choices\":[{\"delta\":{\"content\":\"Complete\"}}]}\n\ndata: [DONE]\n\n").await;
+        let (base, _server) =
+            serve_sse("data: {\"choices\":[{\"delta\":{\"content\":\"Complete\"}}]}\n\ndata: [DONE]\n\n").await;
         let text = client(&base, None, false).complete(&request()).await.unwrap();
         assert_eq!(text, "Complete");
     }
 
     #[tokio::test]
     async fn empty_rewrite_is_an_error() {
-        let base = serve_sse("data: [DONE]\n\n").await;
+        let (base, _server) = serve_sse("data: [DONE]\n\n").await;
         let error = client(&base, None, false).complete(&request()).await.unwrap_err();
         assert!(error.to_string().contains("nothing"), "{error}");
     }
 
     #[tokio::test]
     async fn llama_budget_uses_the_servers_token_counts() {
-        let (base, requests) = serve(vec![
+        let (base, server) = serve(vec![
             ("/apply-template", "", "{\"prompt\":\"rendered\"}".to_owned()),
             ("/tokenize", "", tokens(&vec![1; 3000])),
             ("/v1/chat/completions", "", DONE.to_owned()),
@@ -472,7 +517,8 @@ mod tests {
         let r = Rewrite { max_tokens: None, ..request() };
         let text = client(&base, Some("k"), true).complete(&r).await.unwrap();
         assert_eq!(text, "Ok");
-        let body = |path: &str| requests.lock().unwrap().iter().find(|(p, _)| p == path).unwrap().1.clone();
+        let requests = received(&server).await;
+        let body = |path: &str| requests.iter().find(|(p, _)| p == path).unwrap().1.clone();
         // Both the rendered prompt and the text count 3000: room 5192, cap 6000.
         assert_eq!(body("/v1/chat/completions")["max_tokens"], 5192);
         assert_eq!(body("/apply-template")["chat_template_kwargs"]["enable_thinking"], false);
@@ -486,7 +532,7 @@ mod tests {
 
     #[tokio::test]
     async fn text_spelling_out_a_control_token_is_rejected() {
-        let (base, requests) = serve(vec![
+        let (base, server) = serve(vec![
             ("/apply-template", "", "{\"prompt\":\"rendered\"}".to_owned()),
             ("/tokenize", "\"parse_special\":false", tokens(&[1, 2, 3, 4, 5])),
             ("/tokenize", "", tokens(&[1, 9, 5])),
@@ -496,12 +542,12 @@ mod tests {
         let r = Rewrite { max_tokens: None, ..request() };
         let error = client(&base, None, true).complete(&r).await.unwrap_err();
         assert!(error.to_string().contains("`<|im_end|>`, a control token"), "{error}");
-        assert!(requests.lock().unwrap().iter().all(|(p, _)| p != "/v1/chat/completions"));
+        assert!(received(&server).await.iter().all(|(p, _)| p != "/v1/chat/completions"));
     }
 
     #[tokio::test]
     async fn control_token_is_rejected_when_template_counting_is_unavailable() {
-        let (base, requests) = serve(vec![
+        let (base, server) = serve(vec![
             ("/tokenize", "\"parse_special\":false", tokens(&[1, 2, 3, 4, 5])),
             ("/tokenize", "", tokens(&[1, 9, 5])),
             ("/v1/chat/completions", "", DONE.to_owned()),
@@ -510,17 +556,18 @@ mod tests {
         let r = Rewrite { max_tokens: None, ..request() };
         let error = client(&base, None, true).complete(&r).await.unwrap_err();
         assert!(error.to_string().contains("`<|im_end|>`, a control token"), "{error}");
-        assert!(requests.lock().unwrap().iter().all(|(p, _)| p != "/v1/chat/completions"));
+        assert!(received(&server).await.iter().all(|(p, _)| p != "/v1/chat/completions"));
     }
 
     #[tokio::test]
     async fn a_server_that_cannot_count_falls_back_to_the_estimate() {
-        // An older llama-server: no /apply-template (the mock answers it with an empty body).
-        let (base, requests) = serve(vec![("/v1/chat/completions", "", DONE.to_owned())]).await;
+        // An older llama-server: no /apply-template or /tokenize (the mock answers 404).
+        let (base, server) = serve(vec![("/v1/chat/completions", "", DONE.to_owned())]).await;
         let r = Rewrite { max_tokens: None, ..request() };
         let text = client(&base, None, true).complete(&r).await.unwrap();
         assert_eq!(text, "Ok");
-        let chat = requests.lock().unwrap().iter().find(|(p, _)| p == "/v1/chat/completions").unwrap().1.clone();
+        let requests = received(&server).await;
+        let chat = &requests.iter().find(|(p, _)| p == "/v1/chat/completions").unwrap().1;
         assert_eq!(chat["max_tokens"], 1024);
     }
 
@@ -535,17 +582,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn text_containing_the_delimiter_is_rejected_before_any_request() {
+        let (base, server) = serve(vec![]).await;
+        let r = Rewrite { text: "a </text> b".into(), ..request() };
+        let error = client(&base, None, false).complete(&r).await.unwrap_err();
+        assert!(error.to_string().contains("delimiter"), "{error}");
+        assert!(received(&server).await.is_empty());
+    }
+
+    #[test]
+    fn timing_prefers_the_servers_token_count() {
+        let mut t = Timing::start();
+        for _ in 0..9 {
+            t.record(&Chunk::Text("x".into()));
+        }
+        assert_eq!(t.tokens(), 9);
+        t.record(&Chunk::Usage(8));
+        assert_eq!(t.tokens(), 8);
+        assert!(t.first_token().is_some());
+    }
+
+    #[tokio::test]
     async fn text_too_long_for_the_context_is_rejected_before_generating() {
-        let (base, requests) = serve(vec![]).await;
+        let (base, server) = serve(vec![]).await;
         let r = Rewrite { max_tokens: None, text: "x".repeat(30_000), ..request() };
         let error = client(&base, None, false).complete(&r).await.unwrap_err();
         assert!(error.to_string().contains("too long"), "{error}");
-        assert!(requests.lock().unwrap().is_empty());
+        assert!(received(&server).await.is_empty());
     }
 
     #[tokio::test]
     async fn warm_up_ignores_its_own_token_limit() {
-        let base = serve_sse(
+        let (base, _server) = serve_sse(
             "data: {\"choices\":[{\"delta\":{\"content\":\"Ok\"}}]}\n\n\
              data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n\
              data: [DONE]\n\n",
@@ -556,18 +624,36 @@ mod tests {
 
     #[tokio::test]
     async fn warm_up_requires_a_token() {
-        let base = serve_sse("data: [DONE]\n\n").await;
+        let (base, _server) = serve_sse("data: [DONE]\n\n").await;
         let error = client(&base, None, true).warm_up().await.unwrap_err();
         assert!(error.to_string().contains("no token"), "{error}");
     }
 
     #[test]
-    fn parses_sse() {
-        assert_eq!(parse_sse_line(r#"data: {"choices":[{"delta":{"content":"Hi"}}]}"#), Sse::Delta("Hi".into()));
-        assert_eq!(parse_sse_line("data: [DONE]"), Sse::Done);
-        assert_eq!(parse_sse_line(": keep-alive"), Sse::Skip);
-        assert_eq!(parse_sse_line(r#"data: {"choices":[{"delta":{"role":"assistant"}}]}"#), Sse::Skip);
-        assert_eq!(parse_sse_line(r#"data: {"error":{"message":"boom"}}"#), Sse::Error("boom".into()));
+    fn parses_event_data() {
+        assert_eq!(
+            parse_data(r#"{"choices":[{"delta":{"content":"Hi"}}],"usage":null}"#),
+            Sse::Chunk(Chunk::Text("Hi".into()))
+        );
+        assert_eq!(
+            parse_data(r#"{"choices":[],"usage":{"completion_tokens":8,"prompt_tokens":14}}"#),
+            Sse::Chunk(Chunk::Usage(8))
+        );
+        assert_eq!(parse_data("[DONE]"), Sse::Done);
+        assert_eq!(parse_data(r#"{"choices":[{"delta":{"role":"assistant"}}]}"#), Sse::Skip);
+        assert_eq!(parse_data(r#"{"error":{"message":"boom"}}"#), Sse::Error("boom".into()));
+    }
+
+    #[tokio::test]
+    async fn sse_framing_follows_the_spec() {
+        // CRLF line endings, a comment, an event name, and a text split over two `data:` lines.
+        let (base, _server) = serve_sse(
+            ": keep-alive\r\n\r\n\
+             event: message\r\ndata: {\"choices\":[{\"delta\":\r\ndata: {\"content\":\"Ok\"}}]}\r\n\r\n\
+             data: [DONE]\r\n\r\n",
+        )
+        .await;
+        assert_eq!(client(&base, None, false).complete(&request()).await.unwrap(), "Ok");
     }
 
     #[test]
@@ -579,5 +665,6 @@ mod tests {
         assert_eq!(ours["top_k"], 20);
         assert!(byo.get("top_k").is_none() && byo.get("chat_template_kwargs").is_none());
         assert_eq!(byo["stop"][0], "</text>");
+        assert_eq!(byo["stream_options"]["include_usage"], true);
     }
 }

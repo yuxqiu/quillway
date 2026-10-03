@@ -15,7 +15,7 @@ use quillway_core::config::Config;
 use quillway_core::ipc::Endpoint;
 use tokio::sync::Mutex;
 
-pub use client::{Client, Rewrite};
+pub use client::{Chunk, Client, Rewrite, Timing};
 pub use models::Active;
 
 /// Shared handle to the model backend; clones share one server.
@@ -44,7 +44,11 @@ impl Engine {
     }
 
     /// The model the next request will use.
-    pub async fn active(&self) -> Active {
+    ///
+    /// # Errors
+    ///
+    /// As [`models::active`].
+    pub async fn active(&self) -> anyhow::Result<Active> {
         models::active(&self.inner.lock().await.config)
     }
 
@@ -52,12 +56,12 @@ impl Engine {
     ///
     /// # Errors
     ///
-    /// The model isn't installed, or llama-server fails to start.
+    /// The model is unknown or isn't installed, or llama-server fails to start.
     #[expect(clippy::significant_drop_tightening, reason = "held across startup so callers share one server")]
     pub async fn client(&self) -> anyhow::Result<Client> {
         let mut inner = self.inner.lock().await;
         let cfg = inner.config.model.clone();
-        let active = models::active(&inner.config);
+        let active = models::active(&inner.config)?;
         if let Some(base) = cfg.endpoint {
             drop(inner);
             return Ok(Client::new(Endpoint {

@@ -57,20 +57,17 @@ pub async fn run() -> anyhow::Result<()> {
             }
             Err(e) => check(false, "llama-server", format!("{bin}: {e}")),
         }
-        let active = models::active(&config);
-        check(
-            active.path.is_file(),
-            "model",
-            format!(
-                "{} ({})",
-                active.name,
-                if active.path.is_file() {
-                    active.path.display().to_string()
-                } else {
-                    format!("not installed: run `quillway models install {}`", active.id)
-                }
+        match models::active(&config) {
+            Ok(active) if active.path.is_file() => {
+                check(true, "model", format!("{} ({})", active.name, active.path.display()));
+            }
+            Ok(active) => check(
+                false,
+                "model",
+                format!("{} (not installed: run `quillway models install {}`)", active.name, active.id),
             ),
-        );
+            Err(e) => check(false, "model", format!("{e:#}")),
+        }
     }
 
     match crate::ipc::send(&Request::Status).await {

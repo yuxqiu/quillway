@@ -153,15 +153,15 @@ fn remove_if_present(path: &Path) -> anyhow::Result<bool> {
     }
 }
 
+/// An exclusive `flock` (what std uses on Linux), held until the file is dropped.
 fn lock(dest: &Path) -> anyhow::Result<std::fs::File> {
-    use std::os::fd::AsRawFd;
     let path = lock_path(dest);
     let f = std::fs::File::create(&path).with_context(|| format!("creating {}", path.display()))?;
-    // SAFETY: `f` is an open file descriptor for the duration of the call.
-    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        bail!("another download of {} is already running", dest.display());
+    match f.try_lock() {
+        Ok(()) => Ok(f),
+        Err(std::fs::TryLockError::WouldBlock) => bail!("another download of {} is already running", dest.display()),
+        Err(std::fs::TryLockError::Error(e)) => Err(e).with_context(|| format!("locking {}", path.display())),
     }
-    Ok(f)
 }
 
 async fn hash_existing(part: &Path, hasher: &mut Sha256) -> anyhow::Result<u64> {
@@ -192,69 +192,102 @@ fn ensure_space(dir: &Path, need: u64) -> anyhow::Result<()> {
 }
 
 fn free_bytes(dir: &Path) -> anyhow::Result<u64> {
-    use std::os::unix::ffi::OsStrExt;
-    let c = std::ffi::CString::new(dir.as_os_str().as_bytes())?;
-    let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
-    // SAFETY: `c` is a valid NUL-terminated path and `s` a writable statvfs.
-    if unsafe { libc::statvfs(c.as_ptr(), &raw mut s) } != 0 {
-        return Err(std::io::Error::last_os_error()).context("statvfs");
-    }
-    Ok(s.f_bavail as u64 * s.f_frsize as u64)
+    let s = rustix::fs::statvfs(dir).with_context(|| format!("statvfs {}", dir.display()))?;
+    Ok(s.f_bavail * s.f_frsize)
 }
 
-/// `1.3 GB` / `731 MB`.
+/// `1.3 GB` / `731.0 MB` / `420.0 kB`: decimal (SI) units, as model sizes are published.
 #[must_use]
-#[expect(clippy::cast_precision_loss, reason = "display only")]
 pub fn human(bytes: u64) -> String {
-    let b = bytes as f64;
-    if b >= 1e9 { format!("{:.1} GB", b / 1e9) } else { format!("{:.0} MB", b / 1e6) }
+    bytesize::ByteSize(bytes).display().si().to_string()
+}
+
+/// Download speed and time left from indicatif's estimator (on a hidden bar),
+/// so the CLI line and the popup card show the same numbers.
+#[derive(Debug, Clone, Default)]
+pub struct Rate(Option<indicatif::ProgressBar>);
+
+impl Rate {
+    /// Note the bytes done so far.
+    pub fn update(&mut self, done: u64, total: u64) {
+        if let Some(bar) = &self.0 {
+            // A position going backwards (the server ignored `Range`) resets the estimate.
+            bar.set_position(done);
+            return;
+        }
+        // The first update is the baseline: bytes resumed from a `.part` aren't speed.
+        let bar = indicatif::ProgressBar::hidden();
+        bar.set_length(total);
+        bar.set_position(done);
+        bar.tick();
+        bar.reset_eta();
+        self.0 = Some(bar);
+    }
+
+    /// `45.0 MB/s, 2m left`; `None` until a second of transfer has been measured.
+    #[must_use]
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "whole bytes per second")]
+    pub fn describe(&self) -> Option<String> {
+        let bar = self.0.as_ref().filter(|b| b.elapsed() >= Duration::from_secs(1))?;
+        let speed = bar.per_sec();
+        (speed >= 1.0).then(|| format!("{}/s, {:#} left", human(speed as u64), indicatif::HumanDuration(bar.eta())))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Serve `data` over HTTP, honouring `Range: bytes=N-`.
-    async fn serve(data: Vec<u8>) -> String {
-        use tokio::io::AsyncBufReadExt;
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}/model.gguf", l.local_addr().unwrap());
-        tokio::spawn(async move {
-            loop {
-                let (sock, _) = l.accept().await.unwrap();
-                let data = data.clone();
-                tokio::spawn(async move {
-                    let (r, mut w) = sock.into_split();
-                    let mut lines = tokio::io::BufReader::new(r).lines();
-                    let mut start = 0usize;
-                    while let Ok(Some(line)) = lines.next_line().await {
-                        if line.is_empty() {
-                            break;
-                        }
-                        if let Some(v) = line.to_ascii_lowercase().strip_prefix("range: bytes=") {
-                            start = v.trim_end_matches('-').parse().unwrap();
-                        }
-                    }
-                    let body = &data[start..];
-                    let status = if start > 0 { "206 Partial Content" } else { "200 OK" };
-                    let head =
-                        format!("HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len());
-                    w.write_all(head.as_bytes()).await.unwrap();
-                    w.write_all(body).await.unwrap();
-                });
-            }
-        });
-        url
+    /// Answers with the bytes from the `Range: bytes=N-` offset on, like a CDN.
+    struct Ranged(Vec<u8>);
+
+    impl wiremock::Respond for Ranged {
+        fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
+            let start = request
+                .headers
+                .get("range")
+                .and_then(|v| v.to_str().ok()?.strip_prefix("bytes=")?.trim_end_matches('-').parse().ok())
+                .unwrap_or(0);
+            wiremock::ResponseTemplate::new(if start > 0 { 206 } else { 200 }).set_body_bytes(&self.0[start..])
+        }
+    }
+
+    /// Serve `data`; the server stops when the returned handle is dropped.
+    async fn serve(data: Vec<u8>) -> (String, wiremock::MockServer) {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::path("/model.gguf")).respond_with(Ranged(data)).mount(&server).await;
+        (format!("{}/model.gguf", server.uri()), server)
     }
 
     fn sha(data: &[u8]) -> String {
         format!("{:x}", Sha256::digest(data))
     }
 
+    #[test]
+    fn sizes_use_decimal_units() {
+        assert_eq!(human(0), "0 B");
+        assert_eq!(human(731_000_000), "731.0 MB");
+        assert_eq!(human(2_740_000_000), "2.7 GB");
+    }
+
+    #[test]
+    fn rate_does_not_count_resumed_bytes() {
+        let mut rate = Rate::default();
+        rate.update(1_000_000_000, 2_000_000_000); // resumed a 1 GB `.part`
+        assert_eq!(rate.describe(), None, "nothing measured yet");
+        std::thread::sleep(Duration::from_millis(1100));
+        rate.update(1_001_000_000, 2_000_000_000); // about 1 MB/s since the resume
+        rate.0.as_ref().unwrap().tick();
+        let text = rate.describe().expect("a second was measured");
+        assert!(text.ends_with(" left"), "{text}");
+        let speed: f64 = text.split(' ').next().unwrap().parse().unwrap();
+        assert!(text.contains(" kB/s") || (text.contains(" MB/s") && speed < 2.0), "resumed bytes counted: {text}");
+    }
+
     #[tokio::test]
     async fn downloads_and_verifies() {
         let data: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
-        let url = serve(data.clone()).await;
+        let (url, _server) = serve(data.clone()).await;
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("a/b/model.gguf");
         let mut last = None;
@@ -268,7 +301,7 @@ mod tests {
     #[tokio::test]
     async fn resumes_from_partial_file() {
         let data: Vec<u8> = (0..100_000u32).map(|i| (i % 13) as u8).collect();
-        let url = serve(data.clone()).await;
+        let (url, _server) = serve(data.clone()).await;
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("model.gguf");
         std::fs::write(part_path(&dest), &data[..40_000]).unwrap();
@@ -285,7 +318,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_corrupt_download() {
         let data = vec![7u8; 5000];
-        let url = serve(data.clone()).await;
+        let (url, _server) = serve(data.clone()).await;
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("model.gguf");
         let err =
@@ -312,8 +345,6 @@ mod tests {
 
     #[test]
     fn removal_keeps_the_lock_identity_for_a_waiting_downloader() {
-        use std::os::fd::AsRawFd;
-
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("model.gguf");
         std::fs::write(&dest, b"model").unwrap();
@@ -321,7 +352,8 @@ mod tests {
 
         assert!(remove(&dest).unwrap());
         // This descriptor represents a downloader that opened the lock before removal.
-        assert_eq!(unsafe { libc::flock(waiting.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
+        // Blocking: a test forking in parallel can briefly hold a copy of `remove`'s lock fd.
+        waiting.lock().unwrap();
         assert!(lock(&dest).unwrap_err().to_string().contains("already running"));
     }
 

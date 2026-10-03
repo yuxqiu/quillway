@@ -1,15 +1,22 @@
 //! Unix-socket IPC: the CLI sends one JSON line, the daemon answers with one.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use std::{os::unix::fs::PermissionsExt, path::Path};
 
 use anyhow::{Context, bail};
 use futures_util::Stream;
 use quillway_core::ipc::{Request, Response};
 use quillway_core::paths;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
+
+/// Largest request the daemon reads: 1 MiB of `--stdin` text, even if JSON
+/// escaping grows it several times over.
+const MAX_REQUEST: u64 = 8 << 20;
+/// A client has this long to send its request; the CLI sends it at once.
+const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub async fn send(req: &Request) -> anyhow::Result<Response> {
     let path = paths::socket();
@@ -79,10 +86,18 @@ pub fn serve(listener: std::os::unix::net::UnixListener) -> impl Stream<Item = (
     let listener = UnixListener::from_std(listener).expect("tokio runtime");
     tokio::spawn(async move {
         loop {
-            let Ok((stream, _)) = listener.accept().await else { continue };
+            let stream = match listener.accept().await {
+                Ok((stream, _)) => stream,
+                Err(e) => {
+                    // E.g. out of file descriptors: back off instead of spinning.
+                    eprintln!("quillway: ipc: accepting a connection: {e}");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
             let tx = tx.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle(stream, tx).await {
+                if let Err(e) = handle(stream, tx, READ_TIMEOUT).await {
                     eprintln!("quillway: ipc: {e:#}");
                 }
             });
@@ -91,19 +106,34 @@ pub fn serve(listener: std::os::unix::net::UnixListener) -> impl Stream<Item = (
     futures_util::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|item| (item, rx)) })
 }
 
-async fn handle(stream: UnixStream, tx: mpsc::Sender<(Request, Reply)>) -> anyhow::Result<()> {
+async fn handle(stream: UnixStream, tx: mpsc::Sender<(Request, Reply)>, read_timeout: Duration) -> anyhow::Result<()> {
     let (r, mut w) = stream.into_split();
-    let mut line = String::new();
-    BufReader::new(r).read_line(&mut line).await?;
-    let resp = match serde_json::from_str::<Request>(&line) {
+    let resp = match read_request(r, read_timeout).await {
         Ok(req) => {
             let (otx, orx) = oneshot::channel();
             tx.send((req, Reply::new(otx))).await?;
             orx.await.unwrap_or_else(|_| Response::Error { message: "daemon dropped the request".into() })
         }
-        Err(e) => Response::Error { message: format!("bad request: {e}") },
+        Err(message) => Response::Error { message },
     };
     write_line(&mut w, serde_json::to_string(&resp)?).await
+}
+
+/// One request line, bounded in size and time. Errors are the reply's message;
+/// only an unparseable request starts with "bad request", which `rewrite` reads
+/// as an outdated daemon.
+async fn read_request(r: impl AsyncRead + Unpin, read_timeout: Duration) -> Result<Request, String> {
+    let mut line = String::new();
+    let mut reader = BufReader::new(r.take(MAX_REQUEST));
+    match tokio::time::timeout(read_timeout, reader.read_line(&mut line)).await {
+        Err(_) => return Err("timed out waiting for the request".into()),
+        Ok(Err(e)) => return Err(format!("unreadable request: {e}")),
+        Ok(Ok(_)) => {}
+    }
+    if !line.ends_with('\n') && line.len() as u64 == MAX_REQUEST {
+        return Err(format!("the request is larger than {} MiB", MAX_REQUEST >> 20));
+    }
+    serde_json::from_str(&line).map_err(|e| format!("bad request: {e}"))
 }
 
 /// One JSON value per line.
@@ -124,5 +154,65 @@ mod tests {
         let _listener = bind_at(&path).unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         assert!(bind_at(&path).unwrap_err().to_string().contains("already running"));
+    }
+
+    /// Run `handle` on one end of a socket pair; the other end is the client.
+    fn spawn_handler(read_timeout: Duration) -> (UnixStream, mpsc::Receiver<(Request, Reply)>) {
+        let (client, server) = UnixStream::pair().unwrap();
+        let (tx, rx) = mpsc::channel(1);
+        tokio::spawn(handle(server, tx, read_timeout));
+        (client, rx)
+    }
+
+    async fn response(client: UnixStream) -> Response {
+        let mut line = String::new();
+        BufReader::new(client).read_line(&mut line).await.unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+
+    fn error(r: Response) -> String {
+        let Response::Error { message } = r else { panic!("expected an error, got {r:?}") };
+        message
+    }
+
+    #[tokio::test]
+    async fn an_oversized_request_is_refused_without_buffering_it() {
+        let (client, _rx) = spawn_handler(READ_TIMEOUT);
+        let (r, mut w) = client.into_split();
+        // More than the cap and no newline; the daemon stops reading at the cap.
+        let writer = tokio::spawn(async move {
+            let chunk = vec![b'x'; 1 << 20];
+            for _ in 0..(MAX_REQUEST >> 20) + 2 {
+                if w.write_all(&chunk).await.is_err() {
+                    break; // the daemon answered and closed
+                }
+            }
+        });
+        let mut line = String::new();
+        BufReader::new(r).read_line(&mut line).await.unwrap();
+        let message = error(serde_json::from_str(&line).unwrap());
+        assert!(message.contains("larger than 8 MiB"), "{message}");
+        writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_idle_client_is_answered_and_dropped() {
+        let (client, _rx) = spawn_handler(Duration::from_millis(50));
+        assert!(error(response(client).await).contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn invalid_utf8_gets_an_answer() {
+        let (mut client, _rx) = spawn_handler(READ_TIMEOUT);
+        client.write_all(b"\xff\xfe\n").await.unwrap();
+        let message = error(response(client).await);
+        assert!(message.starts_with("unreadable request"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn malformed_json_reads_as_a_bad_request() {
+        let (mut client, _rx) = spawn_handler(READ_TIMEOUT);
+        client.write_all(b"{\"cmd\":\"from-the-future\"}\n").await.unwrap();
+        assert!(error(response(client).await).starts_with("bad request"));
     }
 }

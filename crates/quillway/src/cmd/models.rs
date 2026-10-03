@@ -8,7 +8,7 @@ use quillway_core::catalog::{self, Entry};
 use quillway_core::config::Config;
 use quillway_core::ipc::{Request, Response};
 use quillway_core::paths;
-use quillway_engine::download::{self, Job, human};
+use quillway_engine::download::{self, Job, Rate, human};
 use quillway_engine::models::{self, State, is_installed};
 
 #[derive(Subcommand)]
@@ -32,12 +32,13 @@ pub async fn run(cmd: ModelsCmd) -> anyhow::Result<()> {
     let config = Config::load(&paths::config_file())?;
     match cmd {
         ModelsCmd::List => {
-            let active = models::active(&config);
+            // Still list the catalog when the choice is broken: it's where a new one comes from.
+            let active = models::active(&config).inspect_err(|e| eprintln!("warning: {e:#}")).ok();
             for e in catalog::all() {
-                let star = if e.id == active.id { "★" } else { " " };
+                let star = if active.as_ref().is_some_and(|a| a.id == e.id) { "★" } else { " " };
                 let tick = if is_installed(e) { "✓" } else { " " };
                 println!(
-                    "{star} {tick} {:<14} {:<13} {:>7}  {:<8}  {}",
+                    "{star} {tick} {:<14} {:<13} {:>8}  {:<8}  {}",
                     e.id,
                     e.name,
                     human(e.size),
@@ -45,8 +46,8 @@ pub async fn run(cmd: ModelsCmd) -> anyhow::Result<()> {
                     e.license
                 );
             }
-            if active.entry.is_none() {
-                println!("★ ✓ {}", active.id);
+            if let Some(custom) = active.filter(|a| a.entry.is_none()) {
+                println!("★ ✓ {}", custom.id);
             }
             if config.model.active.is_some() {
                 println!("\n(active model is pinned by `model.active` in {})", paths::config_file().display());
@@ -63,7 +64,7 @@ pub async fn run(cmd: ModelsCmd) -> anyhow::Result<()> {
             }
             install(e).await?;
             println!("installed {} → {}", e.name, e.path_in(&paths::models_dir()).display());
-            if models::active(&config).id == e.id {
+            if models::active(&config).is_ok_and(|a| a.id == e.id) {
                 // A daemon started before the download shows "not installed" until told.
                 reload_daemon().await;
             } else {
@@ -99,7 +100,7 @@ pub async fn run(cmd: ModelsCmd) -> anyhow::Result<()> {
             let path = e.path_in(&paths::models_dir());
             if download::remove(&path)? {
                 println!("removed {}", path.display());
-                if models::active(&config).id == e.id {
+                if models::active(&config).is_ok_and(|a| a.id == e.id) {
                     reload_daemon().await;
                 }
             } else {
@@ -133,12 +134,16 @@ async fn install(e: &Entry) -> anyhow::Result<()> {
     let url = e.url();
     let tty = std::io::stderr().is_terminal();
     let mut last_pct = u64::MAX;
+    let mut rate = Rate::default();
     let result = download::download(Job { url: &url, dest: &dest, size: e.size, sha256: &e.sha256 }, |p| {
+        rate.update(p.done, p.total);
         let pct = p.done * 100 / p.total.max(1);
         if pct != last_pct && (tty || pct % 10 == 0) {
             last_pct = pct;
-            let end = if tty { "\r" } else { "\n" };
-            eprint!("{:<13} {pct:>3}%  {} / {}{end}", e.name, human(p.done), human(p.total));
+            let speed = rate.describe().map_or_else(String::new, |r| format!("  {r}"));
+            // On a terminal, redraw in place and clear what a longer previous line left.
+            let end = if tty { "\x1b[K\r" } else { "\n" };
+            eprint!("{:<13} {pct:>3}%  {} / {}{speed}{end}", e.name, human(p.done), human(p.total));
         }
     })
     .await;

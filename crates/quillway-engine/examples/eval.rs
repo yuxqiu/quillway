@@ -6,12 +6,11 @@
 //! quotes, fences), latency after warm-up, and every output for eyeballing.
 
 use std::fmt::Write;
-use std::time::Instant;
 
 use futures_util::StreamExt;
 use quillway_core::clean;
 use quillway_core::config::{Config, default_presets};
-use quillway_engine::{Engine, Rewrite};
+use quillway_engine::{Chunk, Engine, Rewrite, Timing};
 
 const TEXTS: [&str; 10] = [
     "their going to the park tomorow, weather permiting. we was hoping you could came to.",
@@ -41,7 +40,7 @@ async fn main() -> anyhow::Result<()> {
         let mut config = Config::default();
         config.model.active = Some(id.clone());
         let engine = Engine::new(config.clone());
-        let active = engine.active().await;
+        let active = engine.active().await?;
         engine.warm_up().await?;
         let client = engine.client().await?;
 
@@ -55,20 +54,18 @@ async fn main() -> anyhow::Result<()> {
                     temperature: preset.temperature,
                     max_tokens: None,
                 };
-                let t0 = Instant::now();
-                let mut first = None;
-                let mut n = 0usize;
+                let mut timing = Timing::start();
                 let mut raw = String::new();
                 let mut s = std::pin::pin!(client.stream(&r).await?);
-                while let Some(d) = s.next().await {
-                    first.get_or_insert_with(|| t0.elapsed());
-                    n += 1;
-                    raw.push_str(&d?);
+                while let Some(chunk) = s.next().await {
+                    let chunk = chunk?;
+                    timing.record(&chunk);
+                    if let Chunk::Text(t) = chunk {
+                        raw.push_str(&t);
+                    }
                 }
-                let first = first.unwrap_or_default();
-                let gen_secs = t0.elapsed().saturating_sub(first).as_secs_f64().max(1e-3);
-                firsts.push(first.as_secs_f64());
-                rates.push(f64::from(u32::try_from(n.saturating_sub(1)).unwrap_or(u32::MAX)) / gen_secs);
+                firsts.push(timing.first_token().unwrap_or_default().as_secs_f64());
+                rates.push(timing.rate());
                 let out = clean::clean(&raw, text, true);
                 let needed = out.trim() != raw.trim();
                 cleaned += usize::from(needed);

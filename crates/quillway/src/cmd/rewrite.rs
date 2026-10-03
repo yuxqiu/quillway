@@ -6,8 +6,8 @@ use anyhow::{Context, bail};
 use futures_util::StreamExt;
 use quillway_core::config::{Config, DEFAULT_TEMPERATURE};
 use quillway_core::ipc::{Request, Response};
-use quillway_core::{clean, paths, prompt};
-use quillway_engine::{Client, Engine, Rewrite};
+use quillway_core::{clean, paths};
+use quillway_engine::{Chunk, Client, Engine, Rewrite, Timing};
 
 #[derive(clap::Args)]
 pub struct RewriteArgs {
@@ -44,10 +44,6 @@ pub async fn run(a: RewriteArgs) -> anyhow::Result<()> {
     if text.trim().is_empty() {
         bail!("nothing to rewrite on stdin");
     }
-
-    if text.contains(prompt::STOP) {
-        bail!("the text contains `{}`, which Quillway uses as a delimiter", prompt::STOP);
-    }
     let t0 = std::time::Instant::now();
     // Share the daemon's model server; load our own only when no daemon runs.
     // `_engine` keeps that own server alive until we finish.
@@ -70,20 +66,20 @@ pub async fn run(a: RewriteArgs) -> anyhow::Result<()> {
     };
     let loaded = t0.elapsed();
     let req = Rewrite { instruction, max_tokens: None, text: text.clone(), temperature };
-    let t1 = std::time::Instant::now();
-    let mut first = None;
-    let mut deltas = 0usize;
+    let mut timing = Timing::start();
     let mut raw = String::new();
     let mut stream = std::pin::pin!(client.stream(&req).await?);
-    while let Some(d) = stream.next().await {
-        first.get_or_insert_with(|| t1.elapsed());
-        deltas += 1;
-        raw.push_str(&d?);
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        timing.record(&chunk);
+        if let Chunk::Text(t) = chunk {
+            raw.push_str(&t);
+        }
     }
+    let rate = timing.rate();
     if raw.trim().is_empty() {
         bail!("the model returned nothing");
     }
-    let total = t1.elapsed();
     let out = if a.raw { raw } else { clean::clean(&raw, &text, true) };
     if out.trim().is_empty() {
         bail!("the model returned nothing after cleanup");
@@ -93,15 +89,12 @@ pub async fn run(a: RewriteArgs) -> anyhow::Result<()> {
         println!();
     }
     if a.stats {
-        let first = first.unwrap_or_default();
-        let gen_secs = total.saturating_sub(first).as_secs_f64().max(1e-3);
         eprintln!(
-            "model {} · startup {:.1}s · first token {:.2}s · {} tokens · {:.1} tok/s",
+            "model {} · startup {:.1}s · first token {:.2}s · {} tokens · {rate:.1} tok/s",
             client.endpoint().model,
             loaded.as_secs_f64(),
-            first.as_secs_f64(),
-            deltas,
-            f64::from(u32::try_from(deltas.saturating_sub(1)).unwrap_or(u32::MAX)) / gen_secs
+            timing.first_token().unwrap_or_default().as_secs_f64(),
+            timing.tokens(),
         );
     }
     Ok(())

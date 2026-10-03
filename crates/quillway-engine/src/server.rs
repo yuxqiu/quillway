@@ -29,7 +29,7 @@ pub struct Server {
 impl Server {
     pub async fn start(model: &Path, cfg: &ModelConfig) -> anyhow::Result<Self> {
         let port = free_port()?;
-        let api_key: String = std::iter::repeat_with(fastrand::alphanumeric).take(32).collect();
+        let api_key = random_key()?;
         let bin = cfg.llama_server.clone().unwrap_or_else(|| "llama-server".into());
 
         let mut cmd = Command::new(&bin);
@@ -164,14 +164,19 @@ fn args(model: &Path, port: u16, cfg: &ModelConfig) -> Vec<String> {
 /// comes. A Ctrl+C or a `systemctl stop` signals both processes at once, so a
 /// SIGTERM here would merge with that one and leave the server running.
 fn die_with_parent(cmd: &mut std::process::Command) {
+    use rustix::process::{Signal, set_parent_process_death_signal};
     use std::os::unix::process::CommandExt;
     // SAFETY: prctl is async-signal-safe and touches no memory of the parent.
     unsafe {
-        cmd.pre_exec(|| {
-            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
-            Ok(())
-        });
+        cmd.pre_exec(|| Ok(set_parent_process_death_signal(Some(Signal::KILL))?));
     }
+}
+
+/// The bearer token that keeps other local processes off our server: 128 bits from the OS's CSPRNG.
+fn random_key() -> anyhow::Result<String> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).map_err(|e| anyhow::anyhow!("generating the server's API key: {e}"))?;
+    Ok(format!("{:032x}", u128::from_ne_bytes(bytes)))
 }
 
 fn free_port() -> anyhow::Result<u16> {
@@ -216,6 +221,14 @@ mod tests {
             assert!(start.elapsed() < Duration::from_secs(5), "child outlived its parent");
             std::thread::sleep(Duration::from_millis(20));
         };
-        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        assert_eq!(status.signal(), Some(rustix::process::Signal::KILL.as_raw()));
+    }
+
+    #[test]
+    fn api_keys_are_random_hex() {
+        let (a, b) = (super::random_key().unwrap(), super::random_key().unwrap());
+        assert_eq!(a.len(), 32);
+        assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b);
     }
 }

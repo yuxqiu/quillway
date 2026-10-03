@@ -56,7 +56,10 @@ impl SourceArg {
             return Ok(Input::Clipboard);
         }
         let mut s = String::new();
-        std::io::stdin().read_to_string(&mut s).context("reading stdin")?;
+        std::io::stdin().take(quillway_wl::MAX_BYTES + 1).read_to_string(&mut s).context("reading stdin")?;
+        if s.len() as u64 > quillway_wl::MAX_BYTES {
+            anyhow::bail!("stdin text is larger than the 1 MiB limit");
+        }
         Ok(Input::Text(s))
     }
 }

@@ -10,8 +10,9 @@ pub use watch::ClipboardWatch;
 use wl_clipboard_rs::copy::{self, Options};
 use wl_clipboard_rs::paste::{self, ClipboardType, Error, MimeType, Seat};
 
-/// Cap on captured text; larger contents aren't rewrite material.
-const MAX_BYTES: u64 = 1 << 20;
+/// Cap on text taken from the clipboard (and, in the CLI, from `--stdin`);
+/// larger contents aren't rewrite material.
+pub const MAX_BYTES: u64 = 1 << 20;
 
 /// Text on the clipboard; `Ok(None)` when it is empty or non-text.
 ///

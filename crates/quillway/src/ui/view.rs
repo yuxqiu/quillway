@@ -108,11 +108,12 @@ impl App {
         let line: Element<'_, Message> = match &self.install {
             Some(Install { error: Some(e), .. }) => text(e.as_str()).size(13).color(pal.error).into(),
             Some(i) => text(format!(
-                "Downloading {}… {} / {} ({}%)",
+                "Downloading {}… {} / {} ({}%){}",
                 i.entry.name,
                 human(i.done),
                 human(i.entry.size),
-                i.done * 100 / i.entry.size.max(1)
+                i.done * 100 / i.entry.size.max(1),
+                i.rate.describe().map_or_else(String::new, |r| format!(" · {r}"))
             ))
             .size(14)
             .color(pal.dim)

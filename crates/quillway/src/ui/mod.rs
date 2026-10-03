@@ -21,9 +21,9 @@ use iced_layershell::to_layer_message;
 use quillway_core::catalog::Entry;
 use quillway_core::config::{Config, DEFAULT_TEMPERATURE, Preset};
 use quillway_core::ipc::{Input, Request, Response};
-use quillway_core::{clean, paths, prompt};
+use quillway_core::{clean, paths};
 use quillway_engine::download::{self, Job};
-use quillway_engine::{Active, Engine, Rewrite, models};
+use quillway_engine::{Active, Chunk, Engine, Rewrite, Timing, models};
 
 use crate::ipc::{self, Reply};
 
@@ -39,26 +39,32 @@ static LISTENER: Mutex<Option<UnixListener>> = Mutex::new(None);
 pub fn run() -> anyhow::Result<()> {
     *LISTENER.lock().expect("listener lock") = Some(ipc::bind()?);
     let config = Config::load(&paths::config_file())?;
+    let active = models::active(&config)?;
     let watch = quillway_wl::ClipboardWatch::start()
         .inspect_err(|e| eprintln!("quillway: {e:#}; the clipboard will always count as recent"))
         .ok();
     // `Font::with_name` needs a `'static` name; this runs once per process.
     let default_font =
         config.ui.font.as_ref().map_or_else(iced::Font::default, |f| iced::Font::with_name(f.clone().leak()));
-    iced_layershell::daemon(move || App::boot(config.clone(), watch.clone()), namespace, App::update, App::view)
-        .subscription(App::subscription)
-        .style(|app: &App, _| iced::theme::Style {
-            background_color: iced::Color::TRANSPARENT,
-            text_color: app.palette.text,
-        })
-        .settings(Settings {
-            layer_settings: LayerShellSettings { start_mode: StartMode::Background, ..Default::default() },
-            default_font,
-            antialiasing: true,
-            ..Default::default()
-        })
-        .run()
-        .map_err(|e| anyhow::anyhow!("{e}"))
+    iced_layershell::daemon(
+        move || App::boot(config.clone(), active.clone(), watch.clone()),
+        namespace,
+        App::update,
+        App::view,
+    )
+    .subscription(App::subscription)
+    .style(|app: &App, _| iced::theme::Style {
+        background_color: iced::Color::TRANSPARENT,
+        text_color: app.palette.text,
+    })
+    .settings(Settings {
+        layer_settings: LayerShellSettings { start_mode: StartMode::Background, ..Default::default() },
+        default_font,
+        antialiasing: true,
+        ..Default::default()
+    })
+    .run()
+    .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 fn namespace() -> String {
@@ -68,7 +74,8 @@ fn namespace() -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Origin {
     Clipboard,
-    Editor,
+    /// Piped to `quillway show|toggle --stdin`.
+    Stdin,
     /// Nothing recent to start from: the user types or pastes the text.
     Typed,
 }
@@ -77,7 +84,7 @@ impl Origin {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Clipboard => "clipboard",
-            Self::Editor => "editor",
+            Self::Stdin => "stdin",
             Self::Typed => "typed",
         }
     }
@@ -142,11 +149,11 @@ pub struct Generation {
     pub label: String,
     show_diff: bool,
     /// A retry: replaces the latest draft when it finishes (kept if cancelled).
-    replace: bool,
+    retry: bool,
     request: Rewrite,
-    started: Instant,
-    first: Option<Instant>,
-    deltas: usize,
+    /// The instruction box's text when this started; given back if it fails without a draft.
+    typed: String,
+    timing: Timing,
 }
 
 impl Generation {
@@ -232,6 +239,7 @@ impl Popup {
 pub struct Install {
     pub entry: &'static Entry,
     pub done: u64,
+    pub rate: download::Rate,
     pub error: Option<String>,
 }
 
@@ -270,7 +278,7 @@ pub enum Shortcut {
 
 #[derive(Debug, Clone)]
 pub enum GenEvent {
-    Delta(String),
+    Chunk(Chunk),
     Error(String),
     Done,
 }
@@ -310,11 +318,11 @@ pub enum Message {
 }
 
 impl App {
-    fn boot(config: Config, watch: Option<quillway_wl::ClipboardWatch>) -> (Self, Task<Message>) {
+    fn boot(config: Config, active: Active, watch: Option<quillway_wl::ClipboardWatch>) -> (Self, Task<Message>) {
         let engine = Engine::new(config.clone());
         let mut app = Self {
             presets: config.presets(),
-            active: models::active(&config),
+            active,
             palette: style::Palette::new(&config.ui),
             engine_state: EngineState::Starting,
             config,
@@ -494,7 +502,7 @@ impl App {
                     // Text sent explicitly wins over a clipboard read still in flight.
                     Input::Text(t) => {
                         self.capturing = None;
-                        self.open(t, Origin::Editor, None)
+                        self.open(t, Origin::Stdin, None)
                     }
                     Input::Clipboard if self.capturing.is_some() => Task::none(),
                     Input::Clipboard if self.clipboard_recent() => {
@@ -511,24 +519,26 @@ impl App {
                 self.capturing = None;
                 self.hide()
             }
-            Request::Reload => match Config::load(&paths::config_file()) {
-                Ok(config) => {
-                    self.presets = config.presets();
-                    self.active = models::active(&config);
-                    self.palette = style::Palette::new(&config.ui);
-                    self.config = config.clone();
-                    let (engine, reply) = (self.engine.clone(), reply.clone());
-                    let reload = Task::future(async move {
-                        engine.reload(config).await;
-                        reply.send(Response::Ok);
-                    });
-                    reload.discard().chain(self.warm_up())
+            Request::Reload => {
+                match Config::load(&paths::config_file()).and_then(|config| Ok((models::active(&config)?, config))) {
+                    Ok((active, config)) => {
+                        self.presets = config.presets();
+                        self.active = active;
+                        self.palette = style::Palette::new(&config.ui);
+                        self.config = config.clone();
+                        let (engine, reply) = (self.engine.clone(), reply.clone());
+                        let reload = Task::future(async move {
+                            engine.reload(config).await;
+                            reply.send(Response::Ok);
+                        });
+                        reload.discard().chain(self.warm_up())
+                    }
+                    Err(e) => {
+                        reply.send(Response::Error { message: format!("{e:#}") });
+                        Task::none()
+                    }
                 }
-                Err(e) => {
-                    reply.send(Response::Error { message: format!("{e:#}") });
-                    Task::none()
-                }
-            },
+            }
             Request::Status => {
                 let engine = self.engine_state.describe();
                 reply.send(Response::Status { visible: self.popup.is_some(), model: self.model_label(), engine });
@@ -697,10 +707,6 @@ impl App {
             p.error = Some("Nothing to rewrite: type or paste the text into the box (Tab switches boxes).".into());
             return Task::none();
         }
-        if text.contains(prompt::STOP) {
-            p.error = Some(format!("The text contains `{}`, which Quillway uses as a delimiter.", prompt::STOP));
-            return Task::none();
-        }
         // The client counts tokens and rejects text too long for the context.
         let request = Rewrite { instruction, max_tokens: None, text, temperature };
         if p.drafts.is_empty() {
@@ -709,14 +715,17 @@ impl App {
         self.start(label, request, show_diff, false)
     }
 
-    fn start(&mut self, label: String, request: Rewrite, show_diff: bool, replace: bool) -> Task<Message> {
+    fn start(&mut self, label: String, request: Rewrite, show_diff: bool, retry: bool) -> Task<Message> {
         let id = self.next_gen;
         self.next_gen += 1;
         let Some(p) = self.popup.as_mut() else { return Task::none() };
+        // A retry samples hotter for a different result. The draft keeps the
+        // original request, so retrying again doesn't compound the increase.
+        let temperature = if retry { (request.temperature + 0.3).min(1.2) } else { request.temperature };
+        let sent = Rewrite { temperature, ..request.clone() };
         let (task, handle) =
-            Task::run(stream_rewrite(self.engine.clone(), request.clone()), move |ev| Message::Gen(id, ev)).abortable();
+            Task::run(stream_rewrite(self.engine.clone(), sent), move |ev| Message::Gen(id, ev)).abortable();
         p.error = None;
-        p.input.clear();
         // The new draft is reviewed from the instruction box, even if this started while editing.
         p.field = Field::Instruction;
         p.generation = Some(Generation {
@@ -725,11 +734,10 @@ impl App {
             raw: String::new(),
             label,
             show_diff,
-            replace,
+            retry,
             request,
-            started: Instant::now(),
-            first: None,
-            deltas: 0,
+            typed: std::mem::take(&mut p.input),
+            timing: Timing::start(),
         });
         Task::batch([task, focus(Field::Instruction)])
     }
@@ -738,22 +746,26 @@ impl App {
         let Some(p) = self.popup.as_mut() else { return Task::none() };
         let Some(g) = p.generation.as_mut().filter(|g| g.id == id) else { return Task::none() };
         match ev {
-            GenEvent::Delta(d) => {
+            GenEvent::Chunk(chunk) => {
                 // Text is flowing, so whatever failed before has recovered.
                 if matches!(self.engine_state, EngineState::Failed(_) | EngineState::Starting) {
                     self.engine_state = EngineState::Ready;
                 }
-                g.first.get_or_insert_with(Instant::now);
-                g.deltas += 1;
-                g.raw.push_str(&d);
+                g.timing.record(&chunk);
+                if let Chunk::Text(t) = chunk {
+                    g.raw.push_str(&t);
+                }
             }
             GenEvent::Error(e) => {
                 let g = p.generation.take().expect("matched above");
                 let partial = clean::clean(&g.raw, &g.request.text, false).trim_end().to_owned();
                 // Keep what arrived, marked, unless a retry failed (its old draft stays).
-                if !partial.trim().is_empty() && !g.replace {
+                if !partial.trim().is_empty() && !g.retry {
                     p.drafts.push(g.into_draft(partial, "stopped early".into(), true));
                     p.follow_diff();
+                } else {
+                    // Nothing new to review: give back the instruction, to fix or send again.
+                    p.input = g.typed;
                 }
                 p.error = Some(e);
             }
@@ -761,13 +773,13 @@ impl App {
                 let g = p.generation.take().expect("matched above");
                 let text = clean::clean(&g.raw, &g.request.text, true);
                 if text.trim().is_empty() {
+                    p.input = g.typed;
                     p.error = Some("The model returned nothing. Run it again, or try another preset.".into());
                     return Task::none();
                 }
-                let secs = g.started.elapsed().as_secs_f64();
-                let gen_secs = g.first.map_or(secs, |f| f.elapsed().as_secs_f64()).max(1e-3);
-                let rate = f64::from(u32::try_from(g.deltas.saturating_sub(1)).unwrap_or(u32::MAX)) / gen_secs;
-                if g.replace {
+                let secs = g.timing.started().elapsed().as_secs_f64();
+                let rate = g.timing.rate();
+                if g.retry {
                     p.drafts.pop();
                 }
                 p.drafts.push(g.into_draft(text, format!("{secs:.1}s · {rate:.0} tok/s"), false));
@@ -805,8 +817,7 @@ impl App {
             }
             (Shortcut::Retry, Phase::Reviewing) => {
                 let Some(d) = p.drafts.last() else { return Task::none() };
-                let Some(mut request) = d.request.clone() else { return Task::none() };
-                request.temperature = (request.temperature + 0.3).min(1.2);
+                let Some(request) = d.request.clone() else { return Task::none() };
                 let (label, show_diff) = (d.label.clone(), d.show_diff);
                 self.start(label, request, show_diff, true)
             }
@@ -848,6 +859,7 @@ impl App {
             self.install = Some(Install {
                 entry,
                 done: 0,
+                rate: download::Rate::default(),
                 error: Some(format!(
                     "{} needs license confirmation: run `quillway models install {}`",
                     entry.name, entry.id
@@ -855,7 +867,7 @@ impl App {
             });
             return Task::none();
         }
-        self.install = Some(Install { entry, done: 0, error: None });
+        self.install = Some(Install { entry, done: 0, rate: download::Rate::default(), error: None });
         Task::run(install_stream(entry), Message::Install)
     }
 
@@ -864,6 +876,7 @@ impl App {
         match ev {
             InstallEvent::Progress(done) => {
                 i.done = done;
+                i.rate.update(done, i.entry.size);
                 Task::none()
             }
             InstallEvent::Done(Ok(())) => {
@@ -900,7 +913,7 @@ impl App {
     /// Rotation of the shimmer ring, in turns, while generating.
     pub fn shimmer(&self) -> Option<f32> {
         let g = self.popup.as_ref()?.generation.as_ref()?;
-        Some((self.now.saturating_duration_since(g.started).as_secs_f32() / 2.4).fract())
+        Some((self.now.saturating_duration_since(g.timing.started()).as_secs_f32() / 2.4).fract())
     }
 
     pub fn streaming_text(&self) -> Option<String> {
@@ -989,7 +1002,7 @@ async fn read_clipboard() -> (Option<String>, Option<String>) {
 fn stream_rewrite(engine: Engine, req: Rewrite) -> impl Stream<Item = GenEvent> {
     stream::once(async move { engine.client().await?.stream(&req).await })
         .flat_map(|r| match r {
-            Ok(s) => s.map(|d| d.map_or_else(|e| GenEvent::Error(format!("{e:#}")), GenEvent::Delta)).boxed(),
+            Ok(s) => s.map(|c| c.map_or_else(|e| GenEvent::Error(format!("{e:#}")), GenEvent::Chunk)).boxed(),
             Err(e) => stream::once(async move { GenEvent::Error(format!("{e:#}")) }).boxed(),
         })
         .chain(stream::once(async { GenEvent::Done }))
@@ -1022,6 +1035,15 @@ mod tests {
         Reply::new(tx)
     }
 
+    fn text(t: &str) -> GenEvent {
+        GenEvent::Chunk(Chunk::Text(t.into()))
+    }
+
+    fn boot(config: Config) -> App {
+        let active = models::active(&config).unwrap();
+        App::boot(config, active, None).0
+    }
+
     fn endpoint_config() -> Config {
         let mut config = Config::default();
         config.model.endpoint = Some("http://127.0.0.1:1/v1".into());
@@ -1030,7 +1052,7 @@ mod tests {
     }
 
     fn generating_app() -> App {
-        let (mut app, _) = App::boot(endpoint_config(), None);
+        let mut app = boot(endpoint_config());
         let _ = app.update(Message::Ipc(Request::Show { input: Input::Text("their here".into()) }, reply()));
         let _ = app.update(Message::Preset(0));
         assert_eq!(app.popup.as_ref().unwrap().phase(), Phase::Generating);
@@ -1039,7 +1061,7 @@ mod tests {
 
     fn reviewing_app() -> App {
         let mut app = generating_app();
-        let _ = app.update(Message::Gen(0, GenEvent::Delta("They're here.".into())));
+        let _ = app.update(Message::Gen(0, text("They're here.")));
         let _ = app.update(Message::Gen(0, GenEvent::Done));
         assert_eq!(app.popup.as_ref().unwrap().phase(), Phase::Reviewing);
         app
@@ -1095,7 +1117,7 @@ mod tests {
         let _ = app.update(Message::Preset(0));
         let p = app.popup.as_ref().unwrap();
         assert_eq!(p.generation.as_ref().unwrap().request.text, "They're here.!");
-        let _ = app.update(Message::Gen(1, GenEvent::Delta("They're here!".into())));
+        let _ = app.update(Message::Gen(1, text("They're here!")));
         let _ = app.update(Message::Gen(1, GenEvent::Done));
         assert!(!app.popup.as_ref().unwrap().editing());
     }
@@ -1186,7 +1208,7 @@ mod tests {
 
     #[test]
     fn presets_run_with_ctrl_digits_from_the_instruction_box_only() {
-        let (mut app, _) = App::boot(endpoint_config(), None);
+        let mut app = boot(endpoint_config());
         let _ = app.update(Message::Ipc(Request::Show { input: Input::Text("their here".into()) }, reply()));
         let _ = app.update(Message::Input("3".into())); // a lone digit is just text now
         assert_eq!(app.popup.as_ref().unwrap().input, "3");
@@ -1204,7 +1226,7 @@ mod tests {
         assert!(app.popup.as_ref().unwrap().show_diff);
         let _ = app.on_shortcut(Shortcut::Diff);
         let _ = app.on_shortcut(Shortcut::Preset(0));
-        let _ = app.update(Message::Gen(1, GenEvent::Delta("They are here.".into())));
+        let _ = app.update(Message::Gen(1, text("They are here.")));
         let _ = app.update(Message::Gen(1, GenEvent::Done));
         assert!(!app.popup.as_ref().unwrap().show_diff, "a new draft keeps the choice");
         let _ = app.on_shortcut(Shortcut::Undo);
@@ -1217,7 +1239,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let mut config = Config::default();
         config.model.active = Some(format!("custom:{}", path.display()));
-        let (mut app, _) = App::boot(config, None);
+        let mut app = boot(config);
         assert_eq!(app.engine_state, EngineState::Missing);
         std::fs::write(&path, b"gguf").unwrap();
         let _ = app.update(Message::Ipc(Request::Show { input: Input::Text("hi".into()) }, reply()));
@@ -1227,7 +1249,7 @@ mod tests {
 
     #[test]
     fn superseded_warm_up_result_is_ignored() {
-        let (mut app, _) = App::boot(endpoint_config(), None);
+        let mut app = boot(endpoint_config());
         let first = app.warm_id;
         let _ = app.warm_up(); // a reload
         let _ = app.update(Message::Engine(first, Err("killed by the reload".into())));
@@ -1239,7 +1261,7 @@ mod tests {
     #[test]
     fn error_keeps_partial_output_as_an_incomplete_draft() {
         let mut app = generating_app();
-        let _ = app.update(Message::Gen(0, GenEvent::Delta("They're here, and".into())));
+        let _ = app.update(Message::Gen(0, text("They're here, and")));
         let _ = app.update(Message::Gen(0, GenEvent::Error("connection reset".into())));
         let p = app.popup.as_ref().unwrap();
         assert_eq!(p.phase(), Phase::Reviewing);
@@ -1251,10 +1273,10 @@ mod tests {
     #[test]
     fn retry_of_an_incomplete_draft_replaces_it_with_a_complete_one() {
         let mut app = generating_app();
-        let _ = app.update(Message::Gen(0, GenEvent::Delta("They're".into())));
+        let _ = app.update(Message::Gen(0, text("They're")));
         let _ = app.update(Message::Gen(0, GenEvent::Error("connection reset".into())));
         let _ = app.on_shortcut(Shortcut::Retry);
-        let _ = app.update(Message::Gen(1, GenEvent::Delta("They're here.".into())));
+        let _ = app.update(Message::Gen(1, text("They're here.")));
         let _ = app.update(Message::Gen(1, GenEvent::Done));
         let p = app.popup.as_ref().unwrap();
         assert_eq!(p.drafts.len(), 1);
@@ -1264,7 +1286,7 @@ mod tests {
 
     #[test]
     fn stdin_text_replaces_a_pending_clipboard_read() {
-        let (mut app, _) = App::boot(Config::default(), None);
+        let mut app = boot(Config::default());
         let _ = app.update(Message::Ipc(Request::Show { input: Input::Clipboard }, reply()));
         let _ = app.update(Message::Ipc(Request::Show { input: Input::Text("from editor".into()) }, reply()));
         assert_eq!(app.popup.as_ref().unwrap().source.text(), "from editor");
@@ -1274,7 +1296,7 @@ mod tests {
 
     #[test]
     fn stdin_text_for_an_open_popup_is_refused_not_dropped() {
-        let (mut app, _) = App::boot(Config::default(), None);
+        let mut app = boot(Config::default());
         let _ = app.update(Message::Ipc(Request::Show { input: Input::Text("first".into()) }, reply()));
         for req in [
             Request::Show { input: Input::Text("second".into()) },
@@ -1285,6 +1307,39 @@ mod tests {
             assert!(matches!(rx.try_recv(), Ok(Response::Error { .. })));
             assert_eq!(app.popup.as_ref().unwrap().source.text(), "first");
         }
+    }
+
+    #[test]
+    fn a_failed_custom_instruction_is_given_back() {
+        let mut app = boot(endpoint_config());
+        let _ = app.update(Message::Ipc(Request::Show { input: Input::Text("their here".into()) }, reply()));
+        let _ = app.update(Message::Input("make it formal".into()));
+        let _ = app.update(Message::Submit);
+        assert_eq!(app.popup.as_ref().unwrap().input, "", "the box is cleared while writing");
+        let _ = app.update(Message::Gen(0, GenEvent::Error("too long".into())));
+        let p = app.popup.as_ref().unwrap();
+        assert_eq!((p.phase(), p.input.as_str()), (Phase::Composing, "make it formal"));
+    }
+
+    #[test]
+    fn retries_do_not_compound_the_temperature() {
+        let mut app = reviewing_app(); // Proofread, temperature 0.2
+        for id in 1..=3 {
+            let _ = app.on_shortcut(Shortcut::Retry);
+            let _ = app.update(Message::Gen(id, text("They're here.")));
+            let _ = app.update(Message::Gen(id, GenEvent::Done));
+        }
+        let p = app.popup.as_ref().unwrap();
+        assert_eq!(p.drafts.len(), 1);
+        let base = p.drafts[0].request.as_ref().unwrap().temperature;
+        assert!((base - 0.2).abs() < f32::EPSILON, "{base}");
+    }
+
+    #[test]
+    fn piped_text_is_labelled_stdin() {
+        let mut app = boot(endpoint_config());
+        let _ = app.update(Message::Ipc(Request::Show { input: Input::Text("hi".into()) }, reply()));
+        assert_eq!(app.popup.as_ref().unwrap().origin, Origin::Stdin);
     }
 
     #[test]
@@ -1301,13 +1356,13 @@ mod tests {
         let mut app = generating_app();
         let _ = app.on_shortcut(Shortcut::Escape);
         assert_eq!(app.popup.as_ref().unwrap().phase(), Phase::Composing);
-        let _ = app.update(Message::Gen(0, GenEvent::Delta("late response".into())));
+        let _ = app.update(Message::Gen(0, text("late response")));
         assert_eq!(app.popup.as_ref().unwrap().phase(), Phase::Composing);
     }
 
     #[test]
     fn hide_during_clipboard_read_keeps_popup_closed() {
-        let (mut app, _) = App::boot(Config::default(), None);
+        let mut app = boot(Config::default());
         let _ = app.update(Message::Ipc(Request::Show { input: Input::Clipboard }, reply()));
         let _ = app.update(Message::Ipc(Request::Hide, reply()));
         let _ = app.update(Message::Captured { id: 0, text: Some("old clipboard".into()), error: None });
@@ -1316,7 +1371,7 @@ mod tests {
 
     #[test]
     fn cancelled_clipboard_read_cannot_supply_a_new_show() {
-        let (mut app, _) = App::boot(Config::default(), None);
+        let mut app = boot(Config::default());
         let _ = app.update(Message::Ipc(Request::Show { input: Input::Clipboard }, reply()));
         let _ = app.update(Message::Ipc(Request::Toggle { input: Input::Clipboard }, reply()));
         let _ = app.update(Message::Ipc(Request::Show { input: Input::Clipboard }, reply()));
