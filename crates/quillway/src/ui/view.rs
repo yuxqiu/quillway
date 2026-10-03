@@ -83,8 +83,8 @@ impl App {
             ),
             Phase::Reviewing => {
                 let d = p.drafts.last().expect("reviewing has a draft");
-                if p.show_diff {
-                    body_scroll(diff_view(&p.original, &d.text, pal))
+                if p.show_diff() {
+                    body_scroll(diff_view(p.original(), &d.text, pal))
                 } else {
                     body_scroll(text(d.text.as_str()).size(15).color(pal.text).into())
                 }
@@ -138,7 +138,7 @@ impl App {
     }
 
     fn chips(&self, pal: Palette) -> Element<'_, Message> {
-        let chips = self.presets.iter().enumerate().map(|(i, preset)| {
+        let chips = self.config.presets().iter().enumerate().map(|(i, preset)| {
             let key = if i < 9 { format!("^{}", i + 1) } else { String::new() };
             let label = row![text(key).size(11).color(pal.faint), text(preset.name.as_str()).size(13).color(pal.text)]
                 .spacing(6);
@@ -167,6 +167,8 @@ impl App {
         };
         let hints = match p.phase() {
             _ if self.needs_install() && self.active.entry.is_some() => "↵ install   esc close",
+            // A missing custom model file: nothing to install, run or switch to.
+            _ if self.needs_install() => "esc close",
             // In the text box, ↵ is a new line and the Ctrl shortcuts are off.
             Phase::Composing if p.field == Field::Source => "⇥ switch box   esc close",
             Phase::Composing => "↵ run   ^1–9 preset   ⇥ switch box   esc close",

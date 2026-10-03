@@ -68,8 +68,7 @@ pub fn all() -> &'static [Entry] {
 }
 
 /// The entry with this id.
-#[must_use]
-pub fn find(id: &str) -> Option<&'static Entry> {
+fn find(id: &str) -> Option<&'static Entry> {
     all().iter().find(|e| e.id == id)
 }
 

@@ -122,15 +122,15 @@ active = "qwen3.5-4b"         # catalog id or "custom:/path.gguf"; default: `mod
 # endpoint_api_key = "…"
 # llama_server = "/path/to/llama-server"   # default: from PATH (the Nix package provides it)
 gpu_layers = 99               # model layers run on the GPU; 99 = all of them. Lower only if GPU memory runs out (0 = CPU only, much slower)
-context = 8192                # the model's working memory in tokens (~¾ word each); must hold your text and the result, ~3,000 words
+context = 8192                # the model's working memory in tokens (~¾ word each); must hold your text and the result, ~3,000 words; at least 1024
 extra_args = []               # appended to the llama-server command line
 
 [ui]
 theme = "dark"                # dark | light
 accent = "#7c6cf2"
-width = 680
+width = 680                   # 300–4096 px
 top_margin = 220              # px from the top of the screen
-opacity = 0.94
+opacity = 0.94                # 0.2–1.0
 client_shadow = true          # false when a compositor rule draws the shadow
 # font = "Inter"             # applies after restarting the daemon
 
@@ -141,7 +141,7 @@ recent_secs = 60              # start with the clipboard only if copied this rec
 [[preset]]
 name = "Proofread"
 instruction = "Fix only clear errors in spelling, grammar and punctuation. Do not change wording or style."
-temperature = 0.2
+temperature = 0.2             # 0–2
 show_diff = true
 ```
 

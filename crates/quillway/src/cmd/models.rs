@@ -30,88 +30,94 @@ pub enum ModelsCmd {
 }
 
 pub async fn run(cmd: ModelsCmd) -> anyhow::Result<()> {
-    let config = Config::load(&paths::config_file())?;
+    let config = Config::load_user()?;
     match cmd {
         ModelsCmd::List => {
-            // Still list the catalog when the choice is broken: it's where a new one comes from.
-            let active = models::active(&config).inspect_err(|e| eprintln!("warning: {e:#}")).ok();
-            for e in catalog::all() {
-                let star = if active.as_ref().is_some_and(|a| a.id == e.id) { "★" } else { " " };
-                let tick = if is_installed(e) { "✓" } else { " " };
-                println!(
-                    "{star} {tick} {:<14} {:<13} {:>8}  {:<8}  {}",
-                    e.id,
-                    e.name,
-                    human(e.size),
-                    e.tier,
-                    e.license
-                );
-            }
-            if let Some(custom) = active.filter(|a| a.entry.is_none()) {
-                println!("★ ✓ {}", custom.id);
-            }
-            if config.model.active.is_some() {
-                println!("\n(active model is pinned by `model.active` in {})", paths::config_file().display());
-            }
+            list(&config);
             Ok(())
         }
-        ModelsCmd::Install { id, yes } => {
-            let e = catalog::get(&id)?;
-            if is_installed(e) {
-                println!("{} is already installed ({})", e.name, models::path(e).display());
-                return Ok(());
-            }
-            if let Some(warning) = e.license_warning().filter(|_| !yes) {
-                confirm_license(&warning)?;
-            }
-            install(e).await?;
-            println!("installed {} → {}", e.name, models::path(e).display());
-            if is_active(&config, e) {
-                // A daemon started before the download shows "not installed" until told.
-                reload_daemon().await;
-            } else {
-                println!("make it active with `quillway models use {}`", e.id);
-            }
-            Ok(())
-        }
-        ModelsCmd::Use { id } => {
-            let id = if let Some(path) = id.strip_prefix("custom:") {
-                // Absolute, so the daemon finds it whatever its working directory.
-                let path = std::fs::canonicalize(path).with_context(|| format!("model file {path}"))?;
-                if !path.is_file() {
-                    bail!("{} is not a file", path.display());
-                }
-                format!("custom:{}", path.display())
-            } else {
-                let e = catalog::get(&id)?;
-                if !is_installed(e) {
-                    bail!("{} is not installed; run `quillway models install {}` first", e.name, e.id);
-                }
-                id
-            };
-            State { active: Some(id.clone()) }.save()?;
-            if config.model.active.is_some() {
-                // The daemon would reload into the same model.
-                eprintln!("note: saved, but `model.active` in the config overrides it until that line is removed");
-                return Ok(());
-            }
-            println!("active model: {id}");
-            reload_daemon().await;
-            Ok(())
-        }
-        ModelsCmd::Remove { id } => {
-            let e = catalog::get(&id)?;
-            if models::remove(e)? {
-                println!("removed {}", models::path(e).display());
-                if is_active(&config, e) {
-                    reload_daemon().await;
-                }
-            } else {
-                println!("{} is not installed", e.name);
-            }
-            Ok(())
-        }
+        ModelsCmd::Install { id, yes } => install(&config, catalog::get(&id)?, yes).await,
+        ModelsCmd::Use { id } => use_model(&config, &id).await,
+        ModelsCmd::Remove { id } => remove(&config, catalog::get(&id)?).await,
     }
+}
+
+fn list(config: &Config) {
+    // Still list the catalog when the choice is broken: it's where a new one comes from.
+    let active = models::active(config).inspect_err(|e| eprintln!("warning: {e:#}")).ok();
+    // With `model.endpoint`, requests go there, not to any model listed here.
+    let local = active.as_ref().filter(|_| config.model.endpoint.is_none());
+    for e in catalog::all() {
+        let star = if local.is_some_and(|a| a.id == e.id) { "★" } else { " " };
+        let tick = if is_installed(e) { "✓" } else { " " };
+        println!("{star} {tick} {:<14} {:<13} {:>8}  {:<8}  {}", e.id, e.name, human(e.size), e.tier, e.license);
+    }
+    if let Some(custom) = local.filter(|a| a.entry.is_none()) {
+        println!("★ {} {}", if custom.is_installed() { "✓" } else { " " }, custom.id);
+    }
+    if let (Some(url), Some(model)) = (&config.model.endpoint, &config.model.endpoint_model) {
+        println!("★   {model} at {url} (`model.endpoint`)");
+    }
+    if config.model.active.is_some() {
+        println!("\n(active model is pinned by `model.active` in {})", paths::config_file().display());
+    }
+}
+
+async fn install(config: &Config, e: &Entry, yes: bool) -> anyhow::Result<()> {
+    if is_installed(e) {
+        println!("{} is already installed ({})", e.name, models::path(e).display());
+        return Ok(());
+    }
+    if let Some(warning) = e.license_warning().filter(|_| !yes) {
+        confirm_license(&warning)?;
+    }
+    download_with_progress(e).await?;
+    println!("installed {} → {}", e.name, models::path(e).display());
+    if is_active(config, e) {
+        // A daemon started before the download shows "not installed" until told.
+        reload_daemon().await;
+    } else {
+        println!("make it active with `quillway models use {}`", e.id);
+    }
+    Ok(())
+}
+
+async fn use_model(config: &Config, id: &str) -> anyhow::Result<()> {
+    let id = if let Some(path) = id.strip_prefix("custom:") {
+        // Absolute, so the daemon finds it whatever its working directory.
+        let path = std::fs::canonicalize(path).with_context(|| format!("model file {path}"))?;
+        if !path.is_file() {
+            bail!("{} is not a file", path.display());
+        }
+        format!("custom:{}", path.display())
+    } else {
+        let e = catalog::get(id)?;
+        if !is_installed(e) {
+            bail!("{} is not installed; run `quillway models install {}` first", e.name, e.id);
+        }
+        id.to_owned()
+    };
+    State { active: Some(id.clone()) }.save()?;
+    if config.model.active.is_some() {
+        // The daemon would reload into the same model.
+        eprintln!("note: saved, but `model.active` in the config overrides it until that line is removed");
+        return Ok(());
+    }
+    println!("active model: {id}");
+    reload_daemon().await;
+    Ok(())
+}
+
+async fn remove(config: &Config, e: &Entry) -> anyhow::Result<()> {
+    if !models::remove(e)? {
+        println!("{} is not installed", e.name);
+        return Ok(());
+    }
+    println!("removed {}", models::path(e).display());
+    if is_active(config, e) {
+        reload_daemon().await;
+    }
+    Ok(())
 }
 
 /// Whether requests use `e`, so the daemon must pick up its install or removal.
@@ -134,7 +140,7 @@ fn confirm_license(warning: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn install(e: &Entry) -> anyhow::Result<()> {
+async fn download_with_progress(e: &Entry) -> anyhow::Result<()> {
     let tty = std::io::stderr().is_terminal();
     let (mut last_pct, mut drawn_at) = (u64::MAX, None::<Instant>);
     let mut rate = Rate::default();

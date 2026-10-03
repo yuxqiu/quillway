@@ -11,11 +11,11 @@ mod server;
 use std::sync::Arc;
 
 use anyhow::Context;
-use quillway_core::config::Config;
+use quillway_core::config::ModelConfig;
 use quillway_core::ipc::Endpoint;
 use tokio::sync::Mutex;
 
-pub use client::{Chunk, Client, Rewrite, Timing};
+pub use client::{Chunk, Client, Interrupted, Rewrite, Timing};
 pub use models::Active;
 
 /// Shared handle to the model backend; clones share one server.
@@ -25,80 +25,64 @@ pub struct Engine {
 }
 
 struct Inner {
-    config: Config,
+    config: ModelConfig,
+    /// Resolved once per config ([`models::active`]), so every request uses the
+    /// model the caller showed to the user.
+    active: Active,
     server: Option<server::Server>,
 }
 
 impl Engine {
-    /// An engine for `config`; nothing starts until the first request.
+    /// An engine for the `[model]` config and its active model; nothing starts
+    /// until the first request.
     #[must_use]
-    pub fn new(config: Config) -> Self {
-        Self { inner: Arc::new(Mutex::new(Inner { config, server: None })) }
+    pub fn new(config: ModelConfig, active: Active) -> Self {
+        Self { inner: Arc::new(Mutex::new(Inner { config, active, server: None })) }
     }
 
     /// Swap the config and drop the running server; the next request restarts it.
-    pub async fn reload(&self, config: Config) {
-        let mut inner = self.inner.lock().await;
-        inner.config = config;
-        inner.server = None;
-    }
-
-    /// The model the next request will use.
-    ///
-    /// # Errors
-    ///
-    /// As [`models::active`].
-    pub async fn active(&self) -> anyhow::Result<Active> {
-        models::active(&self.inner.lock().await.config)
+    pub async fn reload(&self, config: ModelConfig, active: Active) {
+        *self.inner.lock().await = Inner { config, active, server: None };
     }
 
     /// A client ready to accept requests, starting llama-server if needed.
     ///
     /// # Errors
     ///
-    /// The model is unknown or isn't installed, or llama-server fails to start.
+    /// The model isn't installed, or llama-server fails to start.
     #[expect(clippy::significant_drop_tightening, reason = "held across startup so callers share one server")]
     pub async fn client(&self) -> anyhow::Result<Client> {
         let mut inner = self.inner.lock().await;
-        let cfg = inner.config.model.clone();
-        let active = models::active(&inner.config)?;
-        if let Some(base) = cfg.endpoint {
-            drop(inner);
+        let Inner { config, active, server } = &mut *inner;
+        if let Some(base) = &config.endpoint {
             return Ok(Client::new(Endpoint {
-                base,
-                api_key: cfg.endpoint_api_key,
-                model: cfg.endpoint_model.unwrap_or_default(),
+                base: base.clone(),
+                api_key: config.endpoint_api_key.clone(),
+                model: config.endpoint_model.clone().unwrap_or_default(),
                 llama: false,
-                context: cfg.context,
+                context: config.context,
                 sampling: active.sampling,
             }));
         }
         active.ensure_installed()?;
-        // The lock is held across startup on purpose: concurrent callers wait
-        // for this server instead of starting their own.
-        if let Some(s) = inner.server.as_mut()
+        if let Some(s) = server.as_mut()
             && !s.is_alive()
         {
             eprintln!("quillway: llama-server exited; restarting. Its last output:\n{}", s.log_tail());
+            *server = None;
         }
-        let reusable = inner.server.as_mut().is_some_and(|s| s.model_path() == active.path && s.is_alive());
-        let server = match inner.server.take() {
-            Some(s) if reusable => s,
-            old => {
-                drop(old); // stop the previous server before starting another
-                server::Server::start(&active.path, &cfg).await.context("starting llama-server")?
-            }
+        let server = match server {
+            Some(s) => s,
+            None => server.insert(server::Server::start(&active.path, config).await.context("starting llama-server")?),
         };
-        let client = Client::new(Endpoint {
+        Ok(Client::new(Endpoint {
             base: server.base_url(),
             api_key: Some(server.api_key().to_owned()),
-            model: active.id,
+            model: active.id.clone(),
             llama: true,
             context: server.context(),
             sampling: active.sampling,
-        });
-        inner.server = Some(server);
-        Ok(client)
+        }))
     }
 
     /// Start the server and run one tiny request, so GPU pipelines are built
@@ -108,10 +92,6 @@ impl Engine {
     ///
     /// As [`Engine::client`], or the warm-up request fails.
     pub async fn warm_up(&self) -> anyhow::Result<()> {
-        let client = self.client().await?;
-        if client.is_llama() {
-            client.warm_up().await?;
-        }
-        Ok(())
+        self.client().await?.warm_up().await
     }
 }

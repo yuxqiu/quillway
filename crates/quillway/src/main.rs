@@ -24,7 +24,7 @@ enum Command {
     /// Show the popup, or hide it if it is open. Bind this to a key in your compositor.
     /// With `--stdin`, an open popup is kept and the command fails, so the text isn't lost.
     Toggle(SourceArg),
-    /// Show the popup.
+    /// Show the popup (no-op if it is open). With `--stdin`, an open popup makes the command fail.
     Show(SourceArg),
     /// Hide the popup.
     Hide,
@@ -39,7 +39,7 @@ enum Command {
     Models(cmd::models::ModelsCmd),
     /// Rewrite stdin to stdout without the popup (scripting, testing).
     Rewrite(cmd::rewrite::RewriteArgs),
-    /// Check the environment: protocols, llama-server, model.
+    /// Check the environment: config, Wayland, clipboard, llama-server, model, daemon.
     Doctor,
 }
 

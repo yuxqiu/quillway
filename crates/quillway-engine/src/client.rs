@@ -1,5 +1,7 @@
 //! Streaming `/v1/chat/completions` client (llama-server, Ollama, LM Studio, …).
 
+use std::collections::VecDeque;
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
@@ -9,10 +11,32 @@ use quillway_core::ipc::Endpoint;
 use quillway_core::prompt::{self, ChatMessage};
 use serde_json::{Value, json};
 
+/// The server stopped sending mid-response: it exited or was restarted, or
+/// the connection dropped. Find it with `anyhow::Error::downcast_ref`.
+#[derive(Debug)]
+pub struct Interrupted;
+
+impl std::fmt::Display for Interrupted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the model server stopped mid-response")
+    }
+}
+
+impl std::error::Error for Interrupted {}
+
+/// One HTTP client (connection pool, TLS roots) for every [`Client`].
+static HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        // Between reads; the first byte can wait for a long prompt on a CPU.
+        .read_timeout(Duration::from_secs(300))
+        .build()
+        .expect("the TLS backend initializes")
+});
+
 /// A connection to one OpenAI-compatible server.
 #[derive(Debug, Clone)]
 pub struct Client {
-    http: reqwest::Client,
     endpoint: Endpoint,
 }
 
@@ -25,8 +49,6 @@ pub struct Rewrite {
     pub text: String,
     /// Sampling temperature.
     pub temperature: f32,
-    /// Upper bound on generated tokens; `None` fills the context left after the prompt.
-    pub max_tokens: Option<u32>,
 }
 
 /// One piece of a streamed response.
@@ -97,20 +119,8 @@ impl Client {
     /// and exact token counts.
     #[must_use]
     pub fn new(mut endpoint: Endpoint) -> Self {
-        let http = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            // Between reads; the first byte can wait for a long prompt on a CPU.
-            .read_timeout(Duration::from_secs(300))
-            .build()
-            .unwrap_or_default();
         endpoint.base = endpoint.base.trim_end_matches('/').to_owned();
-        Self { http, endpoint }
-    }
-
-    /// Whether this is our own llama-server.
-    #[must_use]
-    pub const fn is_llama(&self) -> bool {
-        self.endpoint.llama
+        Self { endpoint }
     }
 
     /// How to reach the server.
@@ -121,7 +131,7 @@ impl Client {
 
     /// A POST to `url`, authenticated if the server needs it.
     fn post(&self, url: &str) -> reqwest::RequestBuilder {
-        let req = self.http.post(url);
+        let req = HTTP.post(url);
         match &self.endpoint.api_key {
             Some(k) => req.bearer_auth(k),
             None => req,
@@ -156,25 +166,7 @@ impl Client {
     /// `max_tokens` for `r`: counted by our llama-server's tokenizer, estimated
     /// elsewhere or if the server can't count (an older `model.llama_server`).
     async fn budget(&self, r: &Rewrite) -> anyhow::Result<u32> {
-        let counted = if self.is_llama() {
-            match tokio::try_join!(self.tokenize(&r.text, true), self.tokenize(&r.text, false)) {
-                Ok((parsed, plain)) => {
-                    if let Some(token) = control_token(&parsed, &plain) {
-                        bail!("the text contains `{token}`, a control token of the model; remove it and try again");
-                    }
-                    self.server_counts(r, &plain)
-                        .await
-                        .inspect_err(|e| eprintln!("quillway: counting tokens failed, estimating instead: {e:#}"))
-                        .ok()
-                }
-                Err(e) => {
-                    eprintln!("quillway: checking text tokens failed, estimating instead: {e:#}");
-                    None
-                }
-            }
-        } else {
-            None
-        };
+        let counted = if self.endpoint.llama { self.count(r).await? } else { None };
         let (prompt_tokens, text_tokens) = counted.map_or_else(
             || (prompt::estimate_prompt(&r.instruction, &r.text), prompt::estimate_tokens(&r.text)),
             |c| (c.prompt, c.text),
@@ -186,6 +178,23 @@ impl Client {
                  shorten it or raise `model.context`"
             )
         })
+    }
+
+    /// Token counts from our llama-server, after refusing text that spells out
+    /// a control token (DECISIONS #27); `None` if the server can't count.
+    async fn count(&self, r: &Rewrite) -> anyhow::Result<Option<Counts>> {
+        let (parsed, plain) = match tokio::try_join!(self.tokenize(&r.text, true), self.tokenize(&r.text, false)) {
+            Ok(tokens) => tokens,
+            Err(e) => {
+                eprintln!("quillway: checking text tokens failed, estimating instead: {e:#}");
+                return Ok(None);
+            }
+        };
+        if let Some(token) = control_token(&parsed, &plain) {
+            bail!("the text contains `{token}`, a control token of the model; remove it and try again");
+        }
+        let counts = self.server_counts(r, &plain).await;
+        Ok(counts.inspect_err(|e| eprintln!("quillway: counting tokens failed, estimating instead: {e:#}")).ok())
     }
 
     async fn server_counts(&self, r: &Rewrite, plain: &[Token]) -> anyhow::Result<Counts> {
@@ -221,28 +230,34 @@ impl Client {
             .send()
             .await
             .with_context(|| format!("connecting to {root}"))?;
-        let status = resp.status();
-        if !status.is_success() {
-            bail!("{path}: {status}");
-        }
-        Ok(resp.json().await?)
+        Ok(ok(resp, path).await?.json().await?)
     }
 
     /// Stream the response. Dropping the stream cancels the request.
     ///
     /// # Errors
     ///
-    /// The text contains the prompt's delimiter or doesn't fit the context,
-    /// or the server is unreachable or rejects the request; later failures
-    /// arrive as stream items.
+    /// The text contains the prompt's delimiter or spells out a control token
+    /// of the model, it doesn't fit the context, or the server is unreachable
+    /// or rejects the request; later failures arrive as stream items.
     pub async fn stream(
         &self,
         r: &Rewrite,
     ) -> anyhow::Result<impl Stream<Item = anyhow::Result<Chunk>> + Send + use<>> {
+        self.send(r, None).await
+    }
+
+    /// [`Client::stream`] with an explicit `max_tokens`; `None` fills the
+    /// context left after the prompt.
+    async fn send(
+        &self,
+        r: &Rewrite,
+        max_tokens: Option<u32>,
+    ) -> anyhow::Result<impl Stream<Item = anyhow::Result<Chunk>> + Send + use<>> {
         if r.text.contains(prompt::STOP) {
             bail!("the text contains `{}`, which Quillway uses as a delimiter", prompt::STOP);
         }
-        let max_tokens = match r.max_tokens {
+        let max_tokens = match max_tokens {
             Some(n) => n,
             None => self.budget(r).await?,
         };
@@ -253,68 +268,95 @@ impl Client {
             .send()
             .await
             .with_context(|| format!("connecting to {base}"))?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            bail!("{status}: {}", text.chars().take(300).collect::<String>());
-        }
-        let state = (resp.bytes_stream().eventsource(), false);
-        Ok(futures_util::stream::unfold(state, |(mut events, done)| async move {
+        let resp = ok(resp, "chat/completions").await?;
+        let state = (resp.bytes_stream().eventsource(), VecDeque::new(), false);
+        Ok(futures_util::stream::unfold(state, |(mut events, mut pending, done)| async move {
             if done {
                 return None;
             }
             loop {
-                let error = match events.next().await {
-                    // Without `[DONE]`, the output may be cut short.
-                    None => anyhow::anyhow!("incomplete response: stream ended before [DONE]"),
-                    Some(Err(e)) => e.into(),
-                    Some(Ok(event)) => match parse_data(&event.data) {
-                        Sse::Chunk(c) => return Some((Ok(c), (events, false))),
-                        Sse::Done => return None,
-                        Sse::Error(e) => anyhow::anyhow!(e),
-                        Sse::Skip => continue,
-                    },
+                let Some(next) = pending.pop_front() else {
+                    // The server stopped sending: without `[DONE]`, the output may be cut short.
+                    let cause = match events.next().await {
+                        Some(Ok(event)) => {
+                            pending.extend(parse_data(&event.data));
+                            continue;
+                        }
+                        None => "incomplete response: stream ended before [DONE]".to_owned(),
+                        Some(Err(e)) => e.to_string(),
+                    };
+                    return Some((Err(anyhow::Error::new(Interrupted).context(cause)), (events, pending, true)));
                 };
-                return Some((Err(error), (events, true)));
+                return match next {
+                    Sse::Chunk(c) => Some((Ok(c), (events, pending, false))),
+                    Sse::Done => None,
+                    Sse::Error(e) => Some((Err(anyhow::anyhow!(e)), (events, pending, true))),
+                };
             }
         }))
     }
 
-    /// Run one tiny request, so GPU pipelines are built and the fixed prompt
-    /// prefix is cached. It is cut at one token on purpose, so the first
-    /// delta is success and the token-limit ending that follows is ignored.
+    /// On our own llama-server, run one tiny request, so GPU pipelines are
+    /// built and the fixed prompt prefix is cached; other servers are left
+    /// alone. It is cut at one token on purpose, so the first delta is success
+    /// and the token-limit ending that follows is ignored.
     ///
     /// # Errors
     ///
     /// As [`Client::stream`], or the server fails before the first token.
     pub async fn warm_up(&self) -> anyhow::Result<()> {
-        let r = Rewrite { instruction: "Proofread.".into(), text: "ok".into(), temperature: 0.0, max_tokens: Some(1) };
-        let mut s = std::pin::pin!(self.stream(&r).await?);
-        match s.next().await {
-            Some(Ok(_)) => Ok(()),
-            Some(Err(e)) => Err(e),
-            None => bail!("warm-up produced no token"),
+        if !self.endpoint.llama {
+            return Ok(());
         }
+        let r = Rewrite { instruction: "Proofread.".into(), text: "ok".into(), temperature: 0.0 };
+        let mut s = std::pin::pin!(self.send(&r, Some(1)).await?);
+        while let Some(chunk) = s.next().await {
+            if let Chunk::Text(_) = chunk? {
+                return Ok(());
+            }
+        }
+        bail!("warm-up produced no token")
     }
 
-    /// Collect a whole response (CLI use).
+    /// Collect a whole response, with its timing (`quillway rewrite`, the eval).
     ///
     /// # Errors
     ///
-    /// As [`Client::stream`], plus any error reported mid-stream.
-    pub async fn complete(&self, r: &Rewrite) -> anyhow::Result<String> {
+    /// As [`Client::stream`], plus any error reported mid-stream, or an empty response.
+    pub async fn complete(&self, r: &Rewrite) -> anyhow::Result<(String, Timing)> {
+        let mut timing = Timing::start();
         let mut s = std::pin::pin!(self.stream(r).await?);
         let mut out = String::new();
         while let Some(chunk) = s.next().await {
-            if let Chunk::Text(t) = chunk? {
+            let chunk = chunk?;
+            timing.record(&chunk);
+            if let Chunk::Text(t) = chunk {
                 out.push_str(&t);
             }
         }
         if out.trim().is_empty() {
             bail!("the model returned nothing");
         }
-        Ok(out)
+        Ok((out, timing))
     }
+}
+
+/// `resp` if it succeeded, else an error naming `what` with the server's own
+/// message (the OpenAI-style `error.message`, else the start of the body).
+async fn ok(resp: reqwest::Response, what: &str) -> anyhow::Result<reqwest::Response> {
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp);
+    }
+    let body = resp.text().await.unwrap_or_default();
+    let message = serde_json::from_str::<Value>(&body)
+        .ok()
+        .and_then(|v| v.pointer("/error/message").and_then(Value::as_str).map(str::to_owned))
+        .unwrap_or_else(|| body.chars().take(300).collect());
+    if message.is_empty() {
+        bail!("{what}: {status}");
+    }
+    bail!("{what}: {status}: {message}")
 }
 
 struct Counts {
@@ -349,41 +391,45 @@ enum Sse {
     Chunk(Chunk),
     Done,
     Error(String),
-    Skip,
 }
 
-/// One event's `data`, which the SSE parser has already unframed.
-fn parse_data(data: &str) -> Sse {
+/// One event's `data`, which the SSE parser has already unframed, as what it
+/// carries in order: its text, then whether it ends the stream, then usage.
+fn parse_data(data: &str) -> Vec<Sse> {
     if data.is_empty() {
-        return Sse::Skip;
+        return Vec::new();
     }
     if data == "[DONE]" {
-        return Sse::Done;
+        return vec![Sse::Done];
     }
     let v = match serde_json::from_str::<Value>(data) {
         Ok(v) => v,
-        Err(e) => return Sse::Error(format!("malformed SSE data: {e}")),
+        Err(e) => return vec![Sse::Error(format!("malformed SSE data: {e}"))],
     };
     if let Some(e) = v.get("error") {
-        return Sse::Error(e.get("message").and_then(Value::as_str).unwrap_or("server error").to_owned());
+        return vec![Sse::Error(e.get("message").and_then(Value::as_str).unwrap_or("server error").to_owned())];
+    }
+    let mut out = Vec::new();
+    if let Some(s) = v.pointer("/choices/0/delta/content").and_then(Value::as_str)
+        && !s.is_empty()
+    {
+        out.push(Sse::Chunk(Chunk::Text(s.to_owned())));
     }
     // Only reasons that mean "cut short" fail: servers differ in how they name a
     // normal ending (`stop`, `eos_token`, `stop_sequence`, an empty string, …).
     match v.pointer("/choices/0/finish_reason").and_then(Value::as_str) {
-        Some("length") => return Sse::Error("the model stopped at its token limit; the rewrite is incomplete".into()),
+        Some("length") => {
+            out.push(Sse::Error("the model stopped at its token limit; the rewrite is incomplete".into()));
+        }
         Some(reason @ ("content_filter" | "abort")) => {
-            return Sse::Error(format!("the model stopped with finish reason {reason:?}; the rewrite is incomplete"));
+            out.push(Sse::Error(format!("the model stopped with finish reason {reason:?}; the rewrite is incomplete")));
         }
         _ => {}
     }
-    if let Some(s) = v.pointer("/choices/0/delta/content").and_then(Value::as_str)
-        && !s.is_empty()
-    {
-        return Sse::Chunk(Chunk::Text(s.to_owned()));
+    if let Some(n) = v.pointer("/usage/completion_tokens").and_then(Value::as_u64) {
+        out.push(Sse::Chunk(Chunk::Usage(u32::try_from(n).unwrap_or(u32::MAX))));
     }
-    v.pointer("/usage/completion_tokens")
-        .and_then(Value::as_u64)
-        .map_or(Sse::Skip, |n| Sse::Chunk(Chunk::Usage(u32::try_from(n).unwrap_or(u32::MAX))))
+    out
 }
 
 #[cfg(test)]
@@ -433,7 +479,7 @@ mod tests {
     const DONE: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"Ok\"}}]}\n\ndata: [DONE]\n\n";
 
     fn request() -> Rewrite {
-        Rewrite { instruction: "Proofread".into(), text: "hello".into(), temperature: 0.2, max_tokens: Some(128) }
+        Rewrite { instruction: "Proofread".into(), text: "hello".into(), temperature: 0.2 }
     }
 
     #[tokio::test]
@@ -441,6 +487,7 @@ mod tests {
         let (base, _server) = serve_sse("data: {\"choices\":[{\"delta\":{\"content\":\"Partial\"}}]}\n\n").await;
         let error = client(&base, None, false).complete(&request()).await.unwrap_err();
         assert!(error.to_string().contains("incomplete"), "{error}");
+        assert!(error.downcast_ref::<Interrupted>().is_some(), "marked as an interruption");
     }
 
     #[tokio::test]
@@ -474,7 +521,7 @@ mod tests {
                 "data: {{\"choices\":[{{\"delta\":{{\"content\":\"Done\"}},\"finish_reason\":\"{reason}\"}}]}}\n\ndata: [DONE]\n\n"
             );
             let (base, _server) = serve(vec![("/v1/chat/completions", "", body)]).await;
-            let text = client(&base, None, false).complete(&request()).await.unwrap();
+            let text = client(&base, None, false).complete(&request()).await.unwrap().0;
             assert_eq!(text, "Done", "{reason:?}");
         }
     }
@@ -495,7 +542,7 @@ mod tests {
     async fn complete_stream_returns_text() {
         let (base, _server) =
             serve_sse("data: {\"choices\":[{\"delta\":{\"content\":\"Complete\"}}]}\n\ndata: [DONE]\n\n").await;
-        let text = client(&base, None, false).complete(&request()).await.unwrap();
+        let text = client(&base, None, false).complete(&request()).await.unwrap().0;
         assert_eq!(text, "Complete");
     }
 
@@ -514,8 +561,8 @@ mod tests {
             ("/v1/chat/completions", "", DONE.to_owned()),
         ])
         .await;
-        let r = Rewrite { max_tokens: None, ..request() };
-        let text = client(&base, Some("k"), true).complete(&r).await.unwrap();
+        let r = request();
+        let text = client(&base, Some("k"), true).complete(&r).await.unwrap().0;
         assert_eq!(text, "Ok");
         let requests = received(&server).await;
         let body = |path: &str| requests.iter().find(|(p, _)| p == path).unwrap().1.clone();
@@ -539,7 +586,7 @@ mod tests {
             ("/v1/chat/completions", "", DONE.to_owned()),
         ])
         .await;
-        let r = Rewrite { max_tokens: None, ..request() };
+        let r = request();
         let error = client(&base, None, true).complete(&r).await.unwrap_err();
         assert!(error.to_string().contains("`<|im_end|>`, a control token"), "{error}");
         assert!(received(&server).await.iter().all(|(p, _)| p != "/v1/chat/completions"));
@@ -553,7 +600,7 @@ mod tests {
             ("/v1/chat/completions", "", DONE.to_owned()),
         ])
         .await;
-        let r = Rewrite { max_tokens: None, ..request() };
+        let r = request();
         let error = client(&base, None, true).complete(&r).await.unwrap_err();
         assert!(error.to_string().contains("`<|im_end|>`, a control token"), "{error}");
         assert!(received(&server).await.iter().all(|(p, _)| p != "/v1/chat/completions"));
@@ -563,8 +610,8 @@ mod tests {
     async fn a_server_that_cannot_count_falls_back_to_the_estimate() {
         // An older llama-server: no /apply-template or /tokenize (the mock answers 404).
         let (base, server) = serve(vec![("/v1/chat/completions", "", DONE.to_owned())]).await;
-        let r = Rewrite { max_tokens: None, ..request() };
-        let text = client(&base, None, true).complete(&r).await.unwrap();
+        let r = request();
+        let text = client(&base, None, true).complete(&r).await.unwrap().0;
         assert_eq!(text, "Ok");
         let requests = received(&server).await;
         let chat = &requests.iter().find(|(p, _)| p == "/v1/chat/completions").unwrap().1;
@@ -605,7 +652,7 @@ mod tests {
     #[tokio::test]
     async fn text_too_long_for_the_context_is_rejected_before_generating() {
         let (base, server) = serve(vec![]).await;
-        let r = Rewrite { max_tokens: None, text: "x".repeat(30_000), ..request() };
+        let r = Rewrite { text: "x".repeat(30_000), ..request() };
         let error = client(&base, None, false).complete(&r).await.unwrap_err();
         assert!(error.to_string().contains("too long"), "{error}");
         assert!(received(&server).await.is_empty());
@@ -631,17 +678,35 @@ mod tests {
 
     #[test]
     fn parses_event_data() {
-        assert_eq!(
-            parse_data(r#"{"choices":[{"delta":{"content":"Hi"}}],"usage":null}"#),
-            Sse::Chunk(Chunk::Text("Hi".into()))
-        );
+        let text = |t: &str| Sse::Chunk(Chunk::Text(t.into()));
+        assert_eq!(parse_data(r#"{"choices":[{"delta":{"content":"Hi"}}],"usage":null}"#), [text("Hi")]);
         assert_eq!(
             parse_data(r#"{"choices":[],"usage":{"completion_tokens":8,"prompt_tokens":14}}"#),
-            Sse::Chunk(Chunk::Usage(8))
+            [Sse::Chunk(Chunk::Usage(8))]
         );
-        assert_eq!(parse_data("[DONE]"), Sse::Done);
-        assert_eq!(parse_data(r#"{"choices":[{"delta":{"role":"assistant"}}]}"#), Sse::Skip);
-        assert_eq!(parse_data(r#"{"error":{"message":"boom"}}"#), Sse::Error("boom".into()));
+        assert_eq!(parse_data("[DONE]"), [Sse::Done]);
+        assert_eq!(parse_data(r#"{"choices":[{"delta":{"role":"assistant"}}]}"#), []);
+        assert_eq!(parse_data(r#"{"error":{"message":"boom"}}"#), [Sse::Error("boom".into())]);
+        // Text that arrives with a truncating ending is delivered before the error.
+        let last = parse_data(r#"{"choices":[{"delta":{"content":"end"},"finish_reason":"length"}]}"#);
+        assert!(matches!(last.as_slice(), [Sse::Chunk(Chunk::Text(t)), Sse::Error(_)] if t == "end"), "{last:?}");
+    }
+
+    #[tokio::test]
+    async fn warm_up_accepts_a_token_sent_with_its_token_limit_ending() {
+        let (base, _server) = serve_sse(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Ok\"},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n",
+        )
+        .await;
+        client(&base, None, true).warm_up().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn warm_up_needs_a_token_not_just_usage() {
+        let (base, _server) =
+            serve_sse("data: {\"choices\":[],\"usage\":{\"completion_tokens\":0}}\n\ndata: [DONE]\n\n").await;
+        let error = client(&base, None, true).warm_up().await.unwrap_err();
+        assert!(error.to_string().contains("no token"), "{error}");
     }
 
     #[tokio::test]
@@ -653,12 +718,12 @@ mod tests {
              data: [DONE]\r\n\r\n",
         )
         .await;
-        assert_eq!(client(&base, None, false).complete(&request()).await.unwrap(), "Ok");
+        assert_eq!(client(&base, None, false).complete(&request()).await.unwrap().0, "Ok");
     }
 
     #[test]
     fn llama_fields_only_for_llama_server() {
-        let r = Rewrite { instruction: "x".into(), text: "y".into(), temperature: 0.2, max_tokens: Some(128) };
+        let r = Rewrite { instruction: "x".into(), text: "y".into(), temperature: 0.2 };
         let ours = client("http://h/v1", None, true).body(&r, 128);
         let byo = client("http://h/v1", None, false).body(&r, 128);
         assert_eq!(ours["chat_template_kwargs"]["enable_thinking"], false);

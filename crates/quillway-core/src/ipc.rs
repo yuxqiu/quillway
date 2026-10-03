@@ -14,7 +14,8 @@ pub enum Request {
         /// Text to start from.
         input: Input,
     },
-    /// Show the popup (no-op if visible).
+    /// Show the popup; a no-op if it is open, except that [`Input::Text`] then
+    /// fails, so the text isn't lost.
     Show {
         /// Text to start from.
         input: Input,

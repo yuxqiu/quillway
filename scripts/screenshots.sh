@@ -92,7 +92,7 @@ capture() { # theme -> $work/review-<theme>.png
     grim "$work/compose-$t.png"
     # The first keypress can race the keyboard focus: retry until the frame changes.
     for _ in 1 2 3; do
-      wtype 1
+      wtype -k Shift_L -M ctrl 1 -m ctrl # Ctrl+1: Proofread (a throwaway first key, see RUNBOOK)
       sleep 1.5
       grim "$work/probe-$t.png"
       cmp -s "$work/probe-$t.png" "$work/compose-$t.png" || break

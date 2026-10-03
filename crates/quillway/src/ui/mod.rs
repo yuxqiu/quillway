@@ -19,9 +19,9 @@ use iced_layershell::reexport::{Anchor, KeyboardInteractivity, Layer, NewLayerSh
 use iced_layershell::settings::{LayerShellSettings, Settings, StartMode};
 use iced_layershell::to_layer_message;
 use quillway_core::catalog::Entry;
-use quillway_core::config::{Config, DEFAULT_TEMPERATURE, Preset};
+use quillway_core::clean;
+use quillway_core::config::{Config, DEFAULT_TEMPERATURE};
 use quillway_core::ipc::{Input, Request, Response};
-use quillway_core::{clean, paths};
 use quillway_engine::download;
 use quillway_engine::{Active, Chunk, Engine, Rewrite, Timing, models};
 
@@ -30,6 +30,12 @@ use crate::ipc::{self, Reply};
 const INPUT_ID: &str = "quillway-input";
 const SOURCE_ID: &str = "quillway-source";
 const MAX_SURFACE_HEIGHT: u32 = 760;
+/// Panel height assumed when a popup opens, until the sensor reports the real one.
+const INITIAL_PANEL_HEIGHT: u32 = 196;
+/// Animation frame interval (fade-in, shimmer).
+const FRAME: Duration = Duration::from_millis(16);
+/// One turn of the shimmer ring while generating.
+const SHIMMER_PERIOD: Duration = Duration::from_millis(2400);
 const FADE_IN: Duration = Duration::from_millis(140);
 const CLIPBOARD_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -38,11 +44,9 @@ static LISTENER: Mutex<Option<UnixListener>> = Mutex::new(None);
 
 pub fn run() -> anyhow::Result<()> {
     *LISTENER.lock().expect("listener lock") = Some(ipc::bind()?);
-    let config = Config::load(&paths::config_file())?;
+    let config = Config::load_user()?;
     let active = models::active(&config)?;
-    let watch = quillway_wl::ClipboardWatch::start()
-        .inspect_err(|e| eprintln!("quillway: {e:#}; the clipboard will always count as recent"))
-        .ok();
+    let watch = start_clipboard_watch();
     // `Font::with_name` needs a `'static` name; this runs once per process.
     let default_font =
         config.ui.font.as_ref().map_or_else(iced::Font::default, |f| iced::Font::with_name(f.clone().leak()));
@@ -67,12 +71,18 @@ pub fn run() -> anyhow::Result<()> {
     .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
+fn start_clipboard_watch() -> Option<quillway_wl::ClipboardWatch> {
+    quillway_wl::ClipboardWatch::start()
+        .inspect_err(|e| eprintln!("quillway: {e:#}; the clipboard will always count as recent"))
+        .ok()
+}
+
 fn namespace() -> String {
     "quillway".into()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Origin {
+enum Origin {
     Clipboard,
     /// Piped to `quillway show|toggle --stdin`.
     Stdin,
@@ -81,7 +91,7 @@ pub enum Origin {
 }
 
 impl Origin {
-    pub const fn label(self) -> &'static str {
+    const fn label(self) -> &'static str {
         match self {
             Self::Clipboard => "clipboard",
             Self::Stdin => "stdin",
@@ -93,13 +103,13 @@ impl Origin {
 /// Which box has the keyboard: the instruction, or the text (the source while
 /// composing, the latest draft while reviewing).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Field {
+enum Field {
     Instruction,
     Source,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum EngineState {
+enum EngineState {
     Starting,
     Ready,
     Missing,
@@ -119,41 +129,43 @@ impl EngineState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Phase {
+enum Phase {
     Composing,
     Generating,
     Reviewing,
 }
 
-pub struct Draft {
-    pub text: String,
-    pub label: String,
-    pub stats: String,
-    pub show_diff: bool,
+struct Draft {
+    text: String,
+    label: String,
+    stats: String,
+    show_diff: bool,
     /// Generation failed part-way; this is what arrived.
-    pub incomplete: bool,
+    incomplete: bool,
     /// What produced it; `None` for a hand edit, which has nothing to retry.
     request: Option<Rewrite>,
 }
 
 impl Draft {
-    pub const fn edited(&self) -> bool {
+    const fn edited(&self) -> bool {
         self.request.is_none()
     }
 }
 
-pub struct Generation {
+struct Generation {
     id: u64,
     handle: task::Handle,
-    pub raw: String,
-    pub label: String,
+    raw: String,
+    label: String,
     show_diff: bool,
     /// A retry: replaces the latest draft when it finishes (kept if cancelled).
     retry: bool,
     request: Rewrite,
-    /// The instruction box's text when this started; given back if it fails without a draft.
-    typed: String,
+    /// The instruction box's text, if this was started from it; given back if it fails without a draft.
+    typed: Option<String>,
     timing: Timing,
+    /// `raw` cleaned for display, updated as chunks arrive rather than on every frame.
+    shown: Option<String>,
 }
 
 impl Generation {
@@ -162,30 +174,28 @@ impl Generation {
     }
 }
 
-pub struct Popup {
+struct Popup {
     id: window::Id,
-    /// The text to rewrite, editable until the first generation.
-    pub source: text_editor::Content,
-    /// `source` as it was when the first generation started; the diff base.
-    pub original: String,
-    pub origin: Origin,
-    pub field: Field,
-    pub input: String,
-    pub drafts: Vec<Draft>,
+    /// The text to rewrite, editable while there are no drafts.
+    source: text_editor::Content,
+    origin: Origin,
+    field: Field,
+    input: String,
+    drafts: Vec<Draft>,
     /// The latest draft, while it is being edited by hand.
-    pub draft_editor: text_editor::Content,
-    pub generation: Option<Generation>,
-    pub show_diff: bool,
-    /// Set by Ctrl+D: the user's choice outlives the presets' defaults.
-    diff_pinned: bool,
-    pub error: Option<String>,
-    focused: bool,
+    draft_editor: text_editor::Content,
+    generation: Option<Generation>,
+    /// Set by Ctrl+D; until then each draft shows its preset's default.
+    diff_choice: Option<bool>,
+    error: Option<String>,
+    /// The keyboard was given to `field`'s box, on the first resize.
+    focus_given: bool,
     size: (u32, u32),
     opened: Instant,
 }
 
 impl Popup {
-    pub const fn phase(&self) -> Phase {
+    const fn phase(&self) -> Phase {
         if self.generation.is_some() {
             Phase::Generating
         } else if self.drafts.is_empty() {
@@ -201,7 +211,7 @@ impl Popup {
     }
 
     /// The latest draft has the keyboard (Tab while reviewing).
-    pub fn editing(&self) -> bool {
+    fn editing(&self) -> bool {
         self.phase() == Phase::Reviewing && self.field == Field::Source
     }
 
@@ -228,19 +238,34 @@ impl Popup {
         self.drafts.push(draft);
     }
 
-    /// Unless Ctrl+D pinned it, the diff follows the latest draft's preset.
-    fn follow_diff(&mut self) {
-        if !self.diff_pinned {
-            self.show_diff = self.drafts.last().is_some_and(|d| d.show_diff);
+    /// End `g` with `error`: keep what arrived as an incomplete draft (unless a
+    /// retry failed: its old draft stays), else give back the typed instruction.
+    fn fail(&mut self, g: Generation, error: String) {
+        let partial = clean::clean(&g.raw, &g.request.text, false).trim_end().to_owned();
+        if !partial.is_empty() && !g.retry {
+            self.drafts.push(g.into_draft(partial, "stopped early".into(), true));
+        } else if let Some(typed) = g.typed {
+            self.input = typed;
         }
+        self.error = Some(error);
+    }
+
+    /// Whether the latest draft is shown as a word diff: Ctrl+D's choice, else its preset's default.
+    fn show_diff(&self) -> bool {
+        self.diff_choice.or_else(|| self.drafts.last().map(|d| d.show_diff)).unwrap_or(false)
+    }
+
+    /// The diff base: the text the first draft was made from.
+    fn original(&self) -> &str {
+        self.drafts.first().and_then(|d| d.request.as_ref()).map_or("", |r| r.text.as_str())
     }
 }
 
-pub struct Install {
-    pub entry: &'static Entry,
-    pub done: u64,
-    pub rate: download::Rate,
-    pub error: Option<String>,
+struct Install {
+    entry: &'static Entry,
+    done: u64,
+    rate: download::Rate,
+    error: Option<String>,
 }
 
 impl Install {
@@ -249,16 +274,15 @@ impl Install {
     }
 }
 
-pub struct App {
+struct App {
     config: Config,
-    pub presets: Vec<Preset>,
     engine: Engine,
-    pub engine_state: EngineState,
-    pub active: Active,
-    pub palette: style::Palette,
-    pub popup: Option<Popup>,
-    pub install: Option<Install>,
-    pub now: Instant,
+    engine_state: EngineState,
+    active: Active,
+    palette: style::Palette,
+    popup: Option<Popup>,
+    install: Option<Install>,
+    now: Instant,
     next_gen: u64,
     /// The latest warm-up; results of earlier ones (superseded by a reload) are ignored.
     warm_id: u64,
@@ -273,7 +297,7 @@ pub struct App {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub enum Shortcut {
+enum Shortcut {
     Escape,
     Tab,
     Diff,
@@ -283,21 +307,21 @@ pub enum Shortcut {
 }
 
 #[derive(Debug, Clone)]
-pub enum GenEvent {
+enum GenEvent {
     Chunk(Chunk),
     Error(String),
     Done,
 }
 
 #[derive(Debug, Clone)]
-pub enum InstallEvent {
+enum InstallEvent {
     Progress(u64),
     Done(Result<(), String>),
 }
 
 #[to_layer_message(multi)]
 #[derive(Debug, Clone)]
-pub enum Message {
+enum Message {
     Ipc(Request, Reply),
     /// A clipboard read: its text (`None` if empty), or why it failed.
     Captured(u64, Result<Option<String>, String>),
@@ -322,9 +346,8 @@ pub enum Message {
 
 impl App {
     fn boot(config: Config, active: Active, watch: Option<quillway_wl::ClipboardWatch>) -> (Self, Task<Message>) {
-        let engine = Engine::new(config.clone());
+        let engine = Engine::new(config.model.clone(), active.clone());
         let mut app = Self {
-            presets: config.presets(),
             active,
             palette: style::Palette::new(&config.ui),
             engine_state: EngineState::Starting,
@@ -340,7 +363,7 @@ impl App {
             next_capture: 0,
             held: None,
         };
-        let warm = app.warm_up();
+        let warm = app.warm_up(None);
         (app, warm)
     }
 
@@ -349,18 +372,29 @@ impl App {
         self.config.model.endpoint.is_none() && !self.active.is_installed()
     }
 
-    fn warm_up(&mut self) -> Task<Message> {
+    /// Start the model server and warm it up; `reply` (from `quillway reload`)
+    /// gets the outcome, so a model that fails to start is reported.
+    fn warm_up(&mut self, reply: Option<Reply>) -> Task<Message> {
         if self.model_missing() {
             self.engine_state = EngineState::Missing;
+            if let Some(reply) = reply {
+                let message = self.active.ensure_installed().err().map_or_else(String::new, |e| format!("{e:#}"));
+                reply.send(Response::Error { message });
+            }
             return Task::none();
         }
         self.engine_state = EngineState::Starting;
         self.warm_id += 1;
         let id = self.warm_id;
         let engine = self.engine.clone();
-        Task::perform(async move { engine.warm_up().await.map_err(|e| format!("{e:#}")) }, move |r| {
-            Message::Engine(id, r)
-        })
+        let warm = async move {
+            let result = engine.warm_up().await.map_err(|e| format!("{e:#}"));
+            if let Some(reply) = reply {
+                reply.send(result.clone().map_or_else(|message| Response::Error { message }, |()| Response::Ok));
+            }
+            result
+        };
+        Task::perform(warm, move |result| Message::Engine(id, result))
     }
 
     fn subscription(&self) -> Subscription<Message> {
@@ -373,7 +407,7 @@ impl App {
             window::close_events().map(Message::WindowClosed),
         ];
         if self.animating() {
-            subs.push(iced::time::every(Duration::from_millis(16)).map(Message::Tick));
+            subs.push(iced::time::every(FRAME).map(Message::Tick));
         }
         Subscription::batch(subs)
     }
@@ -387,20 +421,7 @@ impl App {
             Message::Ipc(req, reply) => self.ipc(req, &reply),
             Message::Captured(id, result) => self.captured(id, result),
             Message::Input(s) => self.on_input(s),
-            Message::Edit(action) => {
-                if let Some(p) = self.popup.as_mut() {
-                    if p.phase() == Phase::Composing {
-                        p.source.perform(action);
-                    } else if p.editing() {
-                        let edit = action.is_edit();
-                        p.draft_editor.perform(action);
-                        if edit {
-                            p.keep_edit();
-                        }
-                    }
-                }
-                Task::none()
-            }
+            Message::Edit(action) => self.on_edit(action),
             Message::Submit => self.submit(),
             Message::Preset(i) => self.run_preset(i),
             Message::Gen(id, ev) => self.on_gen(id, ev),
@@ -416,48 +437,16 @@ impl App {
                 }
                 Task::none()
             }
-            Message::Clicked(id) => match self.popup.as_ref().filter(|p| p.id == id).map(Popup::phase) {
-                Some(Phase::Composing | Phase::Reviewing) => {
-                    iced::widget::operation::is_focused(INPUT_ID).then(move |input| {
-                        if input {
-                            Task::done(Message::Focused(id, Some(Field::Instruction)))
-                        } else {
-                            iced::widget::operation::is_focused(SOURCE_ID)
-                                .map(move |source| Message::Focused(id, source.then_some(Field::Source)))
-                        }
-                    })
-                }
-                _ => Task::none(),
-            },
-            Message::Focused(id, field) => {
-                // Keep `field` in step with clicks, so Tab and the shortcuts act on the focused box;
-                // a click on neither box gives the keyboard back to `field`'s.
-                let Some(p) = self.popup.as_mut().filter(|p| p.id == id && p.generation.is_none()) else {
-                    return Task::none();
-                };
-                match field {
-                    Some(f) => {
-                        p.field = f;
-                        Task::none()
-                    }
-                    None => focus(p.field),
-                }
-            }
+            Message::Clicked(id) => self.on_click(id),
+            Message::Focused(id, field) => self.on_focused(id, field),
             Message::Resized(size) => self.on_resize(size),
             Message::Tick(now) => {
                 self.now = now;
                 Task::none()
             }
-            Message::Engine(id, _) if id != self.warm_id => Task::none(),
-            Message::Engine(_, r) => {
-                self.engine_state = match r {
-                    Ok(()) => EngineState::Ready,
-                    Err(_) if self.model_missing() => EngineState::Missing,
-                    Err(e) => {
-                        eprintln!("quillway: engine: {e}");
-                        EngineState::Failed(e)
-                    }
-                };
+            Message::Engine(id, _) if id != self.warm_id => Task::none(), // superseded by a reload
+            Message::Engine(_, result) => {
+                self.on_warmed_up(result);
                 Task::none()
             }
             Message::InstallStart => self.start_install(),
@@ -472,6 +461,64 @@ impl App {
             // Layer-shell actions are handled by iced_layershell before reaching us.
             _ => Task::none(),
         }
+    }
+
+    fn on_edit(&mut self, action: text_editor::Action) -> Task<Message> {
+        let Some(p) = self.popup.as_mut() else { return Task::none() };
+        if p.phase() == Phase::Composing {
+            p.source.perform(action);
+        } else if p.editing() {
+            let edit = action.is_edit();
+            p.draft_editor.perform(action);
+            if edit {
+                p.keep_edit();
+            }
+        }
+        Task::none()
+    }
+
+    /// A click may have moved the keyboard to the other box: ask which box has it.
+    fn on_click(&self, id: window::Id) -> Task<Message> {
+        if !matches!(
+            self.popup.as_ref().filter(|p| p.id == id).map(Popup::phase),
+            Some(Phase::Composing | Phase::Reviewing)
+        ) {
+            return Task::none();
+        }
+        iced::widget::operation::is_focused(INPUT_ID).then(move |input| {
+            if input {
+                Task::done(Message::Focused(id, Some(Field::Instruction)))
+            } else {
+                iced::widget::operation::is_focused(SOURCE_ID)
+                    .map(move |source| Message::Focused(id, source.then_some(Field::Source)))
+            }
+        })
+    }
+
+    /// Keep `field` in step with clicks, so Tab and the shortcuts act on the focused box;
+    /// a click on neither box gives the keyboard back to `field`'s.
+    fn on_focused(&mut self, id: window::Id, field: Option<Field>) -> Task<Message> {
+        let Some(p) = self.popup.as_mut().filter(|p| p.id == id && p.generation.is_none()) else {
+            return Task::none();
+        };
+        match field {
+            Some(f) => {
+                p.field = f;
+                Task::none()
+            }
+            None => focus(p.field),
+        }
+    }
+
+    fn on_warmed_up(&mut self, result: Result<(), String>) {
+        self.engine_state = match result {
+            Ok(()) => EngineState::Ready,
+            Err(_) if self.model_missing() => EngineState::Missing,
+            Err(e) => {
+                eprintln!("quillway: engine: {e}");
+                EngineState::Failed(e)
+            }
+        };
     }
 
     fn ipc(&mut self, req: Request, reply: &Reply) -> Task<Message> {
@@ -505,7 +552,7 @@ impl App {
                     // Text sent explicitly wins over a clipboard read still in flight.
                     Input::Text(t) => {
                         self.capturing = None;
-                        self.open(t, Origin::Stdin, None)
+                        self.open(&t, Origin::Stdin, None)
                     }
                     Input::Clipboard if self.capturing.is_some() => Task::none(),
                     Input::Clipboard if self.clipboard_recent() => {
@@ -514,7 +561,7 @@ impl App {
                         self.capturing = Some(id);
                         Task::perform(read_clipboard(), move |result| Message::Captured(id, result))
                     }
-                    Input::Clipboard => self.open(String::new(), Origin::Typed, None),
+                    Input::Clipboard => self.open("", Origin::Typed, None),
                 }
             }
             Request::Hide => {
@@ -522,26 +569,28 @@ impl App {
                 self.capturing = None;
                 self.hide()
             }
-            Request::Reload => {
-                match Config::load(&paths::config_file()).and_then(|config| Ok((models::active(&config)?, config))) {
-                    Ok((active, config)) => {
-                        self.presets = config.presets();
-                        self.active = active;
-                        self.palette = style::Palette::new(&config.ui);
-                        self.config = config.clone();
-                        let (engine, reply) = (self.engine.clone(), reply.clone());
-                        let reload = Task::future(async move {
-                            engine.reload(config).await;
-                            reply.send(Response::Ok);
-                        });
-                        reload.discard().chain(self.warm_up())
+            Request::Reload => match Config::load_user().and_then(|config| Ok((models::active(&config)?, config))) {
+                Ok((active, config)) => {
+                    self.active = active;
+                    self.palette = style::Palette::new(&config.ui);
+                    self.config = config.clone();
+                    // The server this generation streams from is about to stop: say so, not "incomplete response".
+                    if let Some(p) = self.popup.as_mut()
+                        && let Some(g) = p.generation.take()
+                    {
+                        g.handle.abort();
+                        p.fail(g, "Stopped: the model server is restarting for a reload. Run it again.".into());
                     }
-                    Err(e) => {
-                        reply.send(Response::Error { message: format!("{e:#}") });
-                        Task::none()
-                    }
+                    let (engine, active) = (self.engine.clone(), self.active.clone());
+                    let reload = Task::future(async move { engine.reload(config.model, active).await });
+                    // The reply waits for the warm-up, so `quillway reload` reports a model that fails to start.
+                    reload.discard().chain(self.warm_up(Some(reply.clone())))
                 }
-            }
+                Err(e) => {
+                    reply.send(Response::Error { message: format!("{e:#}") });
+                    Task::none()
+                }
+            },
             Request::Status => {
                 let engine = self.engine_state.describe();
                 reply.send(Response::Status { visible: self.popup.is_some(), model: self.model_label(), engine });
@@ -574,7 +623,13 @@ impl App {
     }
 
     /// Copied within `behavior.recent_secs`. Without a watcher we can't tell, so yes.
-    fn clipboard_recent(&self) -> bool {
+    fn clipboard_recent(&mut self) -> bool {
+        if self.watch.as_ref().is_some_and(|w| !w.is_alive()) {
+            // It stopped (e.g. the compositor ended it): start another. Copies made
+            // meanwhile went unseen, so this time the clipboard counts as recent.
+            self.watch = start_clipboard_watch();
+            return true;
+        }
         let window = Duration::from_secs(self.config.behavior.recent_secs);
         self.watch.as_ref().is_none_or(|w| w.last_change().is_some_and(|t| t.elapsed() < window))
     }
@@ -585,40 +640,38 @@ impl App {
         }
         self.capturing = None;
         match result {
-            Ok(Some(text)) => self.open(text, Origin::Clipboard, None),
-            Ok(None) => self.open(String::new(), Origin::Typed, None),
-            Err(e) => self.open(String::new(), Origin::Typed, Some(e)),
+            Ok(Some(text)) => self.open(&text, Origin::Clipboard, None),
+            Ok(None) => self.open("", Origin::Typed, None),
+            Err(e) => self.open("", Origin::Typed, Some(e)),
         }
     }
 
-    fn open(&mut self, text: String, origin: Origin, error: Option<String>) -> Task<Message> {
+    fn open(&mut self, text: &str, origin: Origin, error: Option<String>) -> Task<Message> {
         // The model may have been installed since we last looked (copied in, or by a CLI
         // that couldn't reach us); start it instead of offering the install card.
         let warm = if self.engine_state == EngineState::Missing && self.active.is_installed() {
-            self.warm_up()
+            self.warm_up(None)
         } else {
             Task::none()
         };
         // A key held as the last popup closed was released elsewhere.
         self.held = None;
         let id = window::Id::unique();
-        let size = self.surface_size(196);
+        let size = self.surface_size(INITIAL_PANEL_HEIGHT);
         let top = i32::try_from(self.config.ui.top_margin.saturating_sub(self.margin())).unwrap_or(i32::MAX);
         self.now = Instant::now();
         self.popup = Some(Popup {
             id,
             field: if text.trim().is_empty() { Field::Source } else { Field::Instruction },
-            source: editor_content(&text),
-            original: text,
+            source: editor_content(text),
             origin,
             input: String::new(),
             drafts: Vec::new(),
             draft_editor: text_editor::Content::new(),
             generation: None,
-            show_diff: false,
-            diff_pinned: false,
+            diff_choice: None,
             error,
-            focused: false,
+            focus_given: false,
             size,
             opened: Instant::now(),
         });
@@ -662,8 +715,8 @@ impl App {
         let mut tasks = Vec::new();
         let want = self.surface_size(panel.height.ceil() as u32);
         let Some(p) = self.popup.as_mut() else { return Task::none() };
-        if !p.focused {
-            p.focused = true;
+        if !p.focus_given {
+            p.focus_given = true;
             tasks.push(focus(p.field));
         }
         if p.size != want {
@@ -690,21 +743,34 @@ impl App {
         let instruction = p.input.trim().to_owned();
         match (p.phase(), instruction.is_empty()) {
             (Phase::Reviewing, true) => self.copy(),
-            (Phase::Composing, false) => self.generate("Custom".into(), instruction, DEFAULT_TEMPERATURE, false),
-            (Phase::Reviewing, false) => self.generate("Refine".into(), instruction, DEFAULT_TEMPERATURE, false),
+            (Phase::Composing, false) => self.generate("Custom".into(), instruction, DEFAULT_TEMPERATURE, false, true),
+            (Phase::Reviewing, false) => self.generate("Refine".into(), instruction, DEFAULT_TEMPERATURE, false, true),
             (Phase::Composing, true) | (Phase::Generating, _) => Task::none(),
         }
     }
 
     fn run_preset(&mut self, i: usize) -> Task<Message> {
-        let Some(preset) = self.presets.get(i).cloned() else { return Task::none() };
+        let Some(preset) = self.config.presets().get(i).cloned() else { return Task::none() };
         if self.needs_install() || self.popup.as_ref().is_none_or(|p| p.generation.is_some()) {
             return Task::none();
         }
-        self.generate(preset.name, preset.instruction, preset.temperature, preset.show_diff)
+        // A preset clears the instruction box. That also drops the digit a Ctrl+digit key
+        // typed there: iced's `text_input` inserts it even with Ctrl held.
+        if let Some(p) = self.popup.as_mut() {
+            p.input.clear();
+        }
+        self.generate(preset.name, preset.instruction, preset.temperature, preset.show_diff, false)
     }
 
-    fn generate(&mut self, label: String, instruction: String, temperature: f32, show_diff: bool) -> Task<Message> {
+    /// `from_input`: the instruction is the instruction box's text, which is cleared while it runs.
+    fn generate(
+        &mut self,
+        label: String,
+        instruction: String,
+        temperature: f32,
+        show_diff: bool,
+        from_input: bool,
+    ) -> Task<Message> {
         let Some(p) = self.popup.as_mut() else { return Task::none() };
         let text = p.base();
         if text.trim().is_empty() {
@@ -712,14 +778,18 @@ impl App {
             return Task::none();
         }
         // The client counts tokens and rejects text too long for the context.
-        let request = Rewrite { instruction, max_tokens: None, text, temperature };
-        if p.drafts.is_empty() {
-            p.original.clone_from(&request.text);
-        }
-        self.start(label, request, show_diff, false)
+        let request = Rewrite { instruction, text, temperature };
+        self.start(label, request, show_diff, false, from_input)
     }
 
-    fn start(&mut self, label: String, request: Rewrite, show_diff: bool, retry: bool) -> Task<Message> {
+    fn start(
+        &mut self,
+        label: String,
+        request: Rewrite,
+        show_diff: bool,
+        retry: bool,
+        from_input: bool,
+    ) -> Task<Message> {
         let id = self.next_gen;
         self.next_gen += 1;
         let Some(p) = self.popup.as_mut() else { return Task::none() };
@@ -736,8 +806,9 @@ impl App {
             show_diff,
             retry,
             request,
-            typed: std::mem::take(&mut p.input),
+            typed: from_input.then(|| std::mem::take(&mut p.input)),
             timing: Timing::start(),
+            shown: None,
         });
         Task::batch([task, focus(Field::Instruction)])
     }
@@ -754,26 +825,20 @@ impl App {
                 g.timing.record(&chunk);
                 if let Chunk::Text(t) = chunk {
                     g.raw.push_str(&t);
+                    g.shown = clean::ready(&g.raw, false).then(|| clean::clean(&g.raw, &g.request.text, false));
                 }
             }
             GenEvent::Error(e) => {
                 let g = p.generation.take().expect("matched above");
-                let partial = clean::clean(&g.raw, &g.request.text, false).trim_end().to_owned();
-                // Keep what arrived, marked, unless a retry failed (its old draft stays).
-                if !partial.trim().is_empty() && !g.retry {
-                    p.drafts.push(g.into_draft(partial, "stopped early".into(), true));
-                    p.follow_diff();
-                } else {
-                    // Nothing new to review: give back the instruction, to fix or send again.
-                    p.input = g.typed;
-                }
-                p.error = Some(e);
+                p.fail(g, e);
             }
             GenEvent::Done => {
                 let g = p.generation.take().expect("matched above");
                 let text = clean::clean(&g.raw, &g.request.text, true);
                 if text.trim().is_empty() {
-                    p.input = g.typed;
+                    if let Some(typed) = g.typed {
+                        p.input = typed;
+                    }
                     p.error = Some("The model returned nothing. Run it again, or try another preset.".into());
                     return Task::none();
                 }
@@ -783,13 +848,13 @@ impl App {
                     p.drafts.pop();
                 }
                 p.drafts.push(g.into_draft(text, format!("{secs:.1}s · {rate:.0} tok/s"), false));
-                p.follow_diff();
             }
         }
         Task::none()
     }
 
     fn on_shortcut(&mut self, s: Shortcut) -> Task<Message> {
+        let installing = self.needs_install();
         let Some(p) = self.popup.as_mut() else { return Task::none() };
         match (s, p.phase()) {
             (Shortcut::Escape, Phase::Generating) => {
@@ -797,6 +862,8 @@ impl App {
                 Task::none()
             }
             (Shortcut::Escape, _) => self.hide(),
+            // The install card has no text box to move to; ↵ must keep working.
+            (Shortcut::Tab, _) if installing => Task::none(),
             (Shortcut::Tab, Phase::Composing | Phase::Reviewing) => {
                 p.field = match p.field {
                     Field::Instruction => Field::Source,
@@ -811,20 +878,18 @@ impl App {
             _ if p.field == Field::Source => Task::none(),
             (Shortcut::Preset(i), Phase::Composing | Phase::Reviewing) => self.run_preset(i),
             (Shortcut::Diff, Phase::Reviewing) => {
-                p.show_diff = !p.show_diff;
-                p.diff_pinned = true;
+                p.diff_choice = Some(!p.show_diff());
                 Task::none()
             }
             (Shortcut::Retry, Phase::Reviewing) => {
                 let Some(d) = p.drafts.last() else { return Task::none() };
                 let Some(request) = d.request.clone() else { return Task::none() };
                 let (label, show_diff) = (d.label.clone(), d.show_diff);
-                self.start(label, request, show_diff, true)
+                self.start(label, request, show_diff, true, false)
             }
             (Shortcut::Undo, Phase::Reviewing) => {
                 p.drafts.pop();
                 p.error = None;
-                p.follow_diff();
                 Task::none()
             }
             _ => Task::none(),
@@ -869,7 +934,7 @@ impl App {
             }
             InstallEvent::Done(Ok(())) => {
                 self.install = None;
-                self.warm_up()
+                self.warm_up(None)
             }
             InstallEvent::Done(Err(e)) => {
                 i.error = Some(e);
@@ -879,18 +944,18 @@ impl App {
     }
 
     /// The install card replaces the composer only before anything was generated.
-    pub fn needs_install(&self) -> bool {
+    fn needs_install(&self) -> bool {
         self.engine_state == EngineState::Missing && self.popup.as_ref().is_some_and(|p| p.phase() == Phase::Composing)
     }
 
     /// Name shown in the footer and `status`.
-    pub fn model_label(&self) -> String {
+    fn model_label(&self) -> String {
         // The config requires `endpoint_model` with `endpoint`.
         let endpoint_model = self.config.model.endpoint.as_ref().and(self.config.model.endpoint_model.as_ref());
         endpoint_model.unwrap_or(&self.active.name).clone()
     }
 
-    pub fn fade(&self) -> f32 {
+    fn fade(&self) -> f32 {
         let Some(p) = &self.popup else { return 1.0 };
         let t = self.now.saturating_duration_since(p.opened).as_secs_f32() / FADE_IN.as_secs_f32();
         let t = t.clamp(0.0, 1.0);
@@ -898,14 +963,14 @@ impl App {
     }
 
     /// Rotation of the shimmer ring, in turns, while generating.
-    pub fn shimmer(&self) -> Option<f32> {
+    fn shimmer(&self) -> Option<f32> {
         let g = self.popup.as_ref()?.generation.as_ref()?;
-        Some((self.now.saturating_duration_since(g.timing.started()).as_secs_f32() / 2.4).fract())
+        let elapsed = self.now.saturating_duration_since(g.timing.started());
+        Some((elapsed.as_secs_f32() / SHIMMER_PERIOD.as_secs_f32()).fract())
     }
 
-    pub fn streaming_text(&self) -> Option<String> {
-        let g = self.popup.as_ref()?.generation.as_ref()?;
-        clean::ready(&g.raw, false).then(|| clean::clean(&g.raw, &g.request.text, false))
+    fn streaming_text(&self) -> Option<&str> {
+        self.popup.as_ref()?.generation.as_ref()?.shown.as_deref()
     }
 }
 
@@ -1082,14 +1147,14 @@ mod tests {
     #[test]
     fn diff_has_its_own_key_and_is_off_while_editing() {
         let mut app = reviewing_app();
-        let shown = app.popup.as_ref().unwrap().show_diff;
+        let shown = app.popup.as_ref().unwrap().show_diff();
         let _ = app.on_shortcut(Shortcut::Diff);
-        assert_eq!(app.popup.as_ref().unwrap().show_diff, !shown);
+        assert_eq!(app.popup.as_ref().unwrap().show_diff(), !shown);
         let _ = app.on_shortcut(Shortcut::Tab);
         let _ = app.on_shortcut(Shortcut::Diff);
-        assert_eq!(app.popup.as_ref().unwrap().show_diff, !shown, "ignored while editing");
+        assert_eq!(app.popup.as_ref().unwrap().show_diff(), !shown, "ignored while editing");
         let _ = app.on_shortcut(Shortcut::Tab);
-        assert_eq!(app.popup.as_ref().unwrap().show_diff, !shown, "Tab no longer toggles the diff");
+        assert_eq!(app.popup.as_ref().unwrap().show_diff(), !shown, "Tab no longer toggles the diff");
     }
 
     #[test]
@@ -1206,14 +1271,14 @@ mod tests {
     #[test]
     fn a_chosen_diff_setting_outlives_preset_defaults() {
         let mut app = reviewing_app(); // Proofread shows the diff by default
-        assert!(app.popup.as_ref().unwrap().show_diff);
+        assert!(app.popup.as_ref().unwrap().show_diff());
         let _ = app.on_shortcut(Shortcut::Diff);
         let _ = app.on_shortcut(Shortcut::Preset(0));
         let _ = app.update(Message::Gen(1, text("They are here.")));
         let _ = app.update(Message::Gen(1, GenEvent::Done));
-        assert!(!app.popup.as_ref().unwrap().show_diff, "a new draft keeps the choice");
+        assert!(!app.popup.as_ref().unwrap().show_diff(), "a new draft keeps the choice");
         let _ = app.on_shortcut(Shortcut::Undo);
-        assert!(!app.popup.as_ref().unwrap().show_diff, "so does undo");
+        assert!(!app.popup.as_ref().unwrap().show_diff(), "so does undo");
     }
 
     #[test]
@@ -1234,7 +1299,7 @@ mod tests {
     fn superseded_warm_up_result_is_ignored() {
         let mut app = boot(endpoint_config());
         let first = app.warm_id;
-        let _ = app.warm_up(); // a reload
+        let _ = app.warm_up(None); // a reload
         let _ = app.update(Message::Engine(first, Err("killed by the reload".into())));
         assert_eq!(app.engine_state, EngineState::Starting);
         let _ = app.update(Message::Engine(app.warm_id, Ok(())));
@@ -1330,6 +1395,60 @@ mod tests {
         let _ = app.update(Message::Submit); // ↵ on the card that shows the license notice
         let install = app.install.as_ref().expect("install started");
         assert_eq!((install.entry.id.as_str(), install.error.as_deref()), ("lfm2.5-1.2b", None));
+    }
+
+    #[test]
+    fn a_preset_clears_the_instruction_box() {
+        let mut app = boot(endpoint_config());
+        let _ = app.update(Message::Ipc(Request::Show { input: Input::Text("their here".into()) }, reply()));
+        // Ctrl+1 in the instruction box also types "1" there (iced's text_input).
+        let _ = app.update(Message::Input("1".into()));
+        let _ = app.update(Message::Preset(0));
+        let _ = app.update(Message::Gen(0, text("They're here.")));
+        let _ = app.update(Message::Gen(0, GenEvent::Done));
+        let p = app.popup.as_ref().unwrap();
+        assert_eq!((p.phase(), p.input.as_str()), (Phase::Reviewing, ""));
+    }
+
+    #[test]
+    fn a_reload_stops_a_rewrite_and_says_why() {
+        let mut app = generating_app();
+        let _ = app.update(Message::Gen(0, text("They're")));
+        let _ = app.update(Message::Ipc(Request::Reload, reply()));
+        let p = app.popup.as_ref().unwrap();
+        assert!(p.generation.is_none());
+        assert!(p.error.as_deref().is_some_and(|e| e.contains("restarting for a reload")), "{:?}", p.error);
+        assert!(p.drafts[0].incomplete, "the partial text is kept");
+    }
+
+    #[test]
+    fn tab_on_the_install_card_keeps_the_keyboard_on_the_instruction() {
+        let path = std::env::temp_dir().join(format!("quillway-missing-{}.gguf", std::process::id()));
+        let mut config = Config::default();
+        config.model.active = Some(format!("custom:{}", path.display()));
+        let mut app = boot(config);
+        let _ = app.update(Message::Ipc(Request::Show { input: Input::Text("hi".into()) }, reply()));
+        assert!(app.needs_install());
+        let _ = app.on_shortcut(Shortcut::Tab);
+        assert_eq!(app.popup.as_ref().unwrap().field, Field::Instruction);
+    }
+
+    #[test]
+    fn a_reload_replies_after_the_warm_up() {
+        let path = std::env::temp_dir().join(format!("quillway-missing-{}.gguf", std::process::id()));
+        let mut app = boot(endpoint_config());
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        // A model that can't start is reported to `quillway reload` instead of "ok".
+        app.active = models::active(&{
+            let mut c = Config::default();
+            c.model.active = Some(format!("custom:{}", path.display()));
+            c
+        })
+        .unwrap();
+        app.config.model.endpoint = None;
+        let _ = app.warm_up(Some(Reply::new(tx)));
+        let Ok(Response::Error { message }) = rx.try_recv() else { panic!("expected an error reply") };
+        assert!(message.contains("model file not found"), "{message}");
     }
 
     #[test]

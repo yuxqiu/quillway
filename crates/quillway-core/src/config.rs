@@ -1,14 +1,15 @@
 //! `config.toml` schema. Every field has a default, so an empty or missing file works.
 
 use std::path::Path;
+use std::sync::LazyLock;
 
 use anyhow::Context;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
-use crate::catalog;
+use crate::{catalog, paths};
 
 /// The whole config file.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// `[model]`
@@ -23,7 +24,7 @@ pub struct Config {
 }
 
 /// `[model]`: which model runs and how.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ModelConfig {
     /// Catalog id or `custom:<path to .gguf>`. Unset: `models use` state, then the catalog default.
@@ -49,6 +50,14 @@ pub struct ModelConfig {
     pub extra_args: Vec<String>,
 }
 
+impl ModelConfig {
+    /// The `llama-server` to run: `llama_server`, else the one on `$PATH`.
+    #[must_use]
+    pub fn llama_server_bin(&self) -> &str {
+        self.llama_server.as_deref().unwrap_or("llama-server")
+    }
+}
+
 impl Default for ModelConfig {
     fn default() -> Self {
         Self {
@@ -65,7 +74,7 @@ impl Default for ModelConfig {
 }
 
 /// Popup colour scheme.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ThemeChoice {
     /// Light text on a dark panel.
@@ -76,13 +85,13 @@ pub enum ThemeChoice {
 }
 
 /// `[ui]`: popup look and placement.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct UiConfig {
     /// Colour scheme.
     pub theme: ThemeChoice,
     /// Accent colour, `#rrggbb`.
-    pub accent: String,
+    pub accent: Rgb,
     /// Panel width in logical pixels.
     pub width: u32,
     /// Distance from the top of the output, in logical pixels.
@@ -99,8 +108,8 @@ pub struct UiConfig {
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
-            theme: ThemeChoice::Dark,
-            accent: "#7c6cf2".into(),
+            theme: ThemeChoice::default(),
+            accent: Rgb([0x7c, 0x6c, 0xf2]),
             width: 680,
             top_margin: 220,
             opacity: 0.94,
@@ -110,18 +119,25 @@ impl Default for UiConfig {
     }
 }
 
-impl UiConfig {
-    /// `accent` as red, green and blue; `None` unless it is `#rrggbb`.
-    #[must_use]
-    pub fn accent_rgb(&self) -> Option<[u8; 3]> {
-        let hex = self.accent.strip_prefix('#').filter(|h| h.len() == 6 && h.bytes().all(|b| b.is_ascii_hexdigit()))?;
-        let channel = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
-        Some([channel(0)?, channel(2)?, channel(4)?])
+/// A colour written `#rrggbb`, as red, green and blue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "String")]
+pub struct Rgb(pub [u8; 3]);
+
+impl TryFrom<String> for Rgb {
+    type Error = String;
+
+    fn try_from(s: String) -> Result<Self, String> {
+        let invalid = || format!("{s:?} must be a colour like \"#7c6cf2\"");
+        let hex = s.strip_prefix('#').filter(|h| h.len() == 6 && h.bytes().all(|b| b.is_ascii_hexdigit()));
+        let hex = hex.ok_or_else(invalid)?;
+        let channel = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).map_err(|_| invalid());
+        Ok(Self([channel(0)?, channel(2)?, channel(4)?]))
     }
 }
 
 /// `[behavior]`
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Behavior {
     /// The popup starts with the clipboard text only if it was copied within
@@ -143,7 +159,7 @@ const fn default_temperature() -> f32 {
 }
 
 /// `[[preset]]`: a one-key rewrite.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Preset {
     /// Chip label.
@@ -159,6 +175,15 @@ pub struct Preset {
 }
 
 impl Config {
+    /// Reads the user's `config.toml` ([`paths::config_file`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`Config::load`].
+    pub fn load_user() -> anyhow::Result<Self> {
+        Self::load(&paths::config_file())
+    }
+
     /// Reads `path`; a missing file yields the defaults.
     ///
     /// # Errors
@@ -187,13 +212,26 @@ impl Config {
                 catalog::get(active)?;
             }
         }
-        if config.ui.accent_rgb().is_none() {
-            anyhow::bail!("`ui.accent = {:?}` must be a colour like \"#7c6cf2\"", config.ui.accent);
-        }
         for p in &config.presets {
             if p.name.trim().is_empty() || p.instruction.trim().is_empty() {
                 anyhow::bail!("every `[[preset]]` needs a non-empty `name` and `instruction` (got name {:?})", p.name);
             }
+            if !(0.0..=2.0).contains(&p.temperature) {
+                anyhow::bail!("preset {:?}: `temperature = {}` must be between 0 and 2", p.name, p.temperature);
+            }
+        }
+        let ui = &config.ui;
+        if !(300..=4096).contains(&ui.width) {
+            anyhow::bail!("`ui.width = {}` must be between 300 and 4096 pixels", ui.width);
+        }
+        if !(0.2..=1.0).contains(&ui.opacity) {
+            anyhow::bail!("`ui.opacity = {}` must be between 0.2 and 1.0", ui.opacity);
+        }
+        if config.model.context < 1024 {
+            anyhow::bail!(
+                "`model.context = {}` must be at least 1024: the fixed instructions alone take ~450 tokens",
+                config.model.context
+            );
         }
         if config.model.endpoint.is_some() && config.model.endpoint_model.is_none() {
             anyhow::bail!("`model.endpoint` needs `model.endpoint_model`, the model name the server expects");
@@ -203,14 +241,15 @@ impl Config {
 
     /// The configured presets, or the built-in ones if none are configured.
     #[must_use]
-    pub fn presets(&self) -> Vec<Preset> {
-        if self.presets.is_empty() { default_presets() } else { self.presets.clone() }
+    pub fn presets(&self) -> &[Preset] {
+        if self.presets.is_empty() { &DEFAULT_PRESETS } else { &self.presets }
     }
 }
 
+static DEFAULT_PRESETS: LazyLock<Vec<Preset>> = LazyLock::new(default_presets);
+
 /// Proofread, Rewrite, Friendly, Professional, Concise, Summary, Key points.
-#[must_use]
-pub fn default_presets() -> Vec<Preset> {
+fn default_presets() -> Vec<Preset> {
     let p = |name: &str, instruction: &str, temperature: f32, show_diff: bool| Preset {
         name: name.into(),
         instruction: instruction.into(),
@@ -301,7 +340,25 @@ mod tests {
             assert!(Config::parse(&format!("[ui]\naccent = '{bad}'")).is_err(), "{bad}");
         }
         let ok = Config::parse("[ui]\naccent = '#7C6CF2'").unwrap();
-        assert_eq!(ok.ui.accent_rgb(), Some([0x7c, 0x6c, 0xf2]));
+        assert_eq!(ok.ui.accent, Rgb([0x7c, 0x6c, 0xf2]));
+        let error = Config::parse("[ui]\naccent = 'purple'").unwrap_err();
+        assert!(format!("{error:#}").contains("must be a colour like"), "{error:#}");
+    }
+
+    #[test]
+    fn out_of_range_values_are_rejected() {
+        for bad in [
+            "[ui]\nwidth = 0",
+            "[ui]\nwidth = 70000",
+            "[ui]\nopacity = 0.1",
+            "[ui]\nopacity = nan",
+            "[model]\ncontext = 512",
+            "[[preset]]\nname = 'X'\ninstruction = 'Do it.'\ntemperature = -1.0",
+            "[[preset]]\nname = 'X'\ninstruction = 'Do it.'\ntemperature = nan",
+        ] {
+            assert!(Config::parse(bad).is_err(), "{bad}");
+        }
+        assert!(Config::parse("[ui]\nwidth = 300\nopacity = 1.0\n[model]\ncontext = 1024").is_ok());
     }
 
     #[test]

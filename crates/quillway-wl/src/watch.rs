@@ -1,6 +1,7 @@
 //! When did the clipboard last change? A data-control device gets a
 //! `selection` event on every copy; we note the time and never read the data.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -20,8 +21,12 @@ use wayland_protocols_wlr::data_control::v1::client::{
 };
 
 /// Shared handle to the time of the last clipboard change.
-#[derive(Clone, Default)]
-pub struct ClipboardWatch(Arc<Mutex<Option<Instant>>>);
+#[derive(Clone)]
+pub struct ClipboardWatch {
+    last: Arc<Mutex<Option<Instant>>>,
+    /// Cleared when the watch stops (connection lost, device finished).
+    alive: Arc<AtomicBool>,
+}
 
 impl ClipboardWatch {
     /// Connect to the compositor and watch on a background thread.
@@ -34,8 +39,8 @@ impl ClipboardWatch {
         let (globals, mut queue) = registry_queue_init::<State>(&conn)?;
         let qh = queue.handle();
         let seat: WlSeat = globals.bind(&qh, 1..=1, ()).context("no wl_seat")?;
-        let watch = Self::default();
-        let mut state = State { last: watch.0.clone(), armed: false };
+        let watch = Self { last: Arc::default(), alive: Arc::new(AtomicBool::new(true)) };
+        let mut state = State { last: watch.last.clone(), alive: watch.alive.clone(), armed: false };
 
         if let Ok(m) = globals.bind::<ExtDataControlManagerV1, _, _>(&qh, 1..=1, ()) {
             m.get_data_device(&seat, &qh, ());
@@ -49,10 +54,10 @@ impl ClipboardWatch {
         state.armed = true;
 
         std::thread::Builder::new().name("clipboard-watch".into()).spawn(move || {
-            loop {
+            while state.alive.load(Ordering::Relaxed) {
                 if let Err(e) = queue.blocking_dispatch(&mut state) {
                     eprintln!("quillway: clipboard watch stopped: {e}");
-                    return;
+                    state.alive.store(false, Ordering::Relaxed);
                 }
             }
         })?;
@@ -62,12 +67,19 @@ impl ClipboardWatch {
     /// When the clipboard last changed after the watch started.
     #[must_use]
     pub fn last_change(&self) -> Option<Instant> {
-        *self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        *self.last.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Whether the watch still sees copies; once it stops, it never restarts itself.
+    #[must_use]
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Relaxed)
     }
 }
 
 struct State {
     last: Arc<Mutex<Option<Instant>>>,
+    alive: Arc<AtomicBool>,
     armed: bool,
 }
 
@@ -94,7 +106,10 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for State {
                 offer.destroy();
             }
             ext_device::Event::PrimarySelection { id: Some(offer) } => offer.destroy(),
-            ext_device::Event::Finished => device.destroy(),
+            ext_device::Event::Finished => {
+                device.destroy();
+                state.alive.store(false, Ordering::Relaxed);
+            }
             _ => {}
         }
     }
@@ -119,7 +134,10 @@ impl Dispatch<ZwlrDataControlDeviceV1, ()> for State {
                 offer.destroy();
             }
             wlr_device::Event::PrimarySelection { id: Some(offer) } => offer.destroy(),
-            wlr_device::Event::Finished => device.destroy(),
+            wlr_device::Event::Finished => {
+                device.destroy();
+                state.alive.store(false, Ordering::Relaxed);
+            }
             _ => {}
         }
     }

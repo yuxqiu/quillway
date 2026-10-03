@@ -1,7 +1,7 @@
 //! Supervised `llama-server` child process on a random localhost port.
 
 use std::collections::VecDeque;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -20,7 +20,6 @@ pub struct Server {
     child: Child,
     port: u16,
     api_key: String,
-    model: PathBuf,
     log: Log,
     /// Tokens one request can use, as the running server reports it.
     context: u32,
@@ -30,9 +29,9 @@ impl Server {
     pub async fn start(model: &Path, cfg: &ModelConfig) -> anyhow::Result<Self> {
         let port = free_port()?;
         let api_key = random_key()?;
-        let bin = cfg.llama_server.clone().unwrap_or_else(|| "llama-server".into());
+        let bin = cfg.llama_server_bin();
 
-        let mut cmd = Command::new(&bin);
+        let mut cmd = Command::new(bin);
         cmd.args(args(model, port, cfg))
             .env("LLAMA_API_KEY", &api_key)
             .stdin(Stdio::null())
@@ -47,7 +46,7 @@ impl Server {
             tokio::spawn(collect(stderr, log.clone()));
         }
 
-        let mut server = Self { child, port, api_key, model: model.to_owned(), log, context: cfg.context };
+        let mut server = Self { child, port, api_key, log, context: cfg.context };
         if let Err(e) = server.wait_ready().await {
             // Stop it before reporting: a hung server would otherwise live on.
             let _ = server.child.kill().await;
@@ -121,11 +120,6 @@ impl Server {
     #[must_use]
     pub const fn context(&self) -> u32 {
         self.context
-    }
-
-    #[must_use]
-    pub fn model_path(&self) -> &Path {
-        &self.model
     }
 }
 

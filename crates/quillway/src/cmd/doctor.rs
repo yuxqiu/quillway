@@ -18,7 +18,7 @@ pub async fn run() -> anyhow::Result<()> {
             check(
                 true,
                 "config",
-                format!("{} {}", cfg_path.display(), if cfg_path.exists() { "" } else { "(defaults)" }),
+                format!("{}{}", cfg_path.display(), if cfg_path.exists() { "" } else { " (defaults)" }),
             );
             c
         }
@@ -47,13 +47,18 @@ pub async fn run() -> anyhow::Result<()> {
     if let Some(e) = &config.model.endpoint {
         check(true, "endpoint", format!("{e} (built-in llama-server disabled)"));
     } else {
-        let bin = config.model.llama_server.clone().unwrap_or_else(|| "llama-server".into());
-        let found = std::process::Command::new(&bin).arg("--version").output();
-        match found {
+        let bin = config.model.llama_server_bin();
+        match std::process::Command::new(bin).arg("--version").output() {
             Ok(o) => {
                 let all = String::from_utf8_lossy(&o.stderr).into_owned() + &String::from_utf8_lossy(&o.stdout);
-                let v = all.lines().find(|l| l.starts_with("version")).unwrap_or("found").to_owned();
-                check(true, "llama-server", v);
+                if o.status.success() {
+                    let v = all.lines().find(|l| l.starts_with("version")).unwrap_or("found");
+                    check(true, "llama-server", v.to_owned());
+                } else {
+                    // E.g. missing shared libraries (exit 127): it is there but can't run.
+                    let why = all.lines().find(|l| !l.trim().is_empty()).unwrap_or("no output");
+                    check(false, "llama-server", format!("{bin} --version failed ({}): {why}", o.status));
+                }
             }
             Err(e) => check(false, "llama-server", format!("{bin}: {e}")),
         }
@@ -64,7 +69,10 @@ pub async fn run() -> anyhow::Result<()> {
     }
 
     match crate::ipc::send(&Request::Status).await {
-        Ok(Response::Status { engine, .. }) => check(true, "daemon", format!("running, {engine}")),
+        // Running isn't enough: its model server must be up or coming up.
+        Ok(Response::Status { engine, .. }) => {
+            check(matches!(engine.as_str(), "ready" | "starting"), "daemon", format!("running, {engine}"));
+        }
         Ok(other) => check(false, "daemon", format!("{other:?}")),
         Err(_) => check(false, "daemon", format!("not running ({})", paths::socket().display())),
     }

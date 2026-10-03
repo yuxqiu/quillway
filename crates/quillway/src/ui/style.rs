@@ -31,10 +31,9 @@ pub struct Palette {
 
 impl Palette {
     pub fn new(ui: &UiConfig) -> Self {
-        // The config is validated on load, so the fallback is never used.
-        let [r, g, b] = ui.accent_rgb().unwrap_or([0x7c, 0x6c, 0xf2]);
+        let [r, g, b] = ui.accent.0;
         let accent = Color::from_rgb8(r, g, b);
-        let op = ui.opacity.clamp(0.2, 1.0);
+        let op = ui.opacity; // validated to 0.2–1.0
         let (base, ink): (Color, Color) = match ui.theme {
             ThemeChoice::Dark => (Color::from_rgba8(28, 28, 32, op), Color::from_rgb8(0xed, 0xed, 0xf0)),
             ThemeChoice::Light => (Color::from_rgba8(250, 250, 252, op), Color::from_rgb8(0x1d, 0x1d, 0x22)),

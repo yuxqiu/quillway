@@ -34,10 +34,19 @@ pub struct State {
 }
 
 impl State {
-    /// The saved state; empty if missing or unreadable.
-    #[must_use]
-    pub fn load() -> Self {
-        std::fs::read_to_string(paths::state_file()).ok().and_then(|s| toml::from_str(&s).ok()).unwrap_or_default()
+    /// The saved state; empty if there is none.
+    ///
+    /// # Errors
+    ///
+    /// The file exists but can't be read or parsed: a broken choice is an
+    /// error, not a silent fallback to the default (DECISIONS #14).
+    pub fn load() -> anyhow::Result<Self> {
+        let p = paths::state_file();
+        match std::fs::read_to_string(&p) {
+            Ok(s) => toml::from_str(&s).with_context(|| format!("parsing {}", p.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(e).with_context(|| format!("reading {}", p.display())),
+        }
     }
 
     /// Write the state file.
@@ -61,11 +70,10 @@ impl State {
 /// The chosen id isn't in the catalog, e.g. a `models use` choice that a
 /// newer version dropped.
 pub fn active(config: &Config) -> anyhow::Result<Active> {
-    let (chosen, source) = config
-        .model
-        .active
-        .clone()
-        .map_or_else(|| (State::load().active, "`quillway models use`"), |id| (Some(id), "`model.active`"));
+    let (chosen, source) = match &config.model.active {
+        Some(id) => (Some(id.clone()), "`model.active`"),
+        None => (State::load()?.active, "`quillway models use`"),
+    };
     resolve(chosen.as_deref(), &paths::models_dir()).with_context(|| format!("the model chosen with {source}"))
 }
 

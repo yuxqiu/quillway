@@ -7,10 +7,9 @@
 
 use std::fmt::Write;
 
-use futures_util::StreamExt;
 use quillway_core::clean;
-use quillway_core::config::{Config, default_presets};
-use quillway_engine::{Chunk, Engine, Rewrite, Timing};
+use quillway_core::config::Config;
+use quillway_engine::{Engine, Rewrite, models};
 
 const TEXTS: [&str; 10] = [
     "their going to the park tomorow, weather permiting. we was hoping you could came to.",
@@ -28,7 +27,8 @@ const TEXTS: [&str; 10] = [
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     let ids: Vec<String> = std::env::args().skip(1).collect();
-    let presets = default_presets();
+    let defaults = Config::default();
+    let presets = defaults.presets();
     let proofread = &presets[0];
     let professional = &presets[3];
 
@@ -39,8 +39,8 @@ async fn main() -> anyhow::Result<()> {
     for id in &ids {
         let mut config = Config::default();
         config.model.active = Some(id.clone());
-        let engine = Engine::new(config.clone());
-        let active = engine.active().await?;
+        let active = models::active(&config)?;
+        let engine = Engine::new(config.model, active.clone());
         engine.warm_up().await?;
         let client = engine.client().await?;
 
@@ -52,18 +52,8 @@ async fn main() -> anyhow::Result<()> {
                     instruction: preset.instruction.clone(),
                     text: text.to_owned(),
                     temperature: preset.temperature,
-                    max_tokens: None,
                 };
-                let mut timing = Timing::start();
-                let mut raw = String::new();
-                let mut s = std::pin::pin!(client.stream(&r).await?);
-                while let Some(chunk) = s.next().await {
-                    let chunk = chunk?;
-                    timing.record(&chunk);
-                    if let Chunk::Text(t) = chunk {
-                        raw.push_str(&t);
-                    }
-                }
+                let (raw, timing) = client.complete(&r).await?;
                 firsts.push(timing.first_token().unwrap_or_default().as_secs_f64());
                 rates.push(timing.rate());
                 let out = clean::clean(&raw, text, true);
