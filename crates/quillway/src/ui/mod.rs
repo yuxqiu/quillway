@@ -4,6 +4,8 @@
 //! from the CLI, or typed into the popup) → compose → generate (streamed) →
 //! review / refine / edit → copy → hide.
 
+mod no_ctrl_typing;
+mod notice;
 mod style;
 mod view;
 
@@ -24,6 +26,7 @@ use quillway_core::ipc::{Input, Request, Response};
 use quillway_engine::download;
 use quillway_engine::{Active, Chunk, Engine, EngineState, Rewrite, Timing, models};
 
+use self::notice::Notice;
 use crate::ipc::{self, Reply};
 
 const INPUT_ID: &str = "quillway-input";
@@ -164,10 +167,10 @@ struct Popup {
     generation: Option<Generation>,
     /// Set by Ctrl+D; until then each draft shows its preset's default.
     diff_choice: Option<bool>,
-    error: Option<String>,
-    /// The instruction before its last edit, if that edit typed one character: a
-    /// Ctrl+digit preset types its key there too (iced inserts it even with Ctrl held).
-    before_key: Option<(String, char)>,
+    /// The message under the text, from the last action; see [`App::notice`].
+    notice: Option<Notice>,
+    /// Ctrl+E shows the message's details.
+    details_open: bool,
     /// The keyboard was given to `field`'s box, on the first resize.
     focus_given: bool,
     size: (u32, u32),
@@ -197,7 +200,7 @@ impl Popup {
 
     /// Hand edits go into an "Edited" draft, so Ctrl+Z restores the model's text.
     fn keep_edit(&mut self) {
-        self.error = None; // it was about the text before this edit
+        self.notify(None); // it was about the text before this edit
         let text = self.draft_editor.text();
         let Some(last) = self.drafts.last_mut() else { return };
         if last.edited() {
@@ -226,14 +229,20 @@ impl Popup {
 
     /// End `g` with `error`: keep what arrived as an incomplete draft (unless a
     /// retry failed: its old draft stays), else give back the typed instruction.
-    fn fail(&mut self, g: Generation, error: String) {
+    fn fail(&mut self, g: Generation, notice: Notice) {
         let partial = g.raw.trim().to_owned();
         if !partial.is_empty() && !g.retry {
             self.drafts.push(g.into_draft(partial, "stopped early".into(), true));
         } else if let Some(typed) = g.typed {
             self.input = typed;
         }
-        self.error = Some(error);
+        self.notify(Some(notice));
+    }
+
+    /// Show `notice` (or none), with its details closed.
+    fn notify(&mut self, notice: Option<Notice>) {
+        self.notice = notice;
+        self.details_open = false;
     }
 
     /// Whether the latest draft is shown as a word diff: Ctrl+D's choice, else its preset's default.
@@ -288,6 +297,7 @@ enum Shortcut {
     Diff,
     Retry,
     Undo,
+    Details,
     Preset(usize),
 }
 
@@ -416,6 +426,9 @@ impl App {
     fn on_edit(&mut self, action: text_editor::Action) -> Task<Message> {
         let Some(p) = self.popup.as_mut() else { return Task::none() };
         if p.phase() == Phase::Composing {
+            if action.is_edit() {
+                p.notify(None); // e.g. "Nothing to rewrite", now that there is text
+            }
             p.source.perform(action);
         } else if p.editing() {
             let edit = action.is_edit();
@@ -463,9 +476,15 @@ impl App {
     fn on_engine_state(&mut self, state: EngineState) -> Task<Message> {
         // The engine publishes failures; the journal gets them here.
         if let EngineState::Failed(e) = &state {
-            eprintln!("quillway: {e}");
+            note!("quillway: {e}");
         }
+        let before = self.popup.as_ref().and_then(|p| self.notice(p));
         self.engine_state = state;
+        if self.popup.as_ref().and_then(|p| self.notice(p)) != before
+            && let Some(p) = self.popup.as_mut()
+        {
+            p.details_open = false;
+        }
         // Switched to a missing model while typing in the text box: the install card has none.
         match self.popup.as_mut() {
             Some(p) if self.engine_state == EngineState::Missing && p.phase() == Phase::Composing => {
@@ -534,7 +553,7 @@ impl App {
                         && let Some(g) = p.generation.take()
                     {
                         g.handle.abort();
-                        p.fail(g, "Stopped by a reload. Run it again.".into());
+                        p.fail(g, Notice::info("Stopped by a reload. Run it again."));
                         focus(p.field) // a click while writing may have taken it
                     } else {
                         Task::none()
@@ -611,11 +630,11 @@ impl App {
         match result {
             Ok(Some(text)) => self.open(&text, Origin::Clipboard, None),
             Ok(None) => self.open("", Origin::Typed, None),
-            Err(e) => self.open("", Origin::Typed, Some(e)),
+            Err(e) => self.open("", Origin::Typed, Some(Notice::error(&e))),
         }
     }
 
-    fn open(&mut self, text: &str, origin: Origin, error: Option<String>) -> Task<Message> {
+    fn open(&mut self, text: &str, origin: Origin, notice: Option<Notice>) -> Task<Message> {
         // The model may have been installed since we last looked (copied in, or by a CLI
         // that couldn't reach us); start it instead of offering the install card.
         if self.engine_state == EngineState::Missing && self.active.is_installed() {
@@ -638,8 +657,8 @@ impl App {
             draft_editor: text_editor::Content::new(),
             generation: None,
             diff_choice: None,
-            error,
-            before_key: None,
+            notice,
+            details_open: false,
             focus_given: false,
             size,
             opened: Instant::now(),
@@ -699,7 +718,6 @@ impl App {
         if p.generation.is_some() {
             return Task::none();
         }
-        p.before_key = inserted_char(&p.input, &s).map(|c| (std::mem::take(&mut p.input), c));
         p.input = s;
         Task::none()
     }
@@ -738,16 +756,15 @@ impl App {
         let Some(p) = self.popup.as_mut() else { return Task::none() };
         let text = p.base();
         if text.trim().is_empty() {
-            p.error = Some(if p.drafts.is_empty() {
-                "Nothing to rewrite: type or paste the text into the box (Tab switches boxes).".into()
+            p.notify(Some(Notice::info(if p.drafts.is_empty() {
+                "Nothing to rewrite: type or paste the text into the box (Tab switches boxes)."
             } else {
-                "Nothing to rewrite: the text is empty. Ctrl+Z restores the previous draft.".into()
-            });
+                "Nothing to rewrite: the text is empty. Ctrl+Z restores the previous draft."
+            })));
             return Task::none();
         }
         if !from_input {
-            // A preset clears the instruction box. That also drops the digit a Ctrl+digit key
-            // typed there: iced's `text_input` inserts it even with Ctrl held.
+            // A preset clears the instruction box.
             p.input.clear();
         }
         // The client counts tokens and rejects text too long for the context.
@@ -768,7 +785,7 @@ impl App {
         let Some(p) = self.popup.as_mut() else { return Task::none() };
         let (task, handle) =
             Task::run(stream_rewrite(self.engine.clone(), request.clone()), move |ev| Message::Gen(id, ev)).abortable();
-        p.error = None;
+        p.notify(None);
         // The new draft is reviewed from the instruction box, even if this started while editing.
         p.field = Field::Instruction;
         p.generation = Some(Generation {
@@ -797,7 +814,7 @@ impl App {
             }
             GenEvent::Error(e) => {
                 let g = p.generation.take().expect("matched above");
-                p.fail(g, e);
+                p.fail(g, Notice::error(&e));
             }
             GenEvent::Done => {
                 let g = p.generation.take().expect("matched above");
@@ -806,7 +823,7 @@ impl App {
                     if let Some(typed) = g.typed {
                         p.input = typed;
                     }
-                    p.error = Some("The model returned nothing. Run it again, or try another preset.".into());
+                    p.notify(Some(Notice::error("The model returned nothing. Run it again, or try another preset.")));
                 } else {
                     let secs = g.timing.started().elapsed().as_secs_f64();
                     let rate = g.timing.rate();
@@ -823,6 +840,7 @@ impl App {
 
     fn on_shortcut(&mut self, s: Shortcut) -> Task<Message> {
         let installing = self.needs_install();
+        let has_details = self.popup.as_ref().and_then(|p| self.notice(p)).is_some_and(|n| n.detail.is_some());
         if matches!(s, Shortcut::Enter) {
             // From the instruction box, or the install card; the text box takes ↵ as a new line.
             let instruction = self.popup.as_ref().is_some_and(|p| p.field == Field::Instruction);
@@ -856,20 +874,7 @@ impl App {
             }
             // The Ctrl shortcuts work from the instruction box; the text box keeps its keys.
             _ if p.field == Field::Source => Task::none(),
-            (Shortcut::Preset(i), Phase::Composing | Phase::Reviewing) => {
-                let typed = p.before_key.take();
-                let task = self.run_preset(i);
-                // Nothing ran (no such preset, or no text): take back the digit the key typed, if
-                // the box's last edit was just that. (A digit-row symbol, as on AZERTY, stays.)
-                if let Some(p) = self.popup.as_mut().filter(|p| p.generation.is_none())
-                    && let Some((before, c)) = typed
-                    && inserted_char(&before, &p.input) == Some(c)
-                    && c.to_digit(10) == u32::try_from(i + 1).ok()
-                {
-                    p.input = before;
-                }
-                task
-            }
+            (Shortcut::Preset(i), Phase::Composing | Phase::Reviewing) => self.run_preset(i),
             (Shortcut::Diff, Phase::Reviewing) => {
                 p.diff_choice = Some(!p.show_diff());
                 Task::none()
@@ -880,9 +885,13 @@ impl App {
                 let (label, show_diff) = (d.label.clone(), d.show_diff);
                 self.start(label, request, show_diff, true, false)
             }
+            (Shortcut::Details, _) if has_details => {
+                p.details_open = !p.details_open;
+                Task::none()
+            }
             (Shortcut::Undo, Phase::Reviewing) => {
                 p.drafts.pop();
-                p.error = None;
+                p.notify(None);
                 Task::none()
             }
             _ => Task::none(),
@@ -894,14 +903,14 @@ impl App {
         let Some(d) = p.drafts.last() else { return Task::none() };
         // Only a hand edit can be empty; copying it would just clear the clipboard.
         if d.text.trim().is_empty() {
-            p.error = Some("Nothing to copy: the text is empty. Ctrl+Z restores the previous draft.".into());
+            p.notify(Some(Notice::info("Nothing to copy: the text is empty. Ctrl+Z restores the previous draft.")));
             return Task::none();
         }
         match quillway_wl::copy(&d.text) {
             // Closing at once is the confirmation; the user is waiting to paste.
             Ok(()) => self.hide(),
             Err(e) => {
-                p.error = Some(format!("{e:#}"));
+                p.notify(Some(Notice::error(&format!("Couldn't copy: {e:#}"))));
                 Task::none()
             }
         }
@@ -915,6 +924,9 @@ impl App {
         }
         // A download of a model a reload switched away from finishes on its own; its events are ignored.
         self.install = Some(Install::new(entry));
+        if let Some(p) = self.popup.as_mut() {
+            p.details_open = false;
+        }
         Task::run(install_stream(entry), move |ev| Message::Install(entry, ev))
     }
 
@@ -935,15 +947,36 @@ impl App {
                 self.install = None;
                 self.engine.start();
                 if let Some(p) = self.popup.as_mut() {
-                    p.error = None; // e.g. a rewrite stopped by the reload that led here
+                    p.notify(None); // e.g. a rewrite stopped by the reload that led here
                 }
                 Task::none()
             }
             InstallEvent::Done(Err(e)) => {
                 i.error = Some(e);
+                if let Some(p) = self.popup.as_mut() {
+                    p.details_open = false;
+                }
                 Task::none()
             }
         }
+    }
+
+    /// The one message to show: the install card's problem, else the last action's,
+    /// else the engine's failure. An action's message wins over the engine's, so a run
+    /// that failed because the engine did isn't reported twice.
+    fn notice(&self, p: &Popup) -> Option<Notice> {
+        if self.needs_install() {
+            let Some(entry) = self.active.entry else {
+                return Some(Notice::error(&format!("Model file not found: {}", self.active.path.display())));
+            };
+            if let Some(e) = self.installing(entry).and_then(|i| i.error.as_deref()) {
+                return Some(Notice::error(&format!("The download failed: {e}")));
+            }
+        }
+        p.notice.clone().or_else(|| match &self.engine_state {
+            EngineState::Failed(e) => Some(Notice::error(&format!("The model server failed: {e}"))),
+            _ => None,
+        })
     }
 
     /// The install card replaces the composer only before anything was generated.
@@ -1003,6 +1036,7 @@ fn shortcut(event: Event, _status: event::Status, _window: window::Id) -> Option
             Some('d') => Shortcut::Diff,
             Some('r') => Shortcut::Retry,
             Some('z') => Shortcut::Undo,
+            Some('e') => Shortcut::Details,
             Some(c @ '1'..='9') => Shortcut::Preset(c as usize - '1' as usize),
             Some(c) if c.is_ascii_alphanumeric() => return None,
             // Symbols on the digit row (AZERTY's `&é"'(…`): go by the key's position.
@@ -1027,14 +1061,6 @@ const fn preset_index(key: Physical) -> Option<usize> {
         Code::Digit9 => 8,
         _ => return None,
     })
-}
-
-/// The character `new` adds to `old`, if it adds exactly one.
-fn inserted_char(old: &str, new: &str) -> Option<char> {
-    let at = old.bytes().zip(new.bytes()).take_while(|(a, b)| a == b).count();
-    // `at` ends a whole character: the bytes before it are equal, and `new` has a new character there.
-    let c = new.get(at..)?.chars().next()?;
-    (new.get(at + c.len_utf8()..)? == old.get(at..)?).then_some(c)
 }
 
 /// The engine's state now, then each change; if its supervisor stops, `Failed` once.
@@ -1072,8 +1098,8 @@ fn focus(field: Field) -> Task<Message> {
 async fn read_clipboard() -> Result<Option<String>, String> {
     // The app that owns the clipboard sends the data; a hung one must not block the popup.
     match tokio::time::timeout(CLIPBOARD_TIMEOUT, tokio::task::spawn_blocking(quillway_wl::read)).await {
-        Ok(Ok(read)) => read.map_err(|e| format!("{e:#}")),
-        Ok(Err(e)) => Err(e.to_string()),
+        Ok(Ok(read)) => read.map_err(|e| format!("Couldn't read the clipboard: {e:#}")),
+        Ok(Err(e)) => Err(format!("Couldn't read the clipboard: {e}")),
         Err(_) => Err("The app that owns the clipboard didn't respond; type or paste the text instead.".into()),
     }
 }
@@ -1111,6 +1137,11 @@ mod tests {
     fn reply() -> Reply {
         let (tx, _rx) = tokio::sync::oneshot::channel();
         Reply::new(tx)
+    }
+
+    /// The popup's own message, if any.
+    fn summary(p: &Popup) -> Option<&str> {
+        p.notice.as_ref().map(|n| n.summary.as_str())
     }
 
     fn text(t: &str) -> GenEvent {
@@ -1260,9 +1291,9 @@ mod tests {
         let _ = app.on_shortcut(Shortcut::Tab);
         enter(&mut app);
         let p = app.popup.as_ref().expect("still open");
-        assert!(p.error.as_deref().is_some_and(|e| e.starts_with("Nothing to copy")));
+        assert!(summary(p).is_some_and(|e| e.starts_with("Nothing to copy")));
         let _ = app.on_shortcut(Shortcut::Undo);
-        assert_eq!(app.popup.as_ref().unwrap().error, None, "the error was about the undone text");
+        assert_eq!(summary(app.popup.as_ref().unwrap()), None, "the error was about the undone text");
     }
 
     fn press(key: Key, code: Code, modifiers: keyboard::Modifiers, repeat: bool) -> Option<Message> {
@@ -1346,7 +1377,7 @@ mod tests {
         assert_eq!(p.phase(), Phase::Reviewing);
         assert_eq!(p.drafts[0].text, "They're here, and");
         assert_eq!((p.drafts[0].label.as_str(), p.drafts[0].incomplete), ("Proofread", true));
-        assert_eq!(p.error.as_deref(), Some("connection reset"));
+        assert_eq!(summary(p), Some("Connection reset"));
     }
 
     #[test]
@@ -1360,7 +1391,7 @@ mod tests {
         let p = app.popup.as_ref().unwrap();
         assert_eq!(p.drafts.len(), 1);
         assert_eq!((p.drafts[0].label.as_str(), p.drafts[0].incomplete), ("Proofread", false));
-        assert_eq!(p.error, None);
+        assert_eq!(summary(p), None);
     }
 
     #[test]
@@ -1446,7 +1477,7 @@ mod tests {
         let _ = app.update(Message::Ipc(Request::Reload, reply()));
         let p = app.popup.as_ref().unwrap();
         assert!(p.generation.is_none());
-        assert!(p.error.as_deref().is_some_and(|e| e.contains("Stopped by a reload")), "{:?}", p.error);
+        assert!(summary(p).is_some_and(|e| e.contains("Stopped by a reload")), "{:?}", p.notice);
         assert!(p.drafts[0].incomplete, "the partial text is kept");
     }
 
@@ -1504,37 +1535,64 @@ mod tests {
         let _ = app.update(Message::Input("make it formal".into()));
         let _ = app.update(Message::Preset(0));
         let p = app.popup.as_ref().unwrap();
-        assert!(p.error.as_deref().is_some_and(|e| e.starts_with("Nothing to rewrite")));
+        assert!(summary(p).is_some_and(|e| e.starts_with("Nothing to rewrite")));
         assert_eq!(p.input, "make it formal");
     }
 
+    #[test]
+    fn pasting_text_clears_nothing_to_rewrite() {
+        let mut app = boot(endpoint_config());
+        let _ = app.update(Message::Ipc(Request::Show { input: Input::Text(String::new()) }, reply()));
+        let _ = app.update(Message::Preset(0));
+        assert!(summary(app.popup.as_ref().unwrap()).is_some_and(|e| e.starts_with("Nothing to rewrite")));
+        type_char(&mut app, 'x');
+        assert_eq!(summary(app.popup.as_ref().unwrap()), None);
+    }
+
+    #[test]
+    fn one_message_shows_the_actions_before_the_engines() {
+        let mut app = boot(endpoint_config());
+        let _ = app.update(Message::Ipc(Request::Show { input: Input::Text(String::new()) }, reply()));
+        let failed = "starting llama-server: boom\n--- llama-server log (tail) ---\nlog line";
+        let _ = app.update(Message::EngineState(EngineState::Failed(failed.into())));
+        let engine = app.notice(app.popup.as_ref().unwrap()).unwrap();
+        assert_eq!(engine.summary, "The model server failed: starting llama-server: boom");
+        assert!(engine.detail.is_some_and(|d| d.ends_with("log line")), "the log is the detail");
+        // A run that failed because of it says so itself, once.
+        let _ = app.update(Message::Preset(0));
+        let shown = app.notice(app.popup.as_ref().unwrap()).unwrap();
+        assert!(shown.summary.starts_with("Nothing to rewrite"), "{shown:?}");
+    }
+
+    #[test]
+    fn ctrl_e_opens_the_details_until_the_message_changes() {
+        let mut app = instruction_box();
+        let details = |app: &mut App| {
+            let key = Physical::Code(Code::KeyE);
+            let _ = app.update(Message::Shortcut(Shortcut::Details, key));
+            let _ = app.update(Message::KeyReleased(key));
+        };
+        details(&mut app);
+        assert!(!app.popup.as_ref().unwrap().details_open, "there is no detail yet");
+        let _ = app.update(Message::EngineState(EngineState::Failed("first failure\nfirst log".into())));
+        assert!(!app.popup.as_ref().unwrap().details_open);
+        details(&mut app);
+        assert!(app.popup.as_ref().unwrap().details_open);
+        let _ = app.update(Message::EngineState(EngineState::Failed("second failure\nsecond log".into())));
+        assert!(!app.popup.as_ref().unwrap().details_open, "a different engine message starts closed");
+        details(&mut app);
+        assert!(app.popup.as_ref().unwrap().details_open);
+        let _ = app.update(Message::Preset(0)); // a new message
+        assert!(!app.popup.as_ref().unwrap().details_open);
+        assert!(matches!(ctrl("e", Code::KeyE), Some(Message::Shortcut(Shortcut::Details, _))));
+    }
+
     /// An open popup with no text, typing in the instruction box.
-    fn instruction_with_no_text() -> App {
+    fn instruction_box() -> App {
         let mut app = boot(endpoint_config());
         let _ = app.update(Message::Ipc(Request::Show { input: Input::Text(String::new()) }, reply()));
         app.popup.as_mut().unwrap().field = Field::Instruction;
         app
-    }
-
-    fn ctrl_digit(app: &mut App, typed: &str, preset: usize) {
-        let _ = app.update(Message::Input(typed.into())); // iced's text_input types the digit too
-        let key = Physical::Code(Code::Digit1);
-        let _ = app.update(Message::Shortcut(Shortcut::Preset(preset), key));
-        let _ = app.update(Message::KeyReleased(key));
-    }
-
-    #[test]
-    fn a_ctrl_digit_that_runs_nothing_takes_its_digit_back() {
-        let mut app = instruction_with_no_text();
-        let _ = app.update(Message::Input("make it formal".into()));
-        ctrl_digit(&mut app, "make it formal1", 0); // refused: no text
-        assert_eq!(app.popup.as_ref().unwrap().input, "make it formal");
-        ctrl_digit(&mut app, "make it formal9", 8); // no ninth preset
-        assert_eq!(app.popup.as_ref().unwrap().input, "make it formal");
-        // A character typed by hand stays, even if a later shortcut typed nothing.
-        let _ = app.update(Message::Input("make it formal!".into()));
-        let _ = app.update(Message::Shortcut(Shortcut::Preset(8), Physical::Code(Code::Digit9)));
-        assert_eq!(app.popup.as_ref().unwrap().input, "make it formal!");
     }
 
     #[test]
@@ -1599,7 +1657,7 @@ mod tests {
         let _ = app.update(Message::Gen(0, GenEvent::Error("too long".into())));
         let p = app.popup.as_ref().unwrap();
         assert_eq!(p.phase(), Phase::Composing);
-        assert_eq!(p.error.as_deref(), Some("too long"));
+        assert_eq!(summary(p), Some("Too long"));
     }
 
     #[test]

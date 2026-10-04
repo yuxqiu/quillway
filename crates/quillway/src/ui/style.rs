@@ -132,6 +132,24 @@ impl Palette {
         }
     }
 
+    /// The message line, tinted by its severity's `color`.
+    pub fn notice(color: Color) -> impl Fn(&iced::Theme) -> container::Style {
+        move |_| container::Style {
+            background: Some(Color { a: color.a * 0.12, ..color }.into()),
+            border: Border { radius: 8.0.into(), ..Border::default() },
+            ..container::Style::default()
+        }
+    }
+
+    /// The message line's round severity badge.
+    pub fn badge(color: Color) -> impl Fn(&iced::Theme) -> container::Style {
+        move |_| container::Style {
+            background: Some(color.into()),
+            border: Border { radius: 8.0.into(), ..Border::default() },
+            ..container::Style::default()
+        }
+    }
+
     pub fn input(self) -> impl Fn(&iced::Theme, text_input::Status) -> text_input::Style {
         move |_, _| text_input::Style {
             background: Color::TRANSPARENT.into(),

@@ -73,7 +73,8 @@ bindsym Mod4+space exec quillway toggle
 | | Ctrl+D | Toggle the word diff against the original (off while editing); the choice holds for later drafts |
 | | Ctrl+R | Retry (the same request again) |
 | | Ctrl+Z | Undo the last draft |
-| Anywhere | Esc | Close |
+| Anywhere | Ctrl+E | Show or hide an error's details (e.g. llama-server's log), when it has some |
+| | Esc | Close |
 
 The Ctrl shortcuts above work from the instruction box only; in a text box, Ctrl+C/X/V/A select and copy as usual. They follow the key's position, so they also work on non-Latin layouts.
 

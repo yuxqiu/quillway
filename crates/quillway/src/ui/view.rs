@@ -10,8 +10,10 @@ use iced::{Element, Length, Padding, window};
 use quillway_core::diff::{self, Change};
 use quillway_engine::download::human;
 
+use super::no_ctrl_typing::no_ctrl_typing;
+use super::notice;
 use super::style::{Palette, RING};
-use super::{App, EngineState, Field, INPUT_ID, Install, Message, Phase, Popup, SOURCE_ID};
+use super::{App, EngineState, Field, INPUT_ID, Message, Phase, Popup, SOURCE_ID};
 
 const BODY_MAX_HEIGHT: f32 = 380.0;
 const SOURCE_MAX_HEIGHT: f32 = 170.0;
@@ -66,17 +68,16 @@ impl App {
         if editable {
             input = input.on_input(Message::Input);
         }
-        input.into()
+        // Ctrl+1 runs a preset; it mustn't also type "1" here.
+        no_ctrl_typing(input)
     }
 
     fn body<'a>(&'a self, p: &'a Popup, pal: Palette) -> Element<'a, Message> {
+        let notice = self.notice(p).map(|n| notice::strip(n, p.details_open, pal));
         if self.needs_install() {
-            // E.g. the clipboard couldn't be read: the card mustn't hide it.
-            let mut card = column![self.install_card(pal)].spacing(8);
-            if let Some(e) = &p.error {
-                card = card.push(text(e.as_str()).size(13).color(pal.error));
-            }
-            return card.into();
+            // A missing custom file has no card, only its message.
+            let card = column![].push(self.install_card(pal)).push(notice).spacing(8);
+            return container(card).padding([12, PAD_X]).width(Length::Fill).into();
         }
         let content: Element<'a, Message> = match p.phase() {
             Phase::Composing => editor(&p.source, "Type or paste the text to rewrite…", SOURCE_MAX_HEIGHT, pal),
@@ -95,54 +96,38 @@ impl App {
                 }
             }
         };
-        let mut col = column![content].spacing(8);
-        if let Some(e) = &p.error {
-            col = col.push(text(e.as_str()).size(13).color(pal.error));
-        }
-        // Unless the error above already says it (a request whose start failed).
-        if let EngineState::Failed(e) = &self.engine_state
-            && p.error.as_deref() != Some(e.as_str())
-        {
-            col = col.push(text(format!("Model server failed: {}", preview(e, 200))).size(13).color(pal.error));
-        }
+        let col = column![content].push(notice).spacing(8);
         container(col).padding([12, PAD_X]).width(Length::Fill).into()
     }
 
-    fn install_card(&self, pal: Palette) -> Element<'_, Message> {
-        let Some(entry) = self.active.entry else {
-            let msg = format!("Model file not found: {}", self.active.path.display());
-            return container(text(msg).size(13).color(pal.error)).padding([14, PAD_X]).width(Length::Fill).into();
-        };
-        let line: Element<'_, Message> = match self.installing(entry) {
-            Some(Install { error: Some(e), .. }) => text(e.as_str()).size(13).color(pal.error).into(),
-            Some(i) => text(format!(
+    /// The download's progress, or the offer to install (again, after a failure,
+    /// whose message is shown under the card).
+    fn install_card(&self, pal: Palette) -> Option<Element<'_, Message>> {
+        let entry = self.active.entry?;
+        if let Some(i) = self.installing(entry).filter(|i| i.error.is_none()) {
+            let progress = format!(
                 "Downloading {}… {} / {} ({}%){}",
                 i.entry.name,
                 human(i.done),
                 human(i.entry.size),
                 i.done * 100 / i.entry.size.max(1),
                 i.rate.describe().map_or_else(String::new, |r| format!(" · {r}"))
-            ))
-            .size(14)
-            .color(pal.dim)
-            .into(),
-            // A non-OSI license is shown before ↵, which then accepts it (DECISIONS #9).
-            None => {
-                let size = human(entry.size);
-                let notice = entry.license_warning();
-                let action = if notice.is_some() {
-                    format!("↵  Accept the license and install {} ({size})", entry.name)
-                } else {
-                    format!("↵  Install {} ({size}, {})", entry.name, entry.license)
-                };
-                let mut card = column![].spacing(6);
-                if let Some(w) = notice {
-                    card = card.push(text(w).size(13).color(pal.dim));
-                }
-                card.push(mouse_area(text(action).size(15).color(pal.text)).on_press(Message::InstallStart)).into()
-            }
+            );
+            return Some(text(progress).size(14).color(pal.dim).into());
+        }
+        // A non-OSI license is shown before ↵, which then accepts it (DECISIONS #9).
+        let size = human(entry.size);
+        let license = entry.license_warning();
+        let action = if license.is_some() {
+            format!("↵  Accept the license and install {} ({size})", entry.name)
+        } else {
+            format!("↵  Install {} ({size}, {})", entry.name, entry.license)
         };
-        container(column![line].spacing(6)).padding([14, PAD_X]).width(Length::Fill).into()
+        let mut card = column![].spacing(6);
+        if let Some(w) = license {
+            card = card.push(text(w).size(13).color(pal.dim));
+        }
+        Some(card.push(mouse_area(text(action).size(15).color(pal.text)).on_press(Message::InstallStart)).into())
     }
 
     fn chips(&self, pal: Palette) -> Element<'_, Message> {
@@ -273,16 +258,4 @@ fn diff_view<'a>(old: &str, new: &str, pal: Palette) -> Element<'a, Message> {
         })
         .collect();
     rich_text(spans).size(15).into()
-}
-
-/// First `max` characters on one line.
-fn preview(s: &str, max: usize) -> String {
-    let flat: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    if flat.chars().count() <= max {
-        flat
-    } else {
-        let mut t: String = flat.chars().take(max).collect();
-        t.push('…');
-        t
-    }
 }
