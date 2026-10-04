@@ -1,8 +1,9 @@
 //! Unix-socket IPC: the CLI sends one JSON line, the daemon answers with one.
 
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use std::{os::unix::fs::PermissionsExt, path::Path};
 
 use anyhow::{Context, bail};
 use futures_util::Stream;
@@ -15,6 +16,9 @@ use tokio::sync::{mpsc, oneshot};
 /// Largest request the daemon reads: 1 MiB of `--stdin` text, even if JSON
 /// escaping grows it several times over.
 const MAX_REQUEST: u64 = 8 << 20;
+/// How long the CLI waits for requests the daemon answers at once (not `reload`
+/// or `connect`, which wait for a model server to start).
+pub const QUICK_REPLY: Duration = Duration::from_secs(5);
 /// A client has this long to send its request; the CLI sends it at once.
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -37,6 +41,7 @@ impl std::error::Error for DaemonNotRunning {}
 
 pub async fn send(req: &Request) -> anyhow::Result<Response> {
     let path = paths::socket();
+    check_owner(&path, rustix::process::getuid().as_raw())?;
     let stream = match UnixStream::connect(&path).await {
         Ok(stream) => stream,
         Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused) => {
@@ -86,6 +91,7 @@ pub fn bind() -> anyhow::Result<std::os::unix::net::UnixListener> {
 }
 
 fn bind_at(path: &Path) -> anyhow::Result<std::os::unix::net::UnixListener> {
+    check_owner(path, rustix::process::getuid().as_raw())?;
     if std::os::unix::net::UnixStream::connect(path).is_ok() {
         bail!("another quillway daemon is already running ({})", path.display());
     }
@@ -95,6 +101,18 @@ fn bind_at(path: &Path) -> anyhow::Result<std::os::unix::net::UnixListener> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     l.set_nonblocking(true)?;
     Ok(l)
+}
+
+/// Refuse a socket owned by another user: without `XDG_RUNTIME_DIR` it lives in
+/// the shared temp directory, where anyone could put one there to read our text.
+fn check_owner(path: &Path, uid: u32) -> anyhow::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.uid() != uid => bail!(
+            "{} belongs to another user; set XDG_RUNTIME_DIR to a private directory (normally /run/user/{uid})",
+            path.display()
+        ),
+        _ => Ok(()), // missing: connecting or binding says what's wrong
+    }
 }
 
 /// Accepted requests, each with a way to reply.
@@ -172,6 +190,18 @@ mod tests {
         let _listener = bind_at(&path).unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         assert!(bind_at(&path).unwrap_err().to_string().contains("already running"));
+    }
+
+    #[test]
+    fn a_socket_owned_by_another_user_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("quillway.sock");
+        let me = rustix::process::getuid().as_raw();
+        assert!(check_owner(&path, me).is_ok(), "missing is left to connect/bind");
+        std::fs::write(&path, b"").unwrap();
+        assert!(check_owner(&path, me).is_ok());
+        let err = check_owner(&path, me + 1).unwrap_err().to_string();
+        assert!(err.contains("belongs to another user"), "{err}");
     }
 
     /// Run `handle` on one end of a socket pair; the other end is the client.

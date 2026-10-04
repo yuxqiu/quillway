@@ -90,6 +90,11 @@ pub async fn download(job: Job<'_>, mut on_progress: impl FnMut(Progress)) -> an
         }
         let resp = req.send().await.with_context(|| format!("GET {}", job.url))?;
         let status = resp.status();
+        if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+            // The `.part` is longer than the file: it can't be resumed, so start over next time.
+            tokio::fs::remove_file(&part).await.ok();
+            bail!("the partial download doesn't match the file; run the install again");
+        }
         if have > 0 && status == reqwest::StatusCode::OK {
             // Server ignored the range: start over.
             hasher = Sha256::new();
@@ -109,7 +114,8 @@ pub async fn download(job: Job<'_>, mut on_progress: impl FnMut(Progress)) -> an
             let chunk = chunk.context("download interrupted; run the install again to resume")?;
             have += chunk.len() as u64;
             if have > job.size {
-                bail!("the server sent more than the expected {} bytes", job.size);
+                tokio::fs::remove_file(&part).await.ok();
+                bail!("the server sent more than the expected {} bytes; the partial file was removed", job.size);
             }
             hasher.update(&chunk);
             file.write_all(&chunk).await?;
@@ -133,22 +139,27 @@ pub async fn download(job: Job<'_>, mut on_progress: impl FnMut(Progress)) -> an
     Ok(())
 }
 
-/// Delete `dest` and its partial download; `Ok(false)` if it wasn't installed.
-/// The lock file stays so a downloader that already opened it keeps coordinating
+/// What [`remove`] deleted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Removed {
+    /// The finished file.
+    pub file: bool,
+    /// A partial download.
+    pub partial: bool,
+}
+
+/// Delete `dest` and its partial download. The lock file stays so a downloader that already opened it keeps coordinating
 /// with new downloaders.
 ///
 /// # Errors
 ///
 /// A download of it is running, or a file can't be removed.
-pub fn remove(dest: &Path) -> anyhow::Result<bool> {
+pub fn remove(dest: &Path) -> anyhow::Result<Removed> {
     if !dest.parent().is_some_and(Path::is_dir) {
-        return Ok(false);
+        return Ok(Removed { file: false, partial: false });
     }
-    let held = lock(dest)?;
-    let removed = remove_if_present(dest)?;
-    remove_if_present(&part_path(dest))?;
-    drop(held);
-    Ok(removed)
+    let _held = lock(dest)?;
+    Ok(Removed { file: remove_if_present(dest)?, partial: remove_if_present(&part_path(dest))? })
 }
 
 fn remove_if_present(path: &Path) -> anyhow::Result<bool> {
@@ -347,10 +358,12 @@ mod tests {
             let _running = lock(&dest).unwrap();
             assert!(remove(&dest).unwrap_err().to_string().contains("already running"));
         }
-        assert!(remove(&dest).unwrap());
+        assert_eq!(remove(&dest).unwrap(), Removed { file: true, partial: true });
         assert!(!dest.exists() && !part_path(&dest).exists());
         assert!(lock_path(&dest).exists());
-        assert!(!remove(&dest).unwrap());
+        assert_eq!(remove(&dest).unwrap(), Removed { file: false, partial: false });
+        std::fs::write(part_path(&dest), b"p").unwrap();
+        assert_eq!(remove(&dest).unwrap(), Removed { file: false, partial: true }, "only a partial download");
     }
 
     #[test]
@@ -360,7 +373,7 @@ mod tests {
         std::fs::write(&dest, b"model").unwrap();
         let waiting = std::fs::File::create(lock_path(&dest)).unwrap();
 
-        assert!(remove(&dest).unwrap());
+        assert!(remove(&dest).unwrap().file);
         // This descriptor represents a downloader that opened the lock before removal.
         // Blocking: a test forking in parallel can briefly hold a copy of `remove`'s lock fd.
         waiting.lock().unwrap();

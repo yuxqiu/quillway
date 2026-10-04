@@ -3135,6 +3135,7 @@ dependencies = [
  "quillway-core",
  "quillway-engine",
  "quillway-wl",
+ "rustix 1.1.5",
  "serde_json",
  "tempfile",
  "tokio",
@@ -3179,6 +3180,7 @@ name = "quillway-wl"
 version = "0.1.1"
 dependencies = [
  "anyhow",
+ "rustix 1.1.5",
  "wayland-client",
  "wayland-protocols",
  "wayland-protocols-wlr",

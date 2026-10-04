@@ -1,6 +1,7 @@
 //! Supervised `llama-server` child process on a random localhost port.
 
 use std::collections::VecDeque;
+use std::future::Future;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -26,7 +27,8 @@ pub struct Server {
 }
 
 impl Server {
-    pub async fn start(model: &Path, cfg: &ModelConfig) -> anyhow::Result<Self> {
+    /// Spawn llama-server for `model`; it isn't ready until [`Server::probe`] says so.
+    pub fn spawn(model: &Path, cfg: &ModelConfig) -> anyhow::Result<Self> {
         let port = free_port()?;
         let api_key = random_key()?;
         let bin = cfg.llama_server_bin();
@@ -45,57 +47,25 @@ impl Server {
             // Drained for the server's whole life, so it never blocks on a full pipe.
             tokio::spawn(collect(stderr, log.clone()));
         }
-
-        let mut server = Self { child, port, api_key, log, context: cfg.context };
-        if let Err(e) = server.wait_ready().await {
-            // Stop it before reporting: a hung server would otherwise live on.
-            let _ = server.child.kill().await;
-            tokio::time::sleep(Duration::from_millis(100)).await; // let the last lines arrive
-            bail!("{e}\n--- llama-server log (tail) ---\n{}", server.log_tail());
-        }
-        // `extra_args` may change `--ctx-size` or `--parallel` (which splits it).
-        match server.slot_context().await {
-            Ok(n) => server.context = n,
-            Err(e) => {
-                eprintln!("quillway: reading llama-server's context size failed, assuming {}: {e:#}", cfg.context);
-            }
-        }
-        Ok(server)
+        Ok(Self { child, port, api_key, log, context: cfg.context })
     }
 
-    async fn wait_ready(&mut self) -> anyhow::Result<()> {
-        let http = reqwest::Client::builder().timeout(Duration::from_secs(2)).build()?;
-        let url = format!("http://127.0.0.1:{}/health", self.port);
-        let start = Instant::now();
-        loop {
-            if let Some(status) = self.child.try_wait()? {
-                bail!("llama-server exited during startup ({status})");
-            }
-            if let Ok(r) = http.get(&url).send().await
-                && r.status().is_success()
-            {
-                return Ok(());
-            }
-            if start.elapsed() > READY_TIMEOUT {
-                bail!("llama-server not ready after {READY_TIMEOUT:?}");
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+    /// Wait until the server answers, then read its per-request context window.
+    /// Owns nothing of the process: dropping it leaves the server running.
+    pub fn probe(&self) -> impl Future<Output = anyhow::Result<u32>> + Send + 'static {
+        let (port, api_key, fallback) = (self.port, self.api_key.clone(), self.context);
+        async move {
+            wait_ready(port).await?;
+            // `extra_args` may change `--ctx-size` or `--parallel` (which splits it).
+            Ok(slot_context(port, &api_key).await.unwrap_or_else(|e| {
+                eprintln!("quillway: reading llama-server's context size failed, assuming {fallback}: {e:#}");
+                fallback
+            }))
         }
     }
 
-    /// The per-request context window from `/props`.
-    async fn slot_context(&self) -> anyhow::Result<u32> {
-        let http = reqwest::Client::builder().timeout(Duration::from_secs(5)).build()?;
-        let props: serde_json::Value = http
-            .get(format!("http://127.0.0.1:{}/props", self.port))
-            .bearer_auth(&self.api_key)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-        let n = props["default_generation_settings"]["n_ctx"].as_u64().context("no n_ctx in /props")?;
-        Ok(u32::try_from(n)?)
+    pub const fn set_context(&mut self, context: u32) {
+        self.context = context;
     }
 
     pub fn log_tail(&self) -> String {
@@ -112,9 +82,9 @@ impl Server {
         self.child.wait().await.map_or_else(|e| e.to_string(), |status| status.to_string())
     }
 
-    /// Kill the process and wait until it's gone, so its GPU memory is free.
-    pub async fn stop(mut self) {
-        let _ = self.child.kill().await;
+    /// SIGKILL the process and wait until it's gone (and its GPU memory free).
+    pub async fn stop(&mut self) {
+        let _ = self.child.kill().await; // fails only if it has already exited
     }
 
     #[must_use]
@@ -131,6 +101,38 @@ impl Server {
     pub const fn context(&self) -> u32 {
         self.context
     }
+}
+
+async fn wait_ready(port: u16) -> anyhow::Result<()> {
+    let http = reqwest::Client::builder().timeout(Duration::from_secs(2)).build()?;
+    let url = format!("http://127.0.0.1:{port}/health");
+    let start = Instant::now();
+    loop {
+        if let Ok(r) = http.get(&url).send().await
+            && r.status().is_success()
+        {
+            return Ok(());
+        }
+        if start.elapsed() > READY_TIMEOUT {
+            bail!("llama-server not ready after {READY_TIMEOUT:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// The per-request context window from `/props`.
+async fn slot_context(port: u16, api_key: &str) -> anyhow::Result<u32> {
+    let http = reqwest::Client::builder().timeout(Duration::from_secs(5)).build()?;
+    let props: serde_json::Value = http
+        .get(format!("http://127.0.0.1:{port}/props"))
+        .bearer_auth(api_key)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let n = props["default_generation_settings"]["n_ctx"].as_u64().context("no n_ctx in /props")?;
+    Ok(u32::try_from(n)?)
 }
 
 fn args(model: &Path, port: u16, cfg: &ModelConfig) -> Vec<String> {
@@ -205,6 +207,15 @@ async fn collect(stderr: tokio::process::ChildStderr, log: Log) {
 mod tests {
     use std::os::unix::process::ExitStatusExt;
     use std::time::{Duration, Instant};
+
+    use super::Server;
+
+    impl Server {
+        /// The process id, until it has been reaped.
+        pub(crate) fn id(&self) -> Option<u32> {
+            self.child.id()
+        }
+    }
 
     #[test]
     fn a_child_that_ignores_sigterm_still_dies_with_its_parent() {

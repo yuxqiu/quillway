@@ -91,8 +91,7 @@ impl Engine {
             state: state_tx,
             config,
             active,
-            server: None,
-            starting: None,
+            llama: Llama::Stopped,
             waiting: Vec::new(),
             reloads: Vec::new(),
         };
@@ -137,17 +136,37 @@ impl Engine {
     }
 }
 
-/// Starting llama-server, as a future the supervisor can drop.
-type Start = Pin<Box<dyn Future<Output = anyhow::Result<server::Server>> + Send>>;
+/// Resolves once a spawned llama-server answers, with its per-slot context.
+/// Dropping it leaves the process alone.
+type Probe = Pin<Box<dyn Future<Output = anyhow::Result<u32>> + Send>>;
 
-/// Owns the config and llama-server; see the crate docs.
+/// The llama-server process, if there is one.
+enum Llama {
+    /// None: an endpoint, a missing model, or the last one failed or exited.
+    Stopped,
+    /// Spawned and waiting for it to answer.
+    Starting { server: server::Server, probe: Probe },
+    /// Answering requests.
+    Running(server::Server),
+}
+
+/// What happened to the llama-server.
+enum Event {
+    Probed(anyhow::Result<u32>),
+    Exited(String),
+}
+
+/// Owns the config and the llama-server process; see the crate docs.
+///
+/// A process is stopped by killing it and waiting for it to exit before
+/// anything else happens, never by dropping a future, so two models never
+/// share the GPU's memory (DECISIONS #20).
 pub struct Supervisor {
     inbox: mpsc::UnboundedReceiver<Command>,
     state: watch::Sender<EngineState>,
     config: ModelConfig,
     active: Active,
-    server: Option<server::Server>,
-    starting: Option<Start>,
+    llama: Llama,
     /// Clients waiting for the start in progress.
     waiting: Vec<oneshot::Sender<Result<Client, String>>>,
     /// Reloads waiting for the start in progress.
@@ -157,64 +176,41 @@ pub struct Supervisor {
 impl Supervisor {
     /// Handle commands until every [`Engine`] handle is gone.
     pub async fn run(mut self) {
-        self.bring_up();
+        self.bring_up().await;
         loop {
-            let started = async {
-                match self.starting.as_mut() {
-                    Some(start) => start.await,
-                    None => std::future::pending().await,
-                }
-            };
-            let exited = async {
-                match self.server.as_mut() {
-                    Some(server) => server.exited().await,
-                    None => std::future::pending().await,
+            let event = async {
+                match &mut self.llama {
+                    Llama::Stopped => std::future::pending().await,
+                    Llama::Starting { server, probe } => tokio::select! {
+                        context = probe => Event::Probed(context),
+                        status = server.exited() => Event::Exited(status),
+                    },
+                    Llama::Running(server) => Event::Exited(server.exited().await),
                 }
             };
             tokio::select! {
                 command = self.inbox.recv() => match command {
-                    Some(command) => self.handle(command),
+                    Some(command) => self.handle(command).await,
                     None => return,
                 },
-                started = started => {
-                    self.starting = None;
-                    match started {
-                        Ok(mut server) => {
-                            if server.is_alive() {
-                                self.server = Some(server);
-                                self.settle(EngineState::Ready, &Ok(()));
-                            } else {
-                                self.fail(format!("llama-server exited right after starting:\n{}", server.log_tail()));
-                            }
-                        }
-                        Err(e) => self.fail(format!("starting llama-server: {e:#}")),
-                    }
-                }
-                // Noticed at once, so the state (and `quillway status`) don't claim it's ready.
-                status = exited => {
-                    let tail = self.server.take().map(|s| s.log_tail()).unwrap_or_default();
-                    self.fail(format!("llama-server exited ({status}); the next request restarts it. Its last output:\n{tail}"));
-                }
+                event = event => self.on_event(event).await,
             }
         }
     }
 
-    fn handle(&mut self, command: Command) {
+    async fn handle(&mut self, command: Command) {
         match command {
             Command::Reload { change, done } => {
                 (self.config, self.active) = *change;
-                // Dropping a start in progress kills its process; the old server is
-                // stopped by the next start (bring_up), which waits for it to exit.
-                self.starting = None;
                 for client in self.waiting.drain(..) {
                     let _ = client.send(Err(CANCELLED.into()));
                 }
                 self.reloads.push(done);
-                self.bring_up();
+                self.bring_up().await;
             }
             Command::Start => {
-                if self.ready_client().is_none() && self.starting.is_none() {
-                    self.bring_up();
+                if self.ready_client().is_none() && !self.starting() {
+                    self.bring_up().await;
                 }
             }
             Command::Client(reply) => {
@@ -223,11 +219,40 @@ impl Supervisor {
                     return;
                 }
                 self.waiting.push(reply);
-                if self.starting.is_none() {
-                    self.bring_up();
+                if !self.starting() {
+                    self.bring_up().await;
                 }
             }
         }
+    }
+
+    async fn on_event(&mut self, event: Event) {
+        match (std::mem::replace(&mut self.llama, Llama::Stopped), event) {
+            (Llama::Starting { mut server, .. }, Event::Probed(Ok(context))) => {
+                server.set_context(context);
+                self.llama = Llama::Running(server);
+                self.settle(EngineState::Ready, &Ok(()));
+            }
+            (Llama::Starting { mut server, .. }, Event::Probed(Err(e))) => {
+                let tail = server.log_tail();
+                server.stop().await;
+                self.fail(format!("starting llama-server: {e:#}\n--- llama-server log (tail) ---\n{tail}"));
+            }
+            (Llama::Starting { server, .. }, Event::Exited(status)) => {
+                self.fail(format!("llama-server exited during startup ({status}):\n{}", server.log_tail()));
+            }
+            // Noticed at once, so the state (and `quillway status`) don't claim it's ready.
+            (Llama::Running(server), Event::Exited(status)) => self.fail(format!(
+                "llama-server exited ({status}); the next request restarts it. Its last output:\n{}",
+                server.log_tail()
+            )),
+            // Events come from the current state; nothing else can happen.
+            (llama, _) => self.llama = llama,
+        }
+    }
+
+    const fn starting(&self) -> bool {
+        matches!(self.llama, Llama::Starting { .. })
     }
 
     /// A client for the endpoint or the running llama-server, if there is one.
@@ -242,19 +267,19 @@ impl Supervisor {
                 sampling: self.active.sampling,
             }));
         }
-        if let Some(s) = self.server.as_mut()
-            && !s.is_alive()
-        {
-            eprintln!("quillway: llama-server exited; restarting. Its last output:\n{}", s.log_tail());
-            self.server = None;
-        }
-        self.server.as_ref().map(|server| llama_client(server, &self.active))
+        let Llama::Running(server) = &mut self.llama else { return None };
+        // It may have exited just now, before its event was handled.
+        server.is_alive().then(|| llama_client(server, &self.active))
     }
 
-    /// Start (and warm up) llama-server, or settle at once: an endpoint needs
-    /// no server, and a missing model can't start.
-    fn bring_up(&mut self) {
-        let old = self.server.take();
+    /// Stop the current server, then start one for the current config, or
+    /// settle at once: an endpoint needs no server, and a missing model can't start.
+    async fn bring_up(&mut self) {
+        if let Llama::Starting { mut server, .. } | Llama::Running(mut server) =
+            std::mem::replace(&mut self.llama, Llama::Stopped)
+        {
+            server.stop().await;
+        }
         if self.config.endpoint.is_some() {
             return self.settle(EngineState::Ready, &Ok(()));
         }
@@ -262,14 +287,10 @@ impl Supervisor {
             return self.settle(EngineState::Missing, &Err(format!("{e:#}")));
         }
         self.publish(EngineState::Starting);
-        let (config, active) = (self.config.clone(), self.active.clone());
-        self.starting = Some(Box::pin(async move {
-            // Wait for the old process to go, so two models never share the GPU's memory.
-            if let Some(old) = old {
-                old.stop().await;
-            }
-            server::Server::start(&active.path, &config).await
-        }));
+        match server::Server::spawn(&self.active.path, &self.config) {
+            Ok(server) => self.llama = Llama::Starting { probe: Box::pin(server.probe()), server },
+            Err(e) => self.fail(format!("starting llama-server: {e:#}")),
+        }
     }
 
     fn fail(&mut self, message: String) {
@@ -422,6 +443,20 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_new_server_spawns_only_after_the_old_one_has_exited() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, active) = fake_server(dir.path(), "exec sleep 60");
+        let (_engine, mut supervisor) = Engine::new(config, active);
+        supervisor.bring_up().await;
+        let Llama::Starting { server, .. } = &supervisor.llama else { panic!("not starting") };
+        let old = server.id().unwrap();
+        supervisor.bring_up().await; // what a reload does
+        // Reaped, not just killed: a killed process can hold GPU memory until it exits.
+        assert!(!std::path::Path::new(&format!("/proc/{old}")).exists(), "the old server is gone");
+        assert!(supervisor.starting(), "and a new one is starting");
     }
 
     #[tokio::test]

@@ -51,7 +51,7 @@ pub async fn run(a: RewriteArgs) -> anyhow::Result<()> {
     // The model's text as it wrote it (`complete` refuses an empty one).
     say!("{}", raw.trim());
     if a.stats {
-        eprintln!(
+        note!(
             "model {} · startup {:.1}s · first token {:.2}s · {} tokens · {rate:.1} tok/s",
             client.endpoint().model,
             loaded.as_secs_f64(),
@@ -83,7 +83,7 @@ async fn connect(config: Config) -> anyhow::Result<(Client, Option<Engine>)> {
         Ok(Response::Server(endpoint)) => return Ok((Client::new(endpoint), None)),
         // A daemon older than this command doesn't know `connect`.
         Ok(Response::Error { message }) if message.starts_with("bad request") => {
-            eprintln!("quillway: the running daemon is outdated; restart it to share its model server");
+            note!("quillway: the running daemon is outdated; restart it to share its model server");
         }
         Ok(Response::Error { message }) => bail!("daemon: {message}"),
         Ok(other) => bail!("unexpected daemon response: {other:?}"),

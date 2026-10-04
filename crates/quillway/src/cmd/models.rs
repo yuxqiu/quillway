@@ -41,7 +41,7 @@ pub async fn run(cmd: ModelsCmd) -> anyhow::Result<()> {
 
 fn list(config: &Config) -> anyhow::Result<()> {
     // Still list the catalog when the choice is broken: it's where a new one comes from.
-    let active = models::active(config).inspect_err(|e| eprintln!("warning: {e:#}")).ok();
+    let active = models::active(config).inspect_err(|e| note!("warning: {e:#}")).ok();
     // With `model.endpoint`, requests go there, not to any model listed here.
     let local = active.as_ref().filter(|_| config.model.endpoint.is_none());
     for e in catalog::all() {
@@ -73,7 +73,7 @@ async fn install(config: &Config, e: &Entry, yes: bool) -> anyhow::Result<()> {
     say!("installed {} → {}", e.name, models::path(e).display());
     if is_active(config, e) {
         // A daemon started before the download shows "not installed" until told.
-        reload_or_warn().await?;
+        reload_daemon().await.context("installed, but the daemon couldn't switch to it")?;
     } else {
         say!("make it active with `quillway models use {}`", e.id);
     }
@@ -98,31 +98,36 @@ async fn use_model(config: &Config, id: &str) -> anyhow::Result<()> {
     State { active: Some(id.clone()) }.save()?;
     // In both cases the daemon would reload into the same setup.
     if config.model.active.is_some() {
-        eprintln!("note: saved, but `model.active` in the config overrides it until that line is removed");
+        note!("note: saved, but `model.active` in the config overrides it until that line is removed");
         return Ok(());
     }
     if config.model.endpoint.is_some() {
-        eprintln!("note: saved, but requests go to `model.endpoint` until that line is removed");
+        note!("note: saved, but requests go to `model.endpoint` until that line is removed");
         return Ok(());
     }
     say!("active model: {id}");
-    reload_or_warn().await?;
-    Ok(())
+    reload_daemon().await.context("saved, but the daemon couldn't switch to it")
 }
 
 async fn remove(config: &Config, e: &Entry) -> anyhow::Result<()> {
-    if !models::remove(e)? {
-        say!("{} is not installed", e.name);
+    let removed = models::remove(e)?;
+    match (removed.file, removed.partial) {
+        (true, _) => say!("removed {}", models::path(e).display()),
+        (false, true) => say!("{} wasn't installed; removed its partial download", e.name),
+        (false, false) => say!("{} is not installed", e.name),
+    }
+    if !removed.file || !is_active(config, e) {
         return Ok(());
     }
-    say!("removed {}", models::path(e).display());
     // The daemon stops the removed model's server; it has no model until one is installed or chosen.
-    if is_active(config, e)
-        && let Some(why) = reload_daemon().await?
-    {
-        eprintln!("note: the daemon has no model now ({why})");
+    match reload_daemon().await {
+        // Expected after removing the active model; anything else is a real failure.
+        Err(e) if format!("{e:#}").contains("is not installed") => {
+            note!("note: the daemon has no model now; install one, or pick another with `quillway models use`");
+            Ok(())
+        }
+        result => result.context("removed, but the daemon couldn't reload"),
     }
-    Ok(())
 }
 
 /// Whether requests use `e`, so the daemon must pick up its install or removal.
@@ -131,11 +136,11 @@ fn is_active(config: &Config, e: &Entry) -> bool {
 }
 
 fn confirm_license(warning: &str) -> anyhow::Result<()> {
-    eprintln!("{warning}");
+    note!("{warning}");
     if !std::io::stdin().is_terminal() {
         bail!("re-run with --yes to accept the license non-interactively");
     }
-    eprint!("Accept and download? [y/N] ");
+    let _ = write!(std::io::stderr(), "Accept and download? [y/N] ");
     std::io::stderr().flush()?;
     let mut answer = String::new();
     std::io::stdin().read_line(&mut answer)?;
@@ -163,34 +168,29 @@ async fn download_with_progress(e: &Entry) -> anyhow::Result<()> {
             let speed = rate.describe().map_or_else(String::new, |r| format!("  {r}"));
             // On a terminal, redraw in place and clear what a longer previous line left.
             let end = if tty { "\x1b[K\r" } else { "\n" };
-            eprint!("{:<13} {pct:>3}%  {} / {}{speed}{end}", e.name, human(p.done), human(p.total));
+            let line = format!("{:<13} {pct:>3}%  {} / {}{speed}{end}", e.name, human(p.done), human(p.total));
+            let _ = std::io::stderr().write_all(line.as_bytes()); // a closed stderr mustn't stop the download
         }
     })
     .await;
     if tty {
-        eprintln!();
+        note!();
     }
     result
 }
 
 /// Tell a running daemon to pick up the change; fine if none is running.
-/// Returns what went wrong, if the daemon couldn't reload.
-async fn reload_daemon() -> anyhow::Result<Option<String>> {
-    Ok(match crate::ipc::send(&Request::Reload).await {
-        Ok(Response::Ok) => {
-            say!("daemon reloaded");
-            None
-        }
-        Ok(Response::Error { message }) => Some(message),
-        Ok(other) => Some(format!("unexpected response {other:?}")),
-        Err(e) if e.downcast_ref::<crate::ipc::DaemonNotRunning>().is_some() => None, // it reads the change on start
-        Err(e) => Some(format!("{e:#}")),
-    })
-}
-
-async fn reload_or_warn() -> anyhow::Result<()> {
-    if let Some(error) = reload_daemon().await? {
-        eprintln!("daemon reload failed: {error}");
+///
+/// # Errors
+///
+/// Why the daemon couldn't reload, e.g. llama-server failed to start the model.
+async fn reload_daemon() -> anyhow::Result<()> {
+    match crate::ipc::send(&Request::Reload).await {
+        Ok(Response::Ok) => say!("daemon reloaded"),
+        Ok(Response::Error { message }) => bail!(message),
+        Ok(other) => bail!("unexpected response {other:?}"),
+        Err(e) if e.downcast_ref::<crate::ipc::DaemonNotRunning>().is_some() => {} // it reads the change on start
+        Err(e) => return Err(e),
     }
     Ok(())
 }

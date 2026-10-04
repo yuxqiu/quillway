@@ -152,12 +152,12 @@ pub async fn install(e: &catalog::Entry, on_progress: impl FnMut(download::Progr
     download::download(job, on_progress).await
 }
 
-/// Delete `e`'s files; `Ok(false)` if it wasn't installed.
+/// Delete `e`'s file and any partial download of it.
 ///
 /// # Errors
 ///
 /// As [`download::remove`].
-pub fn remove(e: &catalog::Entry) -> anyhow::Result<bool> {
+pub fn remove(e: &catalog::Entry) -> anyhow::Result<download::Removed> {
     download::remove(&path(e))
 }
 

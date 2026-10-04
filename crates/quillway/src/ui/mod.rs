@@ -528,7 +528,7 @@ impl App {
                         && let Some(g) = p.generation.take()
                     {
                         g.handle.abort();
-                        p.fail(g, "Stopped: the model server is restarting for a reload. Run it again.".into());
+                        p.fail(g, "Stopped by a reload. Run it again.".into());
                         focus(p.field) // a click while writing may have taken it
                     } else {
                         Task::none()
@@ -812,7 +812,13 @@ impl App {
         let Some(p) = self.popup.as_mut() else { return Task::none() };
         match (s, p.phase()) {
             (Shortcut::Escape, Phase::Generating) => {
-                self.abort_generation();
+                if let Some(g) = p.generation.take() {
+                    g.handle.abort();
+                    // A typed instruction comes back, as after an error, to adjust or send again.
+                    if let Some(typed) = g.typed {
+                        p.input = typed;
+                    }
+                }
                 // iced's text_input also took the Esc and dropped its focus.
                 focus(Field::Instruction)
             }
@@ -896,6 +902,9 @@ impl App {
             InstallEvent::Done(Ok(())) => {
                 self.install = None;
                 self.engine.start();
+                if let Some(p) = self.popup.as_mut() {
+                    p.error = None; // e.g. a rewrite stopped by the reload that led here
+                }
                 Task::none()
             }
             InstallEvent::Done(Err(e)) => {
@@ -1390,7 +1399,7 @@ mod tests {
         let _ = app.update(Message::Ipc(Request::Reload, reply()));
         let p = app.popup.as_ref().unwrap();
         assert!(p.generation.is_none());
-        assert!(p.error.as_deref().is_some_and(|e| e.contains("restarting for a reload")), "{:?}", p.error);
+        assert!(p.error.as_deref().is_some_and(|e| e.contains("Stopped by a reload")), "{:?}", p.error);
         assert!(p.drafts[0].incomplete, "the partial text is kept");
     }
 
@@ -1466,6 +1475,17 @@ mod tests {
         let installed = !app.needs_install();
         std::fs::remove_file(&path).unwrap();
         assert!(installed);
+    }
+
+    #[test]
+    fn escape_gives_back_a_typed_instruction() {
+        let mut app = boot(endpoint_config());
+        let _ = app.update(Message::Ipc(Request::Show { input: Input::Text("their here".into()) }, reply()));
+        let _ = app.update(Message::Input("make it formal".into()));
+        let _ = app.update(Message::Submit);
+        let _ = app.on_shortcut(Shortcut::Escape);
+        let p = app.popup.as_ref().unwrap();
+        assert_eq!((p.phase(), p.input.as_str()), (Phase::Composing, "make it formal"));
     }
 
     #[test]

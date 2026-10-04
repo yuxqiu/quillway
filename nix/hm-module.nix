@@ -26,7 +26,7 @@ in
       default = { };
       example = lib.literalExpression ''
         {
-          model.active = "gemma-4-e4b";
+          model.context = 16384;
           ui = { theme = "dark"; opacity = 0.78; client_shadow = false; };
           behavior.recent_secs = 30;
         }

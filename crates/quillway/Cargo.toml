@@ -14,6 +14,7 @@ serde_json.workspace = true
 tokio.workspace = true
 clap = { version = "4", features = ["derive"] }
 futures-util = "0.3"
+rustix = { version = "1", features = ["process"] }
 iced = { version = "0.14", features = ["tokio"] }
 iced_layershell = "=0.19.1"
 # iced_exdevtools 0.19.1 breaks on winit-core beta.3 (non-exhaustive NativeKeyCode); pin what upstream locks.

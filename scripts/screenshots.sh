@@ -8,7 +8,7 @@
 # Everything runs in an isolated headless sway session with its own runtime
 # directory, so keystrokes and the clipboard never touch your desktop, and a
 # running Quillway daemon is left alone. Needs the default model installed
-# (`quillway models install`) and a GPU with a Mesa driver (Intel, AMD, …); the
+# (`quillway models install qwen3.5-4b`) and a GPU with a Mesa driver (Intel, AMD, …); the
 # render node is picked from /dev/dri (override with QUILLWAY_RENDER_NODE=…).
 #
 # The popup pixels are exactly what Quillway draws; the backdrop, a soft drop

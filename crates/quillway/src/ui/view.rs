@@ -98,7 +98,7 @@ impl App {
         }
         // Unless the error above already says it (a request whose start failed).
         if let EngineState::Failed(e) = &self.engine_state
-            && p.error.is_none()
+            && p.error.as_deref() != Some(e.as_str())
         {
             col = col.push(text(format!("Model server failed: {}", preview(e, 200))).size(13).color(pal.error));
         }
@@ -176,6 +176,12 @@ impl App {
             left.push_str(" · model loading…");
         }
         let hints = match p.phase() {
+            // Downloading: ↵ has nothing to do until it finishes or fails.
+            _ if self.needs_install()
+                && self.active.entry.and_then(|e| self.installing(e)).is_some_and(|i| i.error.is_none()) =>
+            {
+                "esc close"
+            }
             _ if self.needs_install() && self.active.entry.is_some() => "↵ install   esc close",
             // A missing custom model file: nothing to install, run or switch to.
             _ if self.needs_install() => "esc close",

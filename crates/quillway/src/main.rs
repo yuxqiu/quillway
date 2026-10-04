@@ -5,6 +5,14 @@ macro_rules! say {
     ($($arg:tt)*) => { $crate::say(format_args!($($arg)*))? };
 }
 
+/// `eprintln!` for notes and progress; a closed stderr is ignored instead of panicking.
+macro_rules! note {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($arg)*);
+    }};
+}
+
 mod cmd;
 mod ipc;
 mod ui;
@@ -112,7 +120,9 @@ fn run() -> anyhow::Result<()> {
         Command::Status => Request::Status,
         Command::Quit => Request::Quit,
     };
-    match runtime()?.block_on(ipc::send(&request))? {
+    // These are answered at once; a hung daemon mustn't leave a key binding's process waiting.
+    let answer = runtime()?.block_on(async { tokio::time::timeout(ipc::QUICK_REPLY, ipc::send(&request)).await });
+    match answer.map_err(|_| anyhow::anyhow!("the daemon didn't answer within {:?}", ipc::QUICK_REPLY))?? {
         Response::Ok => Ok(()),
         Response::Status { visible, model, engine } => {
             let popup = if visible { "visible" } else { "hidden" };

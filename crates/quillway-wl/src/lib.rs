@@ -4,6 +4,10 @@
 mod watch;
 
 use std::io::Read;
+use std::os::fd::AsFd;
+use std::time::{Duration, Instant};
+
+use rustix::event::{PollFd, PollFlags, Timespec};
 
 use anyhow::Context;
 pub use watch::ClipboardWatch;
@@ -26,6 +30,21 @@ impl std::fmt::Display for TooLarge {
 
 impl std::error::Error for TooLarge {}
 
+/// How long the app that owns the clipboard has to send its text.
+pub const READ_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The app that owns the clipboard didn't send its text within [`READ_TIMEOUT`].
+#[derive(Debug)]
+pub struct NoAnswer;
+
+impl std::fmt::Display for NoAnswer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the app that owns the clipboard didn't respond")
+    }
+}
+
+impl std::error::Error for NoAnswer {}
+
 /// Text on the clipboard; `Ok(None)` when it is empty or non-text.
 ///
 /// # Errors
@@ -33,9 +52,29 @@ impl std::error::Error for TooLarge {}
 /// The compositor can't be reached or lacks data-control.
 pub fn read() -> anyhow::Result<Option<String>> {
     match paste::get_contents(ClipboardType::Regular, Seat::Unspecified, MimeType::Text) {
-        Ok((pipe, _mime)) => read_text(pipe),
+        Ok((pipe, _mime)) => read_text(Deadline { inner: pipe, until: Instant::now() + READ_TIMEOUT }),
         Err(Error::NoSeats | Error::ClipboardEmpty | Error::NoMimeType) => Ok(None),
         Err(e) => Err(e).context("reading the Wayland clipboard (does the compositor support data-control?)"),
+    }
+}
+
+/// A pipe that fails with [`NoAnswer`] once `until` passes, so a hung clipboard
+/// owner can't block the reading thread forever.
+struct Deadline<R> {
+    inner: R,
+    until: Instant,
+}
+
+impl<R: Read + AsFd> Read for Deadline<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let left = self.until.saturating_duration_since(Instant::now());
+        let timeout =
+            Timespec { tv_sec: left.as_secs().try_into().unwrap_or(i64::MAX), tv_nsec: left.subsec_nanos().into() };
+        let mut fds = [PollFd::new(&self.inner, PollFlags::IN)];
+        if left.is_zero() || rustix::event::poll(&mut fds, Some(&timeout))? == 0 {
+            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, NoAnswer));
+        }
+        self.inner.read(buf)
     }
 }
 
@@ -64,6 +103,15 @@ pub fn copy(text: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_clipboard_owner_that_never_sends_times_out() {
+        let (pipe, _owner) = std::os::unix::net::UnixStream::pair().unwrap(); // open, silent
+        let started = Instant::now();
+        let error = read_text(Deadline { inner: pipe, until: started + Duration::from_millis(100) }).unwrap_err();
+        assert!(error.chain().any(|e| e.is::<NoAnswer>() || e.to_string().contains("didn't respond")), "{error:#}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
 
     #[test]
     fn clipboard_limit_never_returns_truncated_text() {

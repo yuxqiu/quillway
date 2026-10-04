@@ -9,7 +9,9 @@ pub async fn run() -> anyhow::Result<()> {
     let mut ok = true;
     let mut check = |good: bool, what: &str, detail: String| {
         ok &= good;
+        // Keep checking if stdout closed, so the exit code still reports failures.
         crate::say(format_args!("{} {what:<16} {detail}", if good { "✓" } else { "✗" }))
+            .or_else(|e| if e.is::<crate::StdoutClosed>() { Ok(()) } else { Err(e) })
     };
 
     let cfg_path = paths::config_file();
@@ -35,16 +37,12 @@ pub async fn run() -> anyhow::Result<()> {
         if wayland.is_empty() { "WAYLAND_DISPLAY is not set".into() } else { wayland },
     )?;
 
-    // The app that owns the clipboard sends the data; a hung one mustn't hang `doctor`.
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || tx.send(quillway_wl::read()));
-    match rx.recv_timeout(std::time::Duration::from_secs(2)) {
-        Ok(Ok(t)) => check(true, "clipboard", format!("readable ({} chars)", t.map_or(0, |t| t.chars().count())))?,
-        Ok(Err(e)) if e.downcast_ref::<quillway_wl::TooLarge>().is_some() => {
+    match quillway_wl::read() {
+        Ok(t) => check(true, "clipboard", format!("readable ({} chars)", t.map_or(0, |t| t.chars().count())))?,
+        Err(e) if e.downcast_ref::<quillway_wl::TooLarge>().is_some() => {
             check(true, "clipboard", "readable (its text is over the 1 MiB limit)".into())?;
         }
-        Ok(Err(e)) => check(false, "clipboard", format!("{e:#}"))?,
-        Err(_) => check(false, "clipboard", "the app that owns the clipboard didn't answer within 2 s".into())?,
+        Err(e) => check(false, "clipboard", format!("{e:#}"))?,
     }
     match quillway_wl::ClipboardWatch::start() {
         Ok(_) => check(true, "clipboard watch", "copy times are tracked".into())?,
@@ -75,7 +73,8 @@ pub async fn run() -> anyhow::Result<()> {
         }
     }
 
-    match crate::ipc::send(&Request::Status).await {
+    let status = tokio::time::timeout(crate::ipc::QUICK_REPLY, crate::ipc::send(&Request::Status)).await;
+    match status.unwrap_or_else(|_| Err(anyhow::anyhow!("no answer within {:?}", crate::ipc::QUICK_REPLY))) {
         // Running isn't enough: its model server must be up or coming up.
         Ok(Response::Status { engine, .. }) => {
             check(matches!(engine.as_str(), "ready" | "starting"), "daemon", format!("running, {engine}"))?;
