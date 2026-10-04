@@ -44,17 +44,7 @@ const CLIPBOARD_TIMEOUT: Duration = Duration::from_secs(2);
 /// Bound before the UI starts; taken once by the IPC subscription.
 static LISTENER: Mutex<Option<UnixListener>> = Mutex::new(None);
 
-/// Mesa's Vulkan driver offers 10-bit surface formats first, and iced takes the first
-/// one, whose alpha has 2 bits: the shadow and the panel's translucency round to 0,
-/// ⅓, ⅔ or 1, so the shadow showed only as a hard band below. This Mesa option puts
-/// 8-bit `B8G8R8A8_UNORM` first; other drivers ignore it.
-const MESA_BGRA8_FIRST: &str = "vk_wsi_force_bgra8_unorm_first";
-
 pub fn run() -> anyhow::Result<()> {
-    if std::env::var_os(MESA_BGRA8_FIRST).is_none() {
-        // SAFETY: the first thing the daemon does: no other thread exists yet to read the environment.
-        unsafe { std::env::set_var(MESA_BGRA8_FIRST, "true") };
-    }
     *LISTENER.lock().expect("listener lock") = Some(ipc::bind()?);
     let config = Config::load_user()?;
     let active = models::active(&config)?;

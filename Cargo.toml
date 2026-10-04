@@ -41,3 +41,13 @@ tokio = { version = "1", features = [
   "fs",
   "sync",
 ] }
+
+# iced 0.14.0 plus upstream ed36c6e1, which stops iced_wgpu choosing 10:10:10:2 surfaces: their
+# 2-bit alpha erased the popup's shadow and translucency on Mesa (DECISIONS #52,
+# docs/research/surface-format-alpha.md). Drop this when a released iced has the fix.
+[patch.crates-io]
+iced_wgpu = { git = "https://github.com/yuxqiu/iced", rev = "77e7f24f5ef4e58c670519bb5c1ccf058b4eb121" }
+iced_graphics = { git = "https://github.com/yuxqiu/iced", rev = "77e7f24f5ef4e58c670519bb5c1ccf058b4eb121" }
+iced_core = { git = "https://github.com/yuxqiu/iced", rev = "77e7f24f5ef4e58c670519bb5c1ccf058b4eb121" }
+iced_futures = { git = "https://github.com/yuxqiu/iced", rev = "77e7f24f5ef4e58c670519bb5c1ccf058b4eb121" }
+iced_debug = { git = "https://github.com/yuxqiu/iced", rev = "77e7f24f5ef4e58c670519bb5c1ccf058b4eb121" }
