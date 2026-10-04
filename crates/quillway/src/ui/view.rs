@@ -217,16 +217,32 @@ fn editor<'a>(
         .padding(0)
         .max_height(max_height)
         .style(pal.editor())
-        // Tab switches boxes instead of inserting a tab. Keys pressed with Ctrl insert nothing:
-        // iced still reports the key's text under Ctrl, so Ctrl+1 would otherwise insert "1".
-        .key_binding(|k| match k.key {
-            Key::Named(Named::Tab) => None,
-            _ if k.modifiers.control() => {
-                text_editor::Binding::from_key_press(k).filter(|b| !matches!(b, text_editor::Binding::Insert(_)))
-            }
-            _ => text_editor::Binding::from_key_press(k),
+        .key_binding({
+            let selected = content.selection().is_some();
+            move |k| editor_binding(k, selected)
         })
         .into()
+}
+
+/// The text boxes' keys: iced's, plus the word-wise Ctrl+Backspace and Ctrl+Delete it
+/// lacks (it has Ctrl+arrows). Tab switches boxes instead of inserting a tab. Keys
+/// pressed with Ctrl insert nothing: iced still reports the key's text under Ctrl,
+/// so Ctrl+1 would otherwise insert "1".
+fn editor_binding(k: text_editor::KeyPress, selected: bool) -> Option<text_editor::Binding<Message>> {
+    use text_editor::{Binding, Motion};
+    let ctrl = k.modifiers.control();
+    match k.key.as_ref() {
+        Key::Named(Named::Tab) => None,
+        // With a selection, it goes as with a plain Backspace or Delete.
+        Key::Named(Named::Backspace) if ctrl && !selected => {
+            Some(Binding::Sequence(vec![Binding::Select(Motion::WordLeft), Binding::Backspace]))
+        }
+        Key::Named(Named::Delete) if ctrl && !selected => {
+            Some(Binding::Sequence(vec![Binding::Select(Motion::WordRight), Binding::Delete]))
+        }
+        _ if ctrl => Binding::from_key_press(k).filter(|b| !matches!(b, Binding::Insert(_))),
+        _ => Binding::from_key_press(k),
+    }
 }
 
 fn hairline<'a>(pal: Palette) -> Element<'a, Message> {
@@ -263,4 +279,49 @@ fn diff_view<'a>(old: &str, new: &str, pal: Palette) -> Element<'a, Message> {
         })
         .collect();
     rich_text(spans).size(15).into()
+}
+
+#[cfg(test)]
+mod tests {
+    use iced::keyboard::Modifiers;
+    use iced::keyboard::key::{Code, Physical};
+    use iced::widget::text_editor::{Action, Binding, Content, Edit, KeyPress, Motion, Status};
+
+    use super::*;
+
+    fn press(key: Named, modifiers: Modifiers) -> KeyPress {
+        KeyPress {
+            key: Key::Named(key),
+            modified_key: Key::Named(key),
+            physical_key: Physical::Code(Code::Backspace),
+            modifiers,
+            text: None,
+            status: Status::Focused { is_hovered: false },
+        }
+    }
+
+    #[test]
+    fn ctrl_backspace_and_delete_take_a_word() {
+        let back = editor_binding(press(Named::Backspace, Modifiers::CTRL), false);
+        assert!(
+            matches!(back.as_ref(), Some(Binding::Sequence(b)) if matches!(b.as_slice(), [Binding::Select(Motion::WordLeft), Binding::Backspace]))
+        );
+        let delete = editor_binding(press(Named::Delete, Modifiers::CTRL), false);
+        assert!(
+            matches!(delete.as_ref(), Some(Binding::Sequence(b)) if matches!(b.as_slice(), [Binding::Select(Motion::WordRight), Binding::Delete]))
+        );
+        // A selection goes as it is, and a plain Backspace takes one character.
+        assert!(matches!(editor_binding(press(Named::Backspace, Modifiers::CTRL), true), Some(Binding::Backspace)));
+        assert!(matches!(editor_binding(press(Named::Backspace, Modifiers::empty()), false), Some(Binding::Backspace)));
+    }
+
+    #[test]
+    fn selecting_the_word_left_then_backspace_deletes_that_word() {
+        // What the binding does to the text, through iced's own editor.
+        let mut content = Content::<iced::Renderer>::with_text("make it formal");
+        content.perform(Action::Move(Motion::DocumentEnd));
+        content.perform(Action::Select(Motion::WordLeft));
+        content.perform(Action::Edit(Edit::Backspace));
+        assert_eq!(content.text(), "make it ");
+    }
 }

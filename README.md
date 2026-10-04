@@ -76,7 +76,7 @@ bindsym Mod4+space exec quillway toggle
 | Anywhere | Ctrl+E | Show or hide an error's details (e.g. llama-server's log), when it has some |
 | | Esc | Close |
 
-The Ctrl shortcuts above work from the instruction box only; in a text box, Ctrl+C/X/V/A select and copy as usual. They follow the key's position, so they also work on non-Latin layouts.
+The Ctrl shortcuts above work from the instruction box only; in a text box, Ctrl+C/X/V/A select and copy as usual, and Ctrl+Backspace/Delete and Ctrl+←/→ work by word. They follow the key's position, so they also work on non-Latin layouts.
 
 **Where the text comes from:**
 - If you copied something in the last minute (`behavior.recent_secs`), the popup starts with it, and you can still edit it.
