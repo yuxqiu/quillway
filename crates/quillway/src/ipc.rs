@@ -110,10 +110,14 @@ pub fn bind() -> anyhow::Result<std::os::unix::net::UnixListener> {
 
 fn bind_at(path: &Path) -> anyhow::Result<std::os::unix::net::UnixListener> {
     check_socket(path, rustix::process::getuid().as_raw())?;
-    if std::os::unix::net::UnixStream::connect(path).is_ok() {
-        bail!("another quillway daemon is already running ({})", path.display());
+    match std::os::unix::net::UnixStream::connect(path) {
+        Ok(_) => bail!("another quillway daemon is already running ({})", path.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+            std::fs::remove_file(path).with_context(|| format!("removing stale socket {}", path.display()))?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("checking socket {}", path.display())),
     }
-    let _ = std::fs::remove_file(path);
     let l = std::os::unix::net::UnixListener::bind(path).with_context(|| format!("binding {}", path.display()))?;
     // `XDG_RUNTIME_DIR` is normally private, but the fallback socket lives in /tmp.
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
@@ -215,6 +219,31 @@ mod tests {
         let _listener = bind_at(&path).unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         assert!(bind_at(&path).unwrap_err().to_string().contains("already running"));
+    }
+
+    #[test]
+    fn a_live_socket_with_restricted_permissions_is_not_unlinked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("quillway.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let error = bind_at(&path).unwrap_err();
+        assert_eq!(
+            error.root_cause().downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+    }
+
+    #[test]
+    fn a_stale_socket_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("quillway.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        drop(listener);
+        let _replacement = bind_at(&path).unwrap();
+        assert!(std::os::unix::net::UnixStream::connect(&path).is_ok());
     }
 
     #[test]
