@@ -3,7 +3,7 @@
 use std::f32::consts::TAU;
 
 use iced::widget::{container, rule, text_editor, text_input};
-use iced::{Background, Border, Color, Radians, Shadow, Vector, gradient};
+use iced::{Background, Border, Color, Radians, Shadow, Vector, border, gradient};
 use quillway_core::config::{ThemeChoice, UiConfig};
 
 pub const RADIUS: f32 = 16.0;
@@ -132,11 +132,12 @@ impl Palette {
         }
     }
 
-    /// The message line, tinted by its severity's `color`.
-    pub fn notice(color: Color) -> impl Fn(&iced::Theme) -> container::Style {
+    /// The message tray at the panel's bottom edge, tinted by its severity's `color`;
+    /// its bottom corners follow the panel's.
+    pub fn tray(color: Color) -> impl Fn(&iced::Theme) -> container::Style {
         move |_| container::Style {
             background: Some(Color { a: color.a * 0.12, ..color }.into()),
-            border: Border { radius: 8.0.into(), ..Border::default() },
+            border: Border { radius: border::Radius::new(0.0).bottom(RADIUS - RING), ..Border::default() },
             ..container::Style::default()
         }
     }

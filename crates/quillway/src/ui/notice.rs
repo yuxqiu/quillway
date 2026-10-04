@@ -1,7 +1,8 @@
 //! The popup's one message line: an error or a note, with optional details
-//! (`docs/research/popup-error-display.md`). It sits under the text it is
-//! about, takes no space when there is nothing to say, and stays until its
-//! cause is gone: no timeouts.
+//! (`docs/research/popup-error-display.md`). It is a tray under the footer:
+//! the popup grows down from a fixed top, so nothing above it moves when it
+//! comes or goes. It takes no space when there is nothing to say, and stays
+//! until its cause is gone: no timeouts.
 
 use iced::widget::{Space, column, container, row, scrollable, text};
 use iced::{Element, Length};
@@ -52,8 +53,8 @@ fn capitalized(s: &str) -> String {
     chars.next().map_or_else(String::new, |c| c.to_uppercase().chain(chars).collect())
 }
 
-/// The message line: a badge (not color alone), the summary, and the details if open.
-pub fn strip<'a>(n: Notice, open: bool, pal: Palette) -> Element<'a, Message> {
+/// The tray: a badge (not color alone), the summary, and the details if open.
+pub fn tray<'a>(n: Notice, open: bool, pal: Palette, pad_x: u16) -> Element<'a, Message> {
     let (color, glyph) = match n.severity {
         Severity::Error => (pal.error, "!"),
         Severity::Info => (pal.dim, "i"),
@@ -69,7 +70,7 @@ pub fn strip<'a>(n: Notice, open: bool, pal: Palette) -> Element<'a, Message> {
         let detail = scrollable(row![Space::new().width(24), text(d).size(12).color(pal.dim)]);
         col = col.push(container(detail).max_height(120.0));
     }
-    container(col).padding([6, 10]).width(Length::Fill).style(Palette::notice(color)).into()
+    container(col).padding([10, pad_x]).width(Length::Fill).style(Palette::tray(color)).into()
 }
 
 #[cfg(test)]

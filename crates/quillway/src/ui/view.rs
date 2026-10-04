@@ -35,6 +35,11 @@ impl App {
         }
         sections.push(hairline(pal));
         sections.push(self.footer(p, pal));
+        // Last, so nothing above moves when it comes or goes.
+        if let Some(n) = self.notice(p) {
+            sections.push(hairline(pal));
+            sections.push(notice::tray(n, p.details_open, pal, PAD_X));
+        }
 
         let panel = container(column(sections)).width(Length::Fill).style(pal.panel());
         let width = f32::from(u16::try_from(self.config.ui.width).unwrap_or(u16::MAX));
@@ -73,11 +78,8 @@ impl App {
     }
 
     fn body<'a>(&'a self, p: &'a Popup, pal: Palette) -> Element<'a, Message> {
-        let notice = self.notice(p).map(|n| notice::strip(n, p.details_open, pal));
         if self.needs_install() {
-            // A missing custom file has no card, only its message.
-            let card = column![].push(self.install_card(pal)).push(notice).spacing(8);
-            return container(card).padding([12, PAD_X]).width(Length::Fill).into();
+            return container(self.install_card(pal)).padding([12, PAD_X]).width(Length::Fill).into();
         }
         let content: Element<'a, Message> = match p.phase() {
             Phase::Composing => editor(&p.source, "Type or paste the text to rewrite…", SOURCE_MAX_HEIGHT, pal),
@@ -96,14 +98,17 @@ impl App {
                 }
             }
         };
-        let col = column![content].push(notice).spacing(8);
-        container(col).padding([12, PAD_X]).width(Length::Fill).into()
+        container(content).padding([12, PAD_X]).width(Length::Fill).into()
     }
 
     /// The download's progress, or the offer to install (again, after a failure,
-    /// whose message is shown under the card).
-    fn install_card(&self, pal: Palette) -> Option<Element<'_, Message>> {
-        let entry = self.active.entry?;
+    /// whose message is in the tray).
+    fn install_card(&self, pal: Palette) -> Element<'_, Message> {
+        let Some(entry) = self.active.entry else {
+            // A missing custom file: the tray names it; nothing here can fix it.
+            let hint = "Point `model.active` at an existing file, or pick a model with `quillway models use`.";
+            return text(hint).size(13).color(pal.dim).into();
+        };
         if let Some(i) = self.installing(entry).filter(|i| i.error.is_none()) {
             let progress = format!(
                 "Downloading {}… {} / {} ({}%){}",
@@ -113,7 +118,7 @@ impl App {
                 i.done * 100 / i.entry.size.max(1),
                 i.rate.describe().map_or_else(String::new, |r| format!(" · {r}"))
             );
-            return Some(text(progress).size(14).color(pal.dim).into());
+            return text(progress).size(14).color(pal.dim).into();
         }
         // A non-OSI license is shown before ↵, which then accepts it (DECISIONS #9).
         let size = human(entry.size);
@@ -127,7 +132,7 @@ impl App {
         if let Some(w) = license {
             card = card.push(text(w).size(13).color(pal.dim));
         }
-        Some(card.push(mouse_area(text(action).size(15).color(pal.text)).on_press(Message::InstallStart)).into())
+        card.push(mouse_area(text(action).size(15).color(pal.text)).on_press(Message::InstallStart)).into()
     }
 
     fn chips(&self, pal: Palette) -> Element<'_, Message> {
