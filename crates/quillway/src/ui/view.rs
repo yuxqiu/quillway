@@ -62,18 +62,21 @@ impl App {
             .size(18)
             .padding(Padding { top: 15.0, bottom: 15.0, left: f32::from(PAD_X), right: f32::from(PAD_X) })
             .style(pal.input());
+        // ↵ is a shortcut (`Shortcut::Enter`): a text box without `on_input` drops it.
         if editable {
-            input = input.on_input(Message::Input).on_submit(Message::Submit);
-        }
-        if self.needs_install() {
-            input = input.on_submit(Message::Submit);
+            input = input.on_input(Message::Input);
         }
         input.into()
     }
 
     fn body<'a>(&'a self, p: &'a Popup, pal: Palette) -> Element<'a, Message> {
         if self.needs_install() {
-            return self.install_card(pal);
+            // E.g. the clipboard couldn't be read: the card mustn't hide it.
+            let mut card = column![self.install_card(pal)].spacing(8);
+            if let Some(e) = &p.error {
+                card = card.push(text(e.as_str()).size(13).color(pal.error));
+            }
+            return card.into();
         }
         let content: Element<'a, Message> = match p.phase() {
             Phase::Composing => editor(&p.source, "Type or paste the text to rewrite…", SOURCE_MAX_HEIGHT, pal),

@@ -40,7 +40,7 @@ Without home-manager: `nix profile install github:yuxqiu/quillway`, then run `qu
 
 ### Without Nix
 
-Download `quillway-<version>-<arch>-linux.tar.gz` from [Releases](https://github.com/yuxqiu/quillway/releases) (x86_64 and aarch64; glibc 2.35 or newer), check it against its `.sha256`, and put `quillway` on your `PATH`. It needs a Wayland session (it loads libwayland, libxkbcommon and your Vulkan or GL driver at runtime) and `llama-server` from [llama.cpp](https://github.com/ggml-org/llama.cpp) on your `PATH`, or `model.llama_server` / `model.endpoint` set. Run `quillway daemon` from your compositor's autostart.
+Download `quillway-v<version>-<arch>-linux.tar.gz` from [Releases](https://github.com/yuxqiu/quillway/releases) (x86_64 and aarch64; glibc 2.35 or newer), check it against its `.sha256`, and put `quillway` on your `PATH`. It needs a Wayland session (it loads libwayland, libxkbcommon and your Vulkan or GL driver at runtime) and `llama-server` from [llama.cpp](https://github.com/ggml-org/llama.cpp) on your `PATH`, or `model.llama_server` / `model.endpoint` set. Run `quillway daemon` from your compositor's autostart.
 
 ### Bind a key
 
@@ -123,7 +123,7 @@ Other options:
 # llama_server = "/path/to/llama-server"   # default: from PATH (the Nix package provides it)
 gpu_layers = 99               # model layers run on the GPU; 99 = all of them. Lower only if GPU memory runs out (0 = CPU only, much slower)
 context = 8192                # the model's working memory in tokens (~¾ word each); must hold your text and the result, ~3,000 words; at least 1024
-extra_args = []               # appended to the llama-server command line
+extra_args = []               # appended to the llama-server command line (not the flags Quillway sets)
 
 [ui]
 theme = "dark"                # dark | light

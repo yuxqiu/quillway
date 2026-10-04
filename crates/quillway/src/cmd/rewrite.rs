@@ -1,6 +1,5 @@
 //! `quillway rewrite`: stdin → model → stdout, without the popup.
 
-use std::io::Read;
 use std::time::Instant;
 
 use anyhow::{Context, bail};
@@ -25,8 +24,7 @@ pub struct RewriteArgs {
 pub async fn run(a: RewriteArgs) -> anyhow::Result<()> {
     let config = Config::load_user()?;
     let (instruction, temperature) = task(&a, &config)?;
-    let mut text = String::new();
-    std::io::stdin().read_to_string(&mut text).context("reading stdin")?;
+    let text = crate::read_stdin()?;
     if text.trim().is_empty() {
         bail!("nothing to rewrite on stdin");
     }

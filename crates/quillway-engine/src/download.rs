@@ -1,7 +1,7 @@
 //! Resumable, sha256-verified model downloads.
 //!
-//! `<dest>.part` grows with `Range` requests; the hash covers the bytes already
-//! on disk, and the file is renamed into place only after the digest matches.
+//! `<dest>.part` grows with `Range` requests; a resume first re-hashes the bytes
+//! already on disk, and the file is renamed into place only after the digest matches.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -121,6 +121,8 @@ pub async fn download(job: Job<'_>, mut on_progress: impl FnMut(Progress)) -> an
             file.write_all(&chunk).await?;
             on_progress(Progress { done: have, total: job.size });
         }
+        // Flush first: tokio reports a failed final write only from `flush`.
+        file.flush().await?;
         file.sync_all().await?;
     }
 

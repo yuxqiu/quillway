@@ -11,28 +11,33 @@ use quillway_core::ipc::Endpoint;
 use quillway_core::prompt::{self, ChatMessage};
 use serde_json::{Value, json};
 
-/// The server stopped sending mid-response: it exited or was restarted, or
-/// the connection dropped. Find it with `anyhow::Error::downcast_ref`.
+/// The server stopped mid-response, or our own llama-server stopped before the
+/// request reached it: it exited or was restarted, or the connection dropped.
+/// Find it with `anyhow::Error::downcast_ref`.
 #[derive(Debug)]
 pub struct Interrupted;
 
 impl std::fmt::Display for Interrupted {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("the model server stopped mid-response")
+        f.write_str("the model server stopped")
     }
 }
 
 impl std::error::Error for Interrupted {}
 
-/// One HTTP client (connection pool, TLS roots) for every [`Client`].
-static HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| {
+/// HTTP clients (connection pools, TLS roots) shared by every [`Client`]: one
+/// for configured endpoints, which may need the environment's proxy, and one
+/// for our own llama-server on loopback, which a proxy must not capture.
+static HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| http().build().expect("the TLS backend initializes"));
+static LOCAL: LazyLock<reqwest::Client> =
+    LazyLock::new(|| http().no_proxy().build().expect("the TLS backend initializes"));
+
+fn http() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
         // Between reads; the first byte can wait for a long prompt on a CPU.
         .read_timeout(Duration::from_secs(300))
-        .build()
-        .expect("the TLS backend initializes")
-});
+}
 
 /// A connection to one OpenAI-compatible server.
 #[derive(Debug, Clone)]
@@ -131,7 +136,8 @@ impl Client {
 
     /// A POST to `url`, authenticated if the server needs it.
     fn post(&self, url: &str) -> reqwest::RequestBuilder {
-        let req = HTTP.post(url);
+        let http = if self.endpoint.llama { &LOCAL } else { &HTTP };
+        let req = http.post(url);
         match &self.endpoint.api_key {
             Some(k) => req.bearer_auth(k),
             None => req,
@@ -186,7 +192,7 @@ impl Client {
         let (parsed, plain) = match tokio::try_join!(self.tokenize(&r.text, true), self.tokenize(&r.text, false)) {
             Ok(tokens) => tokens,
             Err(e) => {
-                eprintln!("quillway: checking text tokens failed, estimating instead: {e:#}");
+                crate::warn(format_args!("checking text tokens failed, estimating instead: {e:#}"));
                 return Ok(None);
             }
         };
@@ -194,7 +200,7 @@ impl Client {
             bail!("the text contains `{token}`, a control token of the model; remove it and try again");
         }
         let counts = self.server_counts(r, &plain).await;
-        Ok(counts.inspect_err(|e| eprintln!("quillway: counting tokens failed, estimating instead: {e:#}")).ok())
+        Ok(counts.inspect_err(|e| crate::warn(format_args!("counting tokens failed, estimating instead: {e:#}"))).ok())
     }
 
     async fn server_counts(&self, r: &Rewrite, plain: &[Token]) -> anyhow::Result<Counts> {
@@ -253,12 +259,15 @@ impl Client {
         }
         let max_tokens = self.budget(r).await?;
         let base = &self.endpoint.base;
-        let resp = self
-            .post(&format!("{base}/chat/completions"))
-            .json(&self.body(r, max_tokens))
-            .send()
-            .await
-            .with_context(|| format!("connecting to {base}"))?;
+        let resp =
+            self.post(&format!("{base}/chat/completions")).json(&self.body(r, max_tokens)).send().await.map_err(
+                |e| {
+                    // Our own server refusing connections was stopped after this client was handed out.
+                    let stopped = self.endpoint.llama && e.is_connect();
+                    let e = anyhow::Error::new(e).context(format!("connecting to {base}"));
+                    if stopped { e.context(Interrupted) } else { e }
+                },
+            )?;
         let resp = ok(resp, "chat/completions").await?;
         let state = (resp.bytes_stream().eventsource(), VecDeque::new(), false);
         Ok(futures_util::stream::unfold(state, |(mut events, mut pending, done)| async move {
@@ -456,6 +465,17 @@ mod tests {
 
     fn request() -> Rewrite {
         Rewrite { instruction: "Proofread".into(), text: "hello".into(), temperature: 0.2 }
+    }
+
+    #[tokio::test]
+    async fn our_server_refusing_connections_reads_as_stopped() {
+        // A port nothing listens on, like a llama-server a reload just stopped.
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let base = format!("http://127.0.0.1:{port}/v1");
+        let Err(ours) = client(&base, None, true).stream(&request()).await else { panic!("no server") };
+        assert!(ours.downcast_ref::<Interrupted>().is_some(), "{ours:#}");
+        let Err(endpoint) = client(&base, None, false).stream(&request()).await else { panic!("no server") };
+        assert!(endpoint.downcast_ref::<Interrupted>().is_none(), "an endpoint that's down is just down");
     }
 
     #[tokio::test]

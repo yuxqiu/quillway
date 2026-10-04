@@ -6,8 +6,9 @@
 //! One task, the [`Supervisor`], owns the configuration and the llama-server
 //! and handles commands one at a time; [`Engine`] handles send it commands and
 //! watch its [`EngineState`]. So reloads apply in the order they're sent, a
-//! reload during a start just drops that start (killing the half-started
-//! process), and everyone waiting on a start gets its outcome.
+//! reload during a start stops the half-started process, and everyone waiting
+//! on a start gets its outcome. Failures are published, not logged: the daemon
+//! logs the states it receives, and `quillway rewrite` prints the error it gets.
 
 pub mod client;
 pub mod download;
@@ -33,7 +34,7 @@ pub enum EngineState {
     Ready,
     /// The model file isn't on disk.
     Missing,
-    /// The last start failed.
+    /// The last start failed, or the server exited; the next request restarts it.
     Failed(String),
 }
 
@@ -77,6 +78,13 @@ enum Command {
 
 const CANCELLED: &str = "cancelled: the model server was reloaded";
 const STOPPED: &str = "the engine stopped";
+const EXITED: &str = "llama-server exited just after starting; try again";
+
+/// A warning on stderr (the daemon's journal); a closed stderr is ignored.
+pub(crate) fn warn(message: std::fmt::Arguments<'_>) {
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stderr(), "quillway: {message}");
+}
 
 impl Engine {
     /// An engine for the `[model]` config and its active model, and the
@@ -229,6 +237,10 @@ impl Supervisor {
     async fn on_event(&mut self, event: Event) {
         match (std::mem::replace(&mut self.llama, Llama::Stopped), event) {
             (Llama::Starting { mut server, .. }, Event::Probed(Ok(context))) => {
+                // It answered, then died before this was handled.
+                if !server.is_alive() {
+                    return self.fail(format!("llama-server exited during startup:\n{}", server.log_tail()));
+                }
                 server.set_context(context);
                 self.llama = Llama::Running(server);
                 self.settle(EngineState::Ready, &Ok(()));
@@ -268,8 +280,12 @@ impl Supervisor {
             }));
         }
         let Llama::Running(server) = &mut self.llama else { return None };
-        // It may have exited just now, before its event was handled.
-        server.is_alive().then(|| llama_client(server, &self.active))
+        if server.is_alive() {
+            return Some(llama_client(server, &self.active));
+        }
+        // It exited just now, before its event was handled; the caller restarts it.
+        warn(format_args!("llama-server exited; restarting. Its last output:\n{}", server.log_tail()));
+        None
     }
 
     /// Stop the current server, then start one for the current config, or
@@ -294,7 +310,6 @@ impl Supervisor {
     }
 
     fn fail(&mut self, message: String) {
-        eprintln!("quillway: {message}");
         self.settle(EngineState::Failed(message.clone()), &Err(message));
     }
 
@@ -312,7 +327,7 @@ impl Supervisor {
         self.publish(state);
         let client = outcome.clone().map(|()| self.ready_client());
         for reply in self.waiting.drain(..) {
-            let _ = reply.send(client.clone().and_then(|c| c.ok_or_else(|| CANCELLED.into())));
+            let _ = reply.send(client.clone().and_then(|c| c.ok_or_else(|| EXITED.into())));
         }
         for done in self.reloads.drain(..) {
             let _ = done.send(outcome.clone());
@@ -390,6 +405,15 @@ mod tests {
         // A request after the failure tries again.
         assert!(engine.client().await.is_err());
         assert_eq!(runs(dir.path()), 2);
+    }
+
+    #[tokio::test]
+    async fn a_non_utf8_log_line_does_not_stop_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, active) = fake_server(dir.path(), "printf '\\377\\n' >&2; sleep 0.2; echo FATAL >&2; exit 1");
+        let engine = start(config, active);
+        let error = engine.client().await.unwrap_err().to_string();
+        assert!(error.contains("FATAL") && !error.contains("SIGPIPE"), "{error}");
     }
 
     #[tokio::test]

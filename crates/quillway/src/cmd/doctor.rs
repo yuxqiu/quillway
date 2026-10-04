@@ -73,13 +73,13 @@ pub async fn run() -> anyhow::Result<()> {
         }
     }
 
-    let status = tokio::time::timeout(crate::ipc::QUICK_REPLY, crate::ipc::send(&Request::Status)).await;
-    match status.unwrap_or_else(|_| Err(anyhow::anyhow!("no answer within {:?}", crate::ipc::QUICK_REPLY))) {
+    match crate::ipc::send(&Request::Status).await {
         // Running isn't enough: its model server must be up or coming up.
         Ok(Response::Status { engine, .. }) => {
             check(matches!(engine.as_str(), "ready" | "starting"), "daemon", format!("running, {engine}"))?;
         }
-        Ok(other) => check(false, "daemon", format!("{other:?}"))?,
+        Ok(Response::Error { message }) => check(false, "daemon", message)?,
+        Ok(other) => check(false, "daemon", format!("unexpected answer {other:?}"))?,
         Err(e) if e.downcast_ref::<crate::ipc::DaemonNotRunning>().is_some() => {
             check(false, "daemon", format!("not running ({})", paths::socket().display()))?;
         }

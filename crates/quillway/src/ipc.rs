@@ -1,6 +1,6 @@
 //! Unix-socket IPC: the CLI sends one JSON line, the daemon answers with one.
 
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -16,9 +16,10 @@ use tokio::sync::{mpsc, oneshot};
 /// Largest request the daemon reads: 1 MiB of `--stdin` text, even if JSON
 /// escaping grows it several times over.
 const MAX_REQUEST: u64 = 8 << 20;
-/// How long the CLI waits for requests the daemon answers at once (not `reload`
-/// or `connect`, which wait for a model server to start).
-pub const QUICK_REPLY: Duration = Duration::from_secs(5);
+/// How long the CLI waits for requests the daemon answers at once.
+const QUICK_REPLY: Duration = Duration::from_secs(5);
+/// Model startup can take up to 120 s, plus context probing and scheduling.
+const START_REPLY: Duration = Duration::from_secs(150);
 /// A client has this long to send its request; the CLI sends it at once.
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -41,11 +42,28 @@ impl std::error::Error for DaemonNotRunning {}
 
 pub async fn send(req: &Request) -> anyhow::Result<Response> {
     let path = paths::socket();
-    check_owner(&path, rustix::process::getuid().as_raw())?;
+    send_with_deadline(&path, req, reply_timeout(req)).await
+}
+
+const fn reply_timeout(req: &Request) -> Duration {
+    match req {
+        Request::Reload | Request::Connect => START_REPLY,
+        _ => QUICK_REPLY,
+    }
+}
+
+async fn send_with_deadline(path: &Path, req: &Request, limit: Duration) -> anyhow::Result<Response> {
+    tokio::time::timeout(limit, send_at(path, req))
+        .await
+        .map_err(|_| anyhow::anyhow!("the daemon didn't answer within {limit:?}"))?
+}
+
+async fn send_at(path: &Path, req: &Request) -> anyhow::Result<Response> {
+    check_socket(path, rustix::process::getuid().as_raw())?;
     let stream = match UnixStream::connect(&path).await {
         Ok(stream) => stream,
         Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused) => {
-            return Err(DaemonNotRunning(path).into());
+            return Err(DaemonNotRunning(path.to_path_buf()).into());
         }
         Err(e) => return Err(e).with_context(|| format!("connecting to the daemon at {}", path.display())),
     };
@@ -56,7 +74,7 @@ pub async fn send(req: &Request) -> anyhow::Result<Response> {
     if resp.is_empty() {
         bail!("the daemon closed the connection without answering");
     }
-    Ok(serde_json::from_str(&resp)?)
+    serde_json::from_str(&resp).context("the daemon's answer isn't understood (an outdated daemon?)")
 }
 
 /// Lets the UI answer a request after handling it. `Clone` + `Debug` because
@@ -91,7 +109,7 @@ pub fn bind() -> anyhow::Result<std::os::unix::net::UnixListener> {
 }
 
 fn bind_at(path: &Path) -> anyhow::Result<std::os::unix::net::UnixListener> {
-    check_owner(path, rustix::process::getuid().as_raw())?;
+    check_socket(path, rustix::process::getuid().as_raw())?;
     if std::os::unix::net::UnixStream::connect(path).is_ok() {
         bail!("another quillway daemon is already running ({})", path.display());
     }
@@ -103,15 +121,22 @@ fn bind_at(path: &Path) -> anyhow::Result<std::os::unix::net::UnixListener> {
     Ok(l)
 }
 
-/// Refuse a socket owned by another user: without `XDG_RUNTIME_DIR` it lives in
-/// the shared temp directory, where anyone could put one there to read our text.
-fn check_owner(path: &Path, uid: u32) -> anyhow::Result<()> {
+/// The socket path, if something is there, must be our own socket. Another
+/// user's could read our text: without `XDG_RUNTIME_DIR` it lives in the shared
+/// temp directory. Any other file isn't a daemon, and binding mustn't delete it.
+fn check_socket(path: &Path, uid: u32) -> anyhow::Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.uid() != uid => bail!(
             "{} belongs to another user; set XDG_RUNTIME_DIR to a private directory (normally /run/user/{uid})",
             path.display()
         ),
-        _ => Ok(()), // missing: connecting or binding says what's wrong
+        Ok(meta) if !meta.file_type().is_socket() => {
+            bail!("{} exists and is not a socket; remove it", path.display())
+        }
+        Ok(_) => Ok(()),
+        // Missing: connecting or binding says what's wrong.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("checking {}", path.display())),
     }
 }
 
@@ -193,15 +218,72 @@ mod tests {
     }
 
     #[test]
-    fn a_socket_owned_by_another_user_is_refused() {
+    fn binding_does_not_delete_a_non_socket_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("quillway.sock");
+        std::fs::write(&path, b"keep this").unwrap();
+        assert!(bind_at(&path).unwrap_err().to_string().contains("not a socket"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"keep this");
+    }
+
+    #[test]
+    fn a_socket_owned_by_another_user_or_a_plain_file_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("quillway.sock");
         let me = rustix::process::getuid().as_raw();
-        assert!(check_owner(&path, me).is_ok(), "missing is left to connect/bind");
-        std::fs::write(&path, b"").unwrap();
-        assert!(check_owner(&path, me).is_ok());
-        let err = check_owner(&path, me + 1).unwrap_err().to_string();
+        assert!(check_socket(&path, me).is_ok(), "missing is left to connect/bind");
+        let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        assert!(check_socket(&path, me).is_ok());
+        let err = check_socket(&path, me + 1).unwrap_err().to_string();
         assert!(err.contains("belongs to another user"), "{err}");
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"").unwrap();
+        let err = check_socket(&file, me).unwrap_err().to_string();
+        assert!(err.contains("is not a socket"), "{err}");
+    }
+
+    #[test]
+    fn model_start_requests_have_a_long_but_finite_deadline() {
+        assert_eq!(reply_timeout(&Request::Reload), START_REPLY);
+        assert_eq!(reply_timeout(&Request::Connect), START_REPLY);
+        assert_eq!(reply_timeout(&Request::Status), QUICK_REPLY);
+    }
+
+    #[tokio::test]
+    async fn a_daemon_that_stays_connected_without_reply_times_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("quillway.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let daemon = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut request = String::new();
+            reader.read_line(&mut request).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let error = send_with_deadline(&path, &Request::Reload, Duration::from_millis(50)).await.unwrap_err();
+        assert!(error.to_string().contains("didn't answer within 50ms"), "{error}");
+        daemon.abort();
+    }
+
+    #[tokio::test]
+    async fn a_daemon_exit_while_loading_returns_an_error_promptly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("quillway.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let daemon = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut request = String::new();
+            BufReader::new(stream).read_line(&mut request).await.unwrap();
+            // The daemon exits before its model finishes loading.
+        });
+        let error =
+            tokio::time::timeout(Duration::from_secs(1), send_with_deadline(&path, &Request::Reload, START_REPLY))
+                .await
+                .unwrap()
+                .unwrap_err();
+        assert!(error.to_string().contains("closed the connection"), "{error}");
+        daemon.await.unwrap();
     }
 
     /// Run `handle` on one end of a socket pair; the other end is the client.

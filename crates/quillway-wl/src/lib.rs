@@ -54,7 +54,7 @@ pub fn read() -> anyhow::Result<Option<String>> {
     match paste::get_contents(ClipboardType::Regular, Seat::Unspecified, MimeType::Text) {
         Ok((pipe, _mime)) => read_text(Deadline { inner: pipe, until: Instant::now() + READ_TIMEOUT }),
         Err(Error::NoSeats | Error::ClipboardEmpty | Error::NoMimeType) => Ok(None),
-        Err(e) => Err(e).context("reading the Wayland clipboard (does the compositor support data-control?)"),
+        Err(e) => Err(e).context("reading the Wayland clipboard"),
     }
 }
 

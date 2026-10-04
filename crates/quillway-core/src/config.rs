@@ -46,9 +46,25 @@ pub struct ModelConfig {
     /// so 8192 handles roughly 3,000 words. Higher allows longer text but uses
     /// more memory.
     pub context: u32,
-    /// Extra arguments appended to the llama-server command line.
+    /// Extra arguments appended to the llama-server command line, except those
+    /// in [`RESERVED_ARGS`].
     pub extra_args: Vec<String>,
 }
+
+/// llama-server flags Quillway sets itself, refused in `model.extra_args`.
+pub const RESERVED_ARGS: [&str; 11] = [
+    "-m",
+    "--model",
+    "--host",
+    "--port",
+    "-c",
+    "--ctx-size",
+    "-np",
+    "--parallel",
+    "--api-key",
+    "--api-key-file",
+    "--no-jinja",
+];
 
 impl ModelConfig {
     /// The `llama-server` to run: `llama_server`, else the one on `$PATH`.
@@ -236,6 +252,20 @@ impl Config {
         if config.model.endpoint.is_some() && config.model.endpoint_model.is_none() {
             anyhow::bail!("`model.endpoint` needs `model.endpoint_model`, the model name the server expects");
         }
+        if let Some(url) = &config.model.endpoint
+            && !(url.starts_with("http://") || url.starts_with("https://"))
+        {
+            anyhow::bail!("`model.endpoint = {url:?}` must be an http:// or https:// URL");
+        }
+        // Quillway sets these and relies on them: llama-server takes the last of a repeated flag.
+        for arg in &config.model.extra_args {
+            let flag = arg.split('=').next().unwrap_or_default();
+            if RESERVED_ARGS.contains(&flag) {
+                anyhow::bail!(
+                    "`model.extra_args` can't set `{flag}`: Quillway sets it (the context size is `model.context`)"
+                );
+            }
+        }
         Ok(config)
     }
 
@@ -365,6 +395,21 @@ mod tests {
     fn presets_need_a_name_and_instruction() {
         assert!(Config::parse("[[preset]]\nname = 'X'\ninstruction = ' '").is_err());
         assert!(Config::parse("[[preset]]\nname = ''\ninstruction = 'Do it.'").is_err());
+    }
+
+    #[test]
+    fn extra_args_cannot_override_what_quillway_sets() {
+        for arg in ["--port", "--port=8080", "-c", "--api-key"] {
+            let toml = format!("[model]\nextra_args = [\"{arg}\", \"1\"]");
+            assert!(Config::parse(&toml).unwrap_err().to_string().contains("can't set"), "{arg}");
+        }
+        assert!(Config::parse("[model]\nextra_args = [\"--threads\", \"4\"]").is_ok());
+    }
+
+    #[test]
+    fn an_endpoint_must_be_a_url() {
+        assert!(Config::parse("[model]\nendpoint = \"\"\nendpoint_model = \"m\"").is_err());
+        assert!(Config::parse("[model]\nendpoint = \"https://h/v1\"\nendpoint_model = \"m\"").is_ok());
     }
 
     #[test]

@@ -165,6 +165,9 @@ struct Popup {
     /// Set by Ctrl+D; until then each draft shows its preset's default.
     diff_choice: Option<bool>,
     error: Option<String>,
+    /// The instruction before its last edit, if that edit typed one character: a
+    /// Ctrl+digit preset types its key there too (iced inserts it even with Ctrl held).
+    before_key: Option<(String, char)>,
     /// The keyboard was given to `field`'s box, on the first resize.
     focus_given: bool,
     size: (u32, u32),
@@ -279,6 +282,7 @@ struct App {
 
 #[derive(Debug, Clone, Copy)]
 enum Shortcut {
+    Enter,
     Escape,
     Tab,
     Diff,
@@ -308,7 +312,6 @@ enum Message {
     Captured(u64, Result<Option<String>, String>),
     Input(String),
     Edit(text_editor::Action),
-    Submit,
     Preset(usize),
     Gen(u64, GenEvent),
     Shortcut(Shortcut, Physical),
@@ -374,7 +377,6 @@ impl App {
             Message::Captured(id, result) => self.captured(id, result),
             Message::Input(s) => self.on_input(s),
             Message::Edit(action) => self.on_edit(action),
-            Message::Submit => self.submit(),
             Message::Preset(i) => self.run_preset(i),
             Message::Gen(id, ev) => self.on_gen(id, ev),
             // A held key acts once: a held Esc would stop the generation, then close the popup.
@@ -459,6 +461,10 @@ impl App {
     }
 
     fn on_engine_state(&mut self, state: EngineState) -> Task<Message> {
+        // The engine publishes failures; the journal gets them here.
+        if let EngineState::Failed(e) = &state {
+            eprintln!("quillway: {e}");
+        }
         self.engine_state = state;
         // Switched to a missing model while typing in the text box: the install card has none.
         match self.popup.as_mut() {
@@ -549,7 +555,13 @@ impl App {
             },
             Request::Status => {
                 // From the engine itself: the app's copy arrives as a message, maybe after this request.
-                let engine = self.engine.state().borrow().describe();
+                let state = self.engine.state();
+                // A stopped supervisor leaves its last state behind; the popup shows it as failed.
+                let engine = if state.has_changed().is_err() {
+                    EngineState::Failed("the engine stopped".into()).describe()
+                } else {
+                    state.borrow().describe()
+                };
                 reply.send(Response::Status { visible: self.popup.is_some(), model: self.model_label(), engine });
                 Task::none()
             }
@@ -627,6 +639,7 @@ impl App {
             generation: None,
             diff_choice: None,
             error,
+            before_key: None,
             focus_given: false,
             size,
             opened: Instant::now(),
@@ -686,6 +699,7 @@ impl App {
         if p.generation.is_some() {
             return Task::none();
         }
+        p.before_key = inserted_char(&p.input, &s).map(|c| (std::mem::take(&mut p.input), c));
         p.input = s;
         Task::none()
     }
@@ -809,6 +823,11 @@ impl App {
 
     fn on_shortcut(&mut self, s: Shortcut) -> Task<Message> {
         let installing = self.needs_install();
+        if matches!(s, Shortcut::Enter) {
+            // From the instruction box, or the install card; the text box takes ↵ as a new line.
+            let instruction = self.popup.as_ref().is_some_and(|p| p.field == Field::Instruction);
+            return if installing || instruction { self.submit() } else { Task::none() };
+        }
         let Some(p) = self.popup.as_mut() else { return Task::none() };
         match (s, p.phase()) {
             (Shortcut::Escape, Phase::Generating) => {
@@ -837,7 +856,20 @@ impl App {
             }
             // The Ctrl shortcuts work from the instruction box; the text box keeps its keys.
             _ if p.field == Field::Source => Task::none(),
-            (Shortcut::Preset(i), Phase::Composing | Phase::Reviewing) => self.run_preset(i),
+            (Shortcut::Preset(i), Phase::Composing | Phase::Reviewing) => {
+                let typed = p.before_key.take();
+                let task = self.run_preset(i);
+                // Nothing ran (no such preset, or no text): take back the digit the key typed, if
+                // the box's last edit was just that. (A digit-row symbol, as on AZERTY, stays.)
+                if let Some(p) = self.popup.as_mut().filter(|p| p.generation.is_none())
+                    && let Some((before, c)) = typed
+                    && inserted_char(&before, &p.input) == Some(c)
+                    && c.to_digit(10) == u32::try_from(i + 1).ok()
+                {
+                    p.input = before;
+                }
+                task
+            }
             (Shortcut::Diff, Phase::Reviewing) => {
                 p.diff_choice = Some(!p.show_diff());
                 Task::none()
@@ -962,6 +994,7 @@ fn shortcut(event: Event, _status: event::Status, _window: window::Id) -> Option
         _ => return None,
     };
     let s = match key.as_ref() {
+        Key::Named(Named::Enter) => Shortcut::Enter,
         Key::Named(Named::Escape) => Shortcut::Escape,
         Key::Named(Named::Tab) => Shortcut::Tab,
         _ if !modifiers.control() => return None,
@@ -996,7 +1029,14 @@ const fn preset_index(key: Physical) -> Option<usize> {
     })
 }
 
-/// The engine's state now, then each change.
+/// The character `new` adds to `old`, if it adds exactly one.
+fn inserted_char(old: &str, new: &str) -> Option<char> {
+    let at = old.bytes().zip(new.bytes()).take_while(|(a, b)| a == b).count();
+    // `at` ends a whole character: the bytes before it are equal, and `new` has a new character there.
+    let c = new.get(at..)?.chars().next()?;
+    (new.get(at + c.len_utf8()..)? == old.get(at..)?).then_some(c)
+}
+
 /// The engine's state now, then each change; if its supervisor stops, `Failed` once.
 fn engine_states(engine: &Engine) -> impl Stream<Item = Message> + use<> {
     stream::unfold((Some(engine.state()), true), |(state, first)| async move {
@@ -1105,6 +1145,13 @@ mod tests {
         app
     }
 
+    /// ↵, pressed and released.
+    fn enter(app: &mut App) {
+        let key = Physical::Code(Code::Enter);
+        let _ = app.update(Message::Shortcut(Shortcut::Enter, key));
+        let _ = app.update(Message::KeyReleased(key));
+    }
+
     fn type_char(app: &mut App, c: char) {
         let _ = app.update(Message::Edit(text_editor::Action::Edit(text_editor::Edit::Insert(c))));
     }
@@ -1211,7 +1258,7 @@ mod tests {
         let _ = app.update(Message::Edit(text_editor::Action::SelectAll));
         let _ = app.update(Message::Edit(text_editor::Action::Edit(text_editor::Edit::Backspace)));
         let _ = app.on_shortcut(Shortcut::Tab);
-        let _ = app.update(Message::Submit);
+        enter(&mut app);
         let p = app.popup.as_ref().expect("still open");
         assert!(p.error.as_deref().is_some_and(|e| e.starts_with("Nothing to copy")));
         let _ = app.on_shortcut(Shortcut::Undo);
@@ -1346,7 +1393,7 @@ mod tests {
         let mut app = boot(endpoint_config());
         let _ = app.update(Message::Ipc(Request::Show { input: Input::Text("their here".into()) }, reply()));
         let _ = app.update(Message::Input("make it formal".into()));
-        let _ = app.update(Message::Submit);
+        enter(&mut app);
         assert_eq!(app.popup.as_ref().unwrap().input, "", "the box is cleared while writing");
         let _ = app.update(Message::Gen(0, GenEvent::Error("too long".into())));
         let p = app.popup.as_ref().unwrap();
@@ -1374,7 +1421,7 @@ mod tests {
         let _ = app.update(Message::EngineState(EngineState::Missing)); // as the engine reports it
         let _ = app.update(Message::Ipc(Request::Show { input: Input::Text("hi".into()) }, reply()));
         assert!(app.needs_install());
-        let _ = app.update(Message::Submit); // ↵ on the card that shows the license notice
+        enter(&mut app); // ↵ on the card that shows the license notice
         let install = app.install.as_ref().expect("install started");
         assert_eq!((install.entry.id.as_str(), install.error.as_deref()), ("lfm2.5-1.2b", None));
     }
@@ -1461,6 +1508,57 @@ mod tests {
         assert_eq!(p.input, "make it formal");
     }
 
+    /// An open popup with no text, typing in the instruction box.
+    fn instruction_with_no_text() -> App {
+        let mut app = boot(endpoint_config());
+        let _ = app.update(Message::Ipc(Request::Show { input: Input::Text(String::new()) }, reply()));
+        app.popup.as_mut().unwrap().field = Field::Instruction;
+        app
+    }
+
+    fn ctrl_digit(app: &mut App, typed: &str, preset: usize) {
+        let _ = app.update(Message::Input(typed.into())); // iced's text_input types the digit too
+        let key = Physical::Code(Code::Digit1);
+        let _ = app.update(Message::Shortcut(Shortcut::Preset(preset), key));
+        let _ = app.update(Message::KeyReleased(key));
+    }
+
+    #[test]
+    fn a_ctrl_digit_that_runs_nothing_takes_its_digit_back() {
+        let mut app = instruction_with_no_text();
+        let _ = app.update(Message::Input("make it formal".into()));
+        ctrl_digit(&mut app, "make it formal1", 0); // refused: no text
+        assert_eq!(app.popup.as_ref().unwrap().input, "make it formal");
+        ctrl_digit(&mut app, "make it formal9", 8); // no ninth preset
+        assert_eq!(app.popup.as_ref().unwrap().input, "make it formal");
+        // A character typed by hand stays, even if a later shortcut typed nothing.
+        let _ = app.update(Message::Input("make it formal!".into()));
+        let _ = app.update(Message::Shortcut(Shortcut::Preset(8), Physical::Code(Code::Digit9)));
+        assert_eq!(app.popup.as_ref().unwrap().input, "make it formal!");
+    }
+
+    #[test]
+    fn enter_submits_from_the_instruction_box_once_while_held() {
+        let mut app = boot(endpoint_config());
+        let _ = app.update(Message::Ipc(Request::Show { input: Input::Text("their here".into()) }, reply()));
+        app.popup.as_mut().unwrap().field = Field::Source;
+        enter(&mut app);
+        assert_eq!(app.popup.as_ref().unwrap().phase(), Phase::Composing, "the text box takes ↵ as a new line");
+        app.popup.as_mut().unwrap().field = Field::Instruction;
+        let _ = app.update(Message::Input("fix it".into()));
+        let key = Physical::Code(Code::Enter);
+        let _ = app.update(Message::Shortcut(Shortcut::Enter, key)); // held down
+        assert_eq!(app.popup.as_ref().unwrap().phase(), Phase::Generating);
+        let _ = app.update(Message::Gen(0, text("They're here.")));
+        let _ = app.update(Message::Gen(0, GenEvent::Done));
+        let _ = app.update(Message::Shortcut(Shortcut::Enter, key)); // its auto-repeat
+        assert!(app.popup.is_some(), "a held ↵ doesn't also copy and close the result");
+        assert!(matches!(
+            press(Key::Named(Named::Enter), Code::Enter, keyboard::Modifiers::empty(), false),
+            Some(Message::Shortcut(Shortcut::Enter, _))
+        ));
+    }
+
     #[test]
     fn the_install_card_goes_once_the_model_exists() {
         let path = std::env::temp_dir().join(format!("quillway-card-{}.gguf", std::process::id()));
@@ -1482,7 +1580,7 @@ mod tests {
         let mut app = boot(endpoint_config());
         let _ = app.update(Message::Ipc(Request::Show { input: Input::Text("their here".into()) }, reply()));
         let _ = app.update(Message::Input("make it formal".into()));
-        let _ = app.update(Message::Submit);
+        enter(&mut app);
         let _ = app.on_shortcut(Shortcut::Escape);
         let p = app.popup.as_ref().unwrap();
         assert_eq!((p.phase(), p.input.as_str()), (Phase::Composing, "make it formal"));

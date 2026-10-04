@@ -58,7 +58,7 @@ impl Server {
             wait_ready(port).await?;
             // `extra_args` may change `--ctx-size` or `--parallel` (which splits it).
             Ok(slot_context(port, &api_key).await.unwrap_or_else(|e| {
-                eprintln!("quillway: reading llama-server's context size failed, assuming {fallback}: {e:#}");
+                crate::warn(format_args!("reading llama-server's context size failed, assuming {fallback}: {e:#}"));
                 fallback
             }))
         }
@@ -104,7 +104,7 @@ impl Server {
 }
 
 async fn wait_ready(port: u16) -> anyhow::Result<()> {
-    let http = reqwest::Client::builder().timeout(Duration::from_secs(2)).build()?;
+    let http = reqwest::Client::builder().timeout(Duration::from_secs(2)).no_proxy().build()?;
     let url = format!("http://127.0.0.1:{port}/health");
     let start = Instant::now();
     loop {
@@ -122,7 +122,7 @@ async fn wait_ready(port: u16) -> anyhow::Result<()> {
 
 /// The per-request context window from `/props`.
 async fn slot_context(port: u16, api_key: &str) -> anyhow::Result<u32> {
-    let http = reqwest::Client::builder().timeout(Duration::from_secs(5)).build()?;
+    let http = reqwest::Client::builder().timeout(Duration::from_secs(5)).no_proxy().build()?;
     let props: serde_json::Value = http
         .get(format!("http://127.0.0.1:{port}/props"))
         .bearer_auth(api_key)
@@ -190,16 +190,17 @@ fn free_port() -> anyhow::Result<u16> {
     Ok(l.local_addr()?.port())
 }
 
-/// Keep the last lines of stderr until the process exits.
+/// Keep the last lines of stderr until the process exits. Lines are read as
+/// bytes: stopping at a non-UTF-8 one would close the pipe on the server.
 async fn collect(stderr: tokio::process::ChildStderr, log: Log) {
     use tokio::io::{AsyncBufReadExt, BufReader};
-    let mut lines = BufReader::new(stderr).lines();
-    while let Ok(Some(l)) = lines.next_line().await {
+    let mut lines = BufReader::new(stderr).split(b'\n');
+    while let Ok(Some(l)) = lines.next_segment().await {
         let mut log = log.lock().unwrap_or_else(PoisonError::into_inner);
         if log.len() == LOG_LINES {
             log.pop_front();
         }
-        log.push_back(l);
+        log.push_back(String::from_utf8_lossy(&l).into_owned());
     }
 }
 

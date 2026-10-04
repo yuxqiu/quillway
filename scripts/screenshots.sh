@@ -34,6 +34,9 @@ work=$(mktemp -d)
 # Wayland socket paths are limited to 108 bytes, so keep the runtime dir short.
 run=$(mktemp -d /tmp/qw.XXXXXX)
 trap 'rm -rf "$work" "$run"' EXIT
+# Bash skips EXIT traps when a signal kills it; exiting instead runs them.
+trap 'exit 130' INT
+trap 'exit 143' TERM
 mkdir -p "$work/cfg/quillway"
 
 W=2000 H=1240 # the headless output, in pixels (scale 2)
@@ -76,6 +79,8 @@ capture() { # theme -> $work/review-<theme>.png
     # On any exit, stop this session too, or a failed run leaves sway and a daemon
     # (with its llama-server) running where nothing else can see them.
     trap 'kill "$sp" ${dp:+"$dp"} 2> /dev/null || true' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
     for _ in $(seq 1 50); do [ -S "$run/wayland-1" ] && break; sleep 0.1; done
     [ -S "$run/wayland-1" ] || { echo "sway didn't start:" >&2; tail -n 15 "$work/sway-$t.log" >&2; exit 1; }
     export WAYLAND_DISPLAY=wayland-1
@@ -84,6 +89,12 @@ capture() { # theme -> $work/review-<theme>.png
     "$q" daemon > "$work/daemon-$t.log" 2>&1 &
     dp=$!
     for _ in $(seq 1 90); do "$q" status 2>/dev/null | grep -q 'engine: ready' && break; sleep 1; done
+    "$q" status 2>/dev/null | grep -q 'engine: ready' || {
+      echo "the model server isn't ready after 90 s:" >&2
+      "$q" status >&2 || true
+      tail -n 15 "$work/daemon-$t.log" >&2
+      exit 1
+    }
     printf '%s' "$text" | wl-copy
     sleep 0.5
     "$q" toggle

@@ -85,17 +85,19 @@ struct SourceArg {
 
 impl SourceArg {
     fn input(&self) -> anyhow::Result<Input> {
-        if !self.stdin {
-            return Ok(Input::Clipboard);
-        }
-        // Bytes first: a cap can split a character, which isn't the error to report.
-        let mut bytes = Vec::new();
-        std::io::stdin().take(quillway_wl::MAX_BYTES + 1).read_to_end(&mut bytes).context("reading stdin")?;
-        if bytes.len() as u64 > quillway_wl::MAX_BYTES {
-            anyhow::bail!("stdin text is larger than the 1 MiB limit");
-        }
-        Ok(Input::Text(String::from_utf8(bytes).context("stdin isn't UTF-8 text")?))
+        Ok(if self.stdin { Input::Text(read_stdin()?) } else { Input::Clipboard })
     }
+}
+
+/// All of stdin as text, up to the clipboard's 1 MiB limit.
+fn read_stdin() -> anyhow::Result<String> {
+    // Bytes first: a cap can split a character, which isn't the error to report.
+    let mut bytes = Vec::new();
+    std::io::stdin().take(quillway_wl::MAX_BYTES + 1).read_to_end(&mut bytes).context("reading stdin")?;
+    if bytes.len() as u64 > quillway_wl::MAX_BYTES {
+        anyhow::bail!("stdin text is larger than the 1 MiB limit");
+    }
+    String::from_utf8(bytes).context("stdin isn't UTF-8 text")
 }
 
 fn main() -> anyhow::Result<()> {
@@ -120,9 +122,8 @@ fn run() -> anyhow::Result<()> {
         Command::Status => Request::Status,
         Command::Quit => Request::Quit,
     };
-    // These are answered at once; a hung daemon mustn't leave a key binding's process waiting.
-    let answer = runtime()?.block_on(async { tokio::time::timeout(ipc::QUICK_REPLY, ipc::send(&request)).await });
-    match answer.map_err(|_| anyhow::anyhow!("the daemon didn't answer within {:?}", ipc::QUICK_REPLY))?? {
+    let answer = runtime()?.block_on(ipc::send(&request))?;
+    match answer {
         Response::Ok => Ok(()),
         Response::Status { visible, model, engine } => {
             let popup = if visible { "visible" } else { "hidden" };
