@@ -275,6 +275,8 @@ struct App {
     engine_state: EngineState,
     active: Active,
     palette: style::Palette,
+    /// The desktop's light/dark preference, for `theme = "auto"`.
+    system_theme: iced::theme::Mode,
     popup: Option<Popup>,
     install: Option<Install>,
     now: Instant,
@@ -334,6 +336,8 @@ enum Message {
     Tick(Instant),
     /// The engine's state changed (from its supervisor).
     EngineState(EngineState),
+    /// The desktop's light/dark preference, at start and when it changes.
+    SystemTheme(iced::theme::Mode),
     InstallStart,
     Install(&'static Entry, InstallEvent),
     WindowClosed(window::Id),
@@ -344,7 +348,8 @@ impl App {
         let (engine, supervisor) = Engine::new(config.model.clone(), active.clone());
         let app = Self {
             active,
-            palette: style::Palette::new(&config.ui),
+            palette: style::Palette::new(&config.ui, iced::theme::Mode::None),
+            system_theme: iced::theme::Mode::None,
             engine_state: EngineState::Starting,
             config,
             engine,
@@ -358,7 +363,8 @@ impl App {
             held: None,
         };
         // The supervisor brings the model server up as soon as it runs.
-        (app, Task::future(supervisor.run()).discard())
+        let theme = iced::system::theme().map(Message::SystemTheme);
+        (app, Task::batch([Task::future(supervisor.run()).discard(), theme]))
     }
 
     fn subscription(&self) -> Subscription<Message> {
@@ -370,6 +376,7 @@ impl App {
                 matches!(event, Event::Mouse(iced::mouse::Event::ButtonPressed(_))).then_some(Message::Clicked(id))
             }),
             window::close_events().map(Message::WindowClosed),
+            iced::system::theme_changes().map(Message::SystemTheme),
         ];
         if self.animating() {
             subs.push(iced::time::every(FRAME).map(Message::Tick));
@@ -409,6 +416,11 @@ impl App {
                 Task::none()
             }
             Message::EngineState(state) => self.on_engine_state(state),
+            Message::SystemTheme(mode) => {
+                self.system_theme = mode;
+                self.palette = style::Palette::new(&self.config.ui, mode);
+                Task::none()
+            }
             Message::InstallStart => self.start_install(),
             Message::Install(entry, ev) => self.on_install(entry, ev),
             Message::WindowClosed(id) => {
@@ -546,7 +558,7 @@ impl App {
             Request::Reload => match Config::load_user().and_then(|config| Ok((models::active(&config)?, config))) {
                 Ok((active, config)) => {
                     self.active = active;
-                    self.palette = style::Palette::new(&config.ui);
+                    self.palette = style::Palette::new(&config.ui, self.system_theme);
                     self.config = config.clone();
                     // The server this generation streams from is about to stop: say so, not "incomplete response".
                     let refocus = if let Some(p) = self.popup.as_mut()
@@ -1185,6 +1197,16 @@ mod tests {
 
     fn type_char(app: &mut App, c: char) {
         let _ = app.update(Message::Edit(text_editor::Action::Edit(text_editor::Edit::Insert(c))));
+    }
+
+    #[test]
+    fn auto_theme_follows_the_desktop_live() {
+        let mut app = boot(endpoint_config());
+        let dark = app.palette.panel;
+        let _ = app.update(Message::SystemTheme(iced::theme::Mode::Light));
+        assert_ne!(app.palette.panel, dark);
+        let _ = app.update(Message::SystemTheme(iced::theme::Mode::Dark));
+        assert_eq!(app.palette.panel, dark);
     }
 
     #[test]

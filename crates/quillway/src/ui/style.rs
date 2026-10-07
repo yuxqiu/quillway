@@ -2,6 +2,7 @@
 
 use std::f32::consts::TAU;
 
+use iced::theme::Mode;
 use iced::widget::{container, rule, text_editor, text_input};
 use iced::{Background, Border, Color, Radians, Shadow, Vector, border, gradient};
 use quillway_core::config::{ThemeChoice, UiConfig};
@@ -30,16 +31,18 @@ pub struct Palette {
 }
 
 impl Palette {
-    pub fn new(ui: &UiConfig) -> Self {
+    /// `system` is the desktop's light/dark preference, used by `theme = "auto"`.
+    pub fn new(ui: &UiConfig, system: Mode) -> Self {
         let [r, g, b] = ui.accent.0;
         let accent = Color::from_rgb8(r, g, b);
         let op = ui.opacity; // validated to 0.2–1.0
-        let (base, ink): (Color, Color) = match ui.theme {
-            ThemeChoice::Dark => (Color::from_rgba8(28, 28, 32, op), Color::from_rgb8(0xed, 0xed, 0xf0)),
-            ThemeChoice::Light => (Color::from_rgba8(250, 250, 252, op), Color::from_rgb8(0x1d, 0x1d, 0x22)),
+        let dark = is_dark(ui.theme, system);
+        let (base, ink): (Color, Color) = if dark {
+            (Color::from_rgba8(28, 28, 32, op), Color::from_rgb8(0xed, 0xed, 0xf0))
+        } else {
+            (Color::from_rgba8(250, 250, 252, op), Color::from_rgb8(0x1d, 0x1d, 0x22))
         };
         let a = |c: Color, alpha: f32| Color { a: alpha, ..c };
-        let dark = ui.theme == ThemeChoice::Dark;
         Self {
             panel: base,
             text: ink,
@@ -177,6 +180,15 @@ impl Palette {
     }
 }
 
+/// Whether the panel is dark: `auto` follows the desktop, and is dark when it has no preference.
+fn is_dark(choice: ThemeChoice, system: Mode) -> bool {
+    match choice {
+        ThemeChoice::Auto => system != Mode::Light,
+        ThemeChoice::Dark => true,
+        ThemeChoice::Light => false,
+    }
+}
+
 /// Shift hue by `turns` (fraction of a full circle) in HSV space.
 #[expect(clippy::float_cmp, reason = "`max` is one of r, g, b exactly")]
 #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "h6 is in [0, 6)")]
@@ -219,5 +231,16 @@ mod tests {
         let c = Color::from_rgb8(0xff, 0, 0);
         let g = rotate_hue(c, 1.0 / 3.0);
         assert!((g.g - 1.0).abs() < 1e-4 && g.r.abs() < 1e-4, "{g:?}");
+    }
+
+    #[test]
+    fn auto_follows_the_desktop_and_defaults_to_dark() {
+        assert!(is_dark(ThemeChoice::Auto, Mode::Dark));
+        assert!(!is_dark(ThemeChoice::Auto, Mode::Light));
+        assert!(is_dark(ThemeChoice::Auto, Mode::None));
+        for system in [Mode::Dark, Mode::Light, Mode::None] {
+            assert!(is_dark(ThemeChoice::Dark, system));
+            assert!(!is_dark(ThemeChoice::Light, system));
+        }
     }
 }

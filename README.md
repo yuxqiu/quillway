@@ -127,7 +127,7 @@ context = 8192                # the model's working memory in tokens (~¾ word e
 extra_args = []               # appended to the llama-server command line (not the flags Quillway sets)
 
 [ui]
-theme = "dark"                # dark | light
+theme = "auto"                # auto (follows the desktop; dark if it has no preference) | dark | light
 accent = "#7c6cf2"
 width = 680                   # 300–4096 px
 top_margin = 220              # px from the top of the screen

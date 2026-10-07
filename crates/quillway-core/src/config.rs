@@ -93,8 +93,10 @@ impl Default for ModelConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ThemeChoice {
-    /// Light text on a dark panel.
+    /// Follow the desktop's light/dark preference (XDG portal); dark when it has none.
     #[default]
+    Auto,
+    /// Light text on a dark panel.
     Dark,
     /// Dark text on a light panel.
     Light,
@@ -327,6 +329,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(c.ui.theme, ThemeChoice::Light);
+        assert_eq!(Config::default().ui.theme, ThemeChoice::Auto);
         assert_eq!(c.presets().len(), 1);
         assert_eq!(c.presets()[0].name, "Pirate");
         assert!((c.presets()[0].temperature - DEFAULT_TEMPERATURE).abs() < f32::EPSILON);

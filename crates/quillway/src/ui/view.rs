@@ -227,9 +227,13 @@ fn editor<'a>(
 /// The text boxes' keys: iced's, plus the word-wise Ctrl+Backspace and Ctrl+Delete it
 /// lacks (it has Ctrl+arrows). Tab switches boxes instead of inserting a tab. Keys
 /// pressed with Ctrl insert nothing: iced still reports the key's text under Ctrl,
-/// so Ctrl+1 would otherwise insert "1".
+/// so Ctrl+1 would otherwise insert "1". iced passes keys to every editor, focused
+/// or not, so an unfocused one must ignore them as iced's own binding does.
 fn editor_binding(k: text_editor::KeyPress, selected: bool) -> Option<text_editor::Binding<Message>> {
     use text_editor::{Binding, Motion};
+    if !matches!(k.status, text_editor::Status::Focused { .. }) {
+        return None;
+    }
     let ctrl = k.modifiers.control();
     match k.key.as_ref() {
         Key::Named(Named::Tab) => None,
@@ -313,6 +317,18 @@ mod tests {
         // A selection goes as it is, and a plain Backspace takes one character.
         assert!(matches!(editor_binding(press(Named::Backspace, Modifiers::CTRL), true), Some(Binding::Backspace)));
         assert!(matches!(editor_binding(press(Named::Backspace, Modifiers::empty()), false), Some(Binding::Backspace)));
+    }
+
+    #[test]
+    fn an_unfocused_text_box_ignores_keys() {
+        // Typing Ctrl+Backspace in the instruction box must not delete in the text box (#4).
+        for key in [Named::Backspace, Named::Delete] {
+            for modifiers in [Modifiers::CTRL, Modifiers::empty()] {
+                for status in [Status::Active, Status::Hovered] {
+                    assert!(editor_binding(KeyPress { status, ..press(key, modifiers) }, false).is_none());
+                }
+            }
+        }
     }
 
     #[test]
