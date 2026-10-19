@@ -3135,7 +3135,7 @@ dependencies = [
 
 [[package]]
 name = "quillway"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "clap",
@@ -3154,7 +3154,7 @@ dependencies = [
 
 [[package]]
 name = "quillway-core"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "serde",
@@ -3165,7 +3165,7 @@ dependencies = [
 
 [[package]]
 name = "quillway-engine"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "bytesize",
@@ -3187,7 +3187,7 @@ dependencies = [
 
 [[package]]
 name = "quillway-wl"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "rustix 1.1.5",
