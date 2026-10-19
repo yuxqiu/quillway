@@ -1,9 +1,10 @@
-//! The daemon: an `iced_layershell` program with no surface until `show`.
+//! The daemon: an `iced_exwlshell` program with no surface until `show`.
 //!
 //! One popup at a time. Its life: take the input text (recent clipboard, text
 //! from the CLI, or typed into the popup) → compose → generate (streamed) →
 //! review / refine / edit → copy → hide.
 
+mod blur;
 mod no_ctrl_typing;
 mod notice;
 mod style;
@@ -17,9 +18,11 @@ use futures_util::{SinkExt, Stream, StreamExt, stream};
 use iced::keyboard::{self, Key, key::Code, key::Named, key::Physical};
 use iced::widget::text_editor;
 use iced::{Event, Size, Subscription, Task, event, task, window};
-use iced_layershell::reexport::{Anchor, KeyboardInteractivity, Layer, NewLayerShellSettings, OutputOption};
-use iced_layershell::settings::{LayerShellSettings, Settings, StartMode};
-use iced_layershell::to_layer_message;
+use iced_exwlshell::reexport::{
+    Anchor, BlurOption, KeyboardInteractivity, Layer, LayerSize, NewLayerShellSettings, OutputOption,
+};
+use iced_exwlshell::settings::{LayerShellSettings, Settings, StartMode};
+use iced_exwlshell::to_layer_message;
 use quillway_core::catalog::Entry;
 use quillway_core::config::{Config, DEFAULT_TEMPERATURE};
 use quillway_core::ipc::{Input, Request, Response};
@@ -52,7 +55,7 @@ pub fn run() -> anyhow::Result<()> {
     // `Font::with_name` needs a `'static` name; this runs once per process.
     let default_font =
         config.ui.font.as_ref().map_or_else(iced::Font::default, |f| iced::Font::with_name(f.clone().leak()));
-    iced_layershell::daemon(
+    iced_exwlshell::daemon(
         move || App::boot(config.clone(), active.clone(), watch.clone()),
         namespace,
         App::update,
@@ -67,6 +70,7 @@ pub fn run() -> anyhow::Result<()> {
         layer_settings: LayerShellSettings { start_mode: StartMode::Background, ..Default::default() },
         default_font,
         antialiasing: true,
+        keep_compositor_alive: false,
         ..Default::default()
     })
     .run()
@@ -156,6 +160,8 @@ impl Generation {
 
 struct Popup {
     id: window::Id,
+    /// Transparent surface behind the panel, to receive clicks on the desktop.
+    backdrop: window::Id,
     /// The text to rewrite, editable while there are no drafts.
     source: text_editor::Content,
     origin: Origin,
@@ -174,6 +180,8 @@ struct Popup {
     /// The keyboard was given to `field`'s box, on the first resize.
     focus_given: bool,
     size: (u32, u32),
+    blur_region: BlurOption,
+    scroll_y: f32,
     opened: Instant,
 }
 
@@ -333,6 +341,7 @@ enum Message {
     /// The box that has the keyboard after a click; `None` if the click unfocused both.
     Focused(window::Id, Option<Field>),
     Resized(window::Id, Size),
+    Scrolled(window::Id, f32, f32),
     Tick(Instant),
     /// The engine's state changed (from its supervisor).
     EngineState(EngineState),
@@ -341,6 +350,10 @@ enum Message {
     InstallStart,
     Install(&'static Entry, InstallEvent),
     WindowClosed(window::Id),
+    WindowUnfocused(window::Id),
+    OutsideClicked(window::Id),
+    /// Capture clicks on the panel's empty areas before the surrounding dismiss area.
+    PanelPressed,
 }
 
 impl App {
@@ -372,8 +385,10 @@ impl App {
             Subscription::run(ipc_stream).map(|(req, reply)| Message::Ipc(req, reply)),
             Subscription::run_with(self.engine.clone(), engine_states),
             event::listen_with(shortcut),
-            event::listen_with(|event, _, id| {
-                matches!(event, Event::Mouse(iced::mouse::Event::ButtonPressed(_))).then_some(Message::Clicked(id))
+            event::listen_with(|event, _, id| match event {
+                Event::Mouse(iced::mouse::Event::ButtonPressed(_)) => Some(Message::Clicked(id)),
+                Event::Window(window::Event::Unfocused) => Some(Message::WindowUnfocused(id)),
+                _ => None,
             }),
             window::close_events().map(Message::WindowClosed),
             iced::system::theme_changes().map(Message::SystemTheme),
@@ -411,6 +426,11 @@ impl App {
             Message::Clicked(id) => self.on_click(id),
             Message::Focused(id, field) => self.on_focused(id, field),
             Message::Resized(id, size) => self.on_resize(id, size),
+            Message::Scrolled(id, height, offset) => {
+                let Some(p) = self.popup.as_mut().filter(|p| p.id == id) else { return Task::none() };
+                p.scroll_y = offset;
+                self.on_resize(id, Size::new(0.0, height))
+            }
             Message::Tick(now) => {
                 self.now = now;
                 Task::none()
@@ -423,14 +443,18 @@ impl App {
             }
             Message::InstallStart => self.start_install(),
             Message::Install(entry, ev) => self.on_install(entry, ev),
+            Message::WindowUnfocused(id) | Message::OutsideClicked(id)
+                if self.popup.as_ref().is_some_and(|p| p.id == id) =>
+            {
+                self.hide()
+            }
             Message::WindowClosed(id) => {
-                if self.popup.as_ref().is_some_and(|p| p.id == id) {
-                    self.abort_generation();
-                    self.popup = None;
+                if self.popup.as_ref().is_some_and(|p| p.id == id || p.backdrop == id) {
+                    return self.hide();
                 }
                 Task::none()
             }
-            // Layer-shell actions are handled by iced_layershell before reaching us.
+            // Layer-shell actions are handled by iced_exwlshell before reaching us.
             _ => Task::none(),
         }
     }
@@ -622,6 +646,11 @@ impl App {
         (self.config.ui.width + 2 * m, (panel_height + 2 * m).min(MAX_SURFACE_HEIGHT))
     }
 
+    fn blur_region(&self, panel_height: u32, scroll_y: f32) -> BlurOption {
+        let margin = self.margin();
+        blur::panel(self.config.ui.width, panel_height, MAX_SURFACE_HEIGHT - 2 * margin, margin, scroll_y)
+    }
+
     /// Copied within `behavior.recent_secs`. Without a watcher we can't tell, so yes.
     fn clipboard_recent(&mut self) -> bool {
         if self.watch.as_ref().is_some_and(|w| !w.is_alive()) {
@@ -655,11 +684,14 @@ impl App {
         // A key held as the last popup closed was released elsewhere.
         self.held = None;
         let id = window::Id::unique();
+        let backdrop = window::Id::unique();
         let size = self.surface_size(INITIAL_PANEL_HEIGHT);
+        let blur_region = self.blur_region(INITIAL_PANEL_HEIGHT, 0.0);
         let top = i32::try_from(self.config.ui.top_margin.saturating_sub(self.margin())).unwrap_or(i32::MAX);
         self.now = Instant::now();
         self.popup = Some(Popup {
             id,
+            backdrop,
             // The install card has no text box; ↵ there goes to the instruction box.
             field: if text.trim().is_empty() && !self.model_missing() { Field::Source } else { Field::Instruction },
             source: editor_content(text),
@@ -673,28 +705,47 @@ impl App {
             details_open: false,
             focus_given: false,
             size,
+            blur_region: blur_region.clone(),
+            scroll_y: 0.0,
             opened: Instant::now(),
         });
-        Task::done(Message::NewLayerShell {
+        let background = Message::NewLayerShell {
             settings: NewLayerShellSettings {
-                size: Some(size),
+                size: LayerSize::FILL,
+                layer: Layer::Top,
+                anchor: Anchor::all(),
+                exclusive_zone: Some(-1),
+                margin: None,
+                keyboard_interactivity: KeyboardInteractivity::None,
+                output_option: OutputOption::Active,
+                events_transparent: false,
+                namespace: Some("quillway-dismiss".into()),
+                // An empty region overrides compositor blur rules; None would use their fallback.
+                blur_option: BlurOption::Region(Vec::new()),
+            },
+            id: backdrop,
+        };
+        Task::done(background).chain(Task::done(Message::NewLayerShell {
+            settings: NewLayerShellSettings {
+                size: LayerSize::px(size.0, size.1),
+                blur_option: blur_region,
                 layer: Layer::Overlay,
                 anchor: Anchor::Top,
                 exclusive_zone: None,
                 margin: Some((top, 0, 0, 0)),
-                keyboard_interactivity: KeyboardInteractivity::Exclusive,
+                keyboard_interactivity: KeyboardInteractivity::OnDemand,
                 output_option: OutputOption::Active,
                 events_transparent: false,
                 namespace: Some(namespace()),
             },
             id,
-        })
+        }))
     }
 
     fn hide(&mut self) -> Task<Message> {
         self.abort_generation();
         match self.popup.take() {
-            Some(p) => window::close(p.id),
+            Some(p) => Task::batch([window::close(p.id), window::close(p.backdrop)]),
             None => Task::none(),
         }
     }
@@ -712,7 +763,10 @@ impl App {
     )]
     fn on_resize(&mut self, id: window::Id, panel: Size) -> Task<Message> {
         let mut tasks = Vec::new();
-        let want = self.surface_size(panel.height.ceil() as u32);
+        let panel_height = panel.height.ceil() as u32;
+        let want = self.surface_size(panel_height);
+        let Some(p) = self.popup.as_ref().filter(|p| p.id == id) else { return Task::none() };
+        let blur = self.blur_region(panel_height, p.scroll_y);
         let Some(p) = self.popup.as_mut().filter(|p| p.id == id) else { return Task::none() };
         if !p.focus_given {
             p.focus_given = true;
@@ -720,7 +774,15 @@ impl App {
         }
         if p.size != want {
             p.size = want;
-            tasks.push(Task::done(Message::SizeChange { id: p.id, size: want }));
+            tasks.push(Task::done(Message::LayoutChange {
+                id: p.id,
+                anchor: Anchor::Top,
+                size: LayerSize::px(want.0, want.1),
+            }));
+        }
+        if p.blur_region != blur {
+            p.blur_region = blur.clone();
+            tasks.push(Task::done(Message::BlurOptionChange { id: p.id, option: blur }));
         }
         Task::batch(tasks)
     }
@@ -1302,6 +1364,147 @@ mod tests {
         assert_eq!(p.size, initial_size);
         let _ = app.update(Message::Resized(current, Size::new(680.0, 320.0)));
         assert!(app.popup.as_ref().unwrap().focus_given);
+    }
+
+    async fn messages(task: Task<Message>) -> Vec<Message> {
+        let Some(actions) = iced_runtime::task::into_stream(task) else { return Vec::new() };
+        actions
+            .filter_map(|action| async {
+                match action {
+                    iced_runtime::Action::Output(message) => Some(message),
+                    _ => None,
+                }
+            })
+            .collect()
+            .await
+    }
+
+    #[tokio::test]
+    async fn popup_takes_on_demand_focus_and_closes_when_focus_moves_away() {
+        let mut app = boot(endpoint_config());
+        let opened = messages(app.open("hello", Origin::Stdin, None)).await;
+        let [Message::NewLayerShell { settings: background, .. }, Message::NewLayerShell { settings, id }] =
+            opened.as_slice()
+        else {
+            panic!("missing popup")
+        };
+        assert_eq!(background.keyboard_interactivity, KeyboardInteractivity::None);
+        assert_eq!(background.blur_option, BlurOption::Region(Vec::new()));
+        assert_eq!(background.layer, Layer::Top);
+        assert_eq!(settings.layer, Layer::Overlay);
+        assert_eq!(settings.keyboard_interactivity, KeyboardInteractivity::OnDemand);
+        let id = *id;
+        let _ = app.update(Message::WindowUnfocused(window::Id::unique()));
+        assert_eq!(app.popup.as_ref().unwrap().id, id, "ignore focus changes from other windows");
+        let _ = app.update(Message::WindowUnfocused(id));
+        assert!(app.popup.is_none());
+        let _ = app.open("new popup", Origin::Stdin, None);
+        let new_id = app.popup.as_ref().unwrap().id;
+        let _ = app.update(Message::WindowUnfocused(id));
+        assert_eq!(app.popup.as_ref().unwrap().id, new_id, "ignore a late focus loss from the old popup");
+    }
+
+    #[tokio::test]
+    async fn outside_dismissal_aborts_the_rewrite_and_closes_both_surfaces() {
+        let dismissals: [fn(window::Id) -> Message; 2] = [Message::WindowUnfocused, Message::OutsideClicked];
+        for dismiss in dismissals {
+            let mut app = generating_app();
+            let p = app.popup.as_ref().unwrap();
+            let (id, backdrop) = (p.id, p.backdrop);
+            let handle = p.generation.as_ref().unwrap().handle.clone();
+            let _ = app.update(Message::PanelPressed);
+            let _ = app.update(dismiss(window::Id::unique()));
+            assert!(app.popup.is_some(), "inside clicks and stale dismissals must keep the popup open");
+            let closed: Vec<_> = iced_runtime::task::into_stream(app.update(dismiss(id)))
+                .unwrap()
+                .filter_map(|action| async move {
+                    match action {
+                        iced_runtime::Action::Window(iced_runtime::window::Action::Close(id)) => Some(id),
+                        _ => None,
+                    }
+                })
+                .collect()
+                .await;
+            assert!(app.popup.is_none());
+            assert!(handle.is_aborted());
+            assert_eq!(closed.len(), 2);
+            assert!(closed.contains(&id) && closed.contains(&backdrop));
+        }
+    }
+
+    #[test]
+    fn a_closed_backdrop_cannot_leave_an_open_popup() {
+        let mut app = boot(endpoint_config());
+        let _ = app.open("hello", Origin::Stdin, None);
+        let backdrop = app.popup.as_ref().unwrap().backdrop;
+        let _ = app.update(Message::WindowClosed(backdrop));
+        assert!(app.popup.is_none());
+    }
+
+    fn blur_contains(option: &BlurOption, x: i32, y: i32) -> bool {
+        let BlurOption::Region(rects) = option else {
+            panic!("expected an explicit panel region, got {option:?}");
+        };
+        rects.iter().any(|r| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height)
+    }
+
+    #[tokio::test]
+    async fn popup_blur_region_tracks_open_resize_and_clipping() {
+        for shadow in [false, true] {
+            let mut config = endpoint_config();
+            config.ui.client_shadow = shadow;
+            let mut app = boot(config);
+            let opened = messages(app.open("hello", Origin::Stdin, None)).await;
+            let [Message::NewLayerShell { .. }, Message::NewLayerShell { settings, id }] = opened.as_slice() else {
+                panic!("missing popup")
+            };
+            let id = *id;
+            let m = i32::try_from(app.margin()).unwrap();
+            let check = |option: &BlurOption, height: i32, clipped: bool| {
+                assert!(blur_contains(option, m + 340, m));
+                assert!(!blur_contains(option, m, m), "top corner must be clear");
+                assert!(!blur_contains(option, m + 679, m));
+                assert!(blur_contains(option, m, m + 16));
+                assert!(!blur_contains(option, m - 1, m + 16), "left shadow must be clear");
+                assert!(!blur_contains(option, m + 680, m + 16), "right shadow must be clear");
+                assert!(blur_contains(option, m + 340, m + height - 1));
+                assert_eq!(blur_contains(option, m, m + height - 1), clipped);
+                assert_eq!(blur_contains(option, m + 679, m + height - 1), clipped);
+                assert!(!blur_contains(option, m + 340, m + height), "bottom shadow must be clear");
+                assert!(!blur_contains(option, m + 340, m - 1), "top shadow must be clear");
+            };
+            check(&settings.blur_option, 196, false);
+            for natural_height in [320, 2000, 196] {
+                let height = f32::from(u16::try_from(natural_height).unwrap());
+                let resized = messages(app.on_resize(id, Size::new(680.0, height))).await;
+                assert!(
+                    resized.iter().any(|msg| matches!(msg, Message::LayoutChange { id: target, .. } if *target == id))
+                );
+                let option = resized
+                    .iter()
+                    .find_map(|msg| match msg {
+                        Message::BlurOptionChange { id: target, option } if *target == id => Some(option),
+                        _ => None,
+                    })
+                    .expect("resize must update the blur region");
+                let visible = natural_height.min(i32::try_from(MAX_SURFACE_HEIGHT).unwrap() - 2 * m);
+                check(option, visible, natural_height > visible);
+                if natural_height > visible {
+                    for (offset, bottom_round) in [(200.0, false), (2000.0, true)] {
+                        let scrolled = messages(app.update(Message::Scrolled(id, height, offset))).await;
+                        let [Message::BlurOptionChange { option, .. }] = scrolled.as_slice() else {
+                            panic!("scroll must update only the blur region");
+                        };
+                        assert!(blur_contains(option, m, m));
+                        assert_eq!(blur_contains(option, m, m + visible - 1), !bottom_round);
+                    }
+                }
+            }
+            let unchanged = messages(app.on_resize(id, Size::new(680.0, 196.0))).await;
+            assert!(unchanged.is_empty(), "unchanged layout must not resend the region");
+            let stale = messages(app.on_resize(window::Id::unique(), Size::new(680.0, 420.0))).await;
+            assert!(stale.is_empty(), "stale events cannot change a popup's blur");
+        }
     }
 
     #[test]

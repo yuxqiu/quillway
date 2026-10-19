@@ -21,9 +21,19 @@ const PAD_X: u16 = 18;
 
 impl App {
     pub(super) fn view(&self, id: window::Id) -> Element<'_, Message> {
-        let Some(p) = self.popup.as_ref().filter(|p| p.id == id) else {
+        let Some(p) = self.popup.as_ref() else {
             return Space::new().into();
         };
+        if p.backdrop == id {
+            return mouse_area(Space::new().width(Length::Fill).height(Length::Fill))
+                .on_press(Message::OutsideClicked(p.id))
+                .on_right_press(Message::OutsideClicked(p.id))
+                .on_middle_press(Message::OutsideClicked(p.id))
+                .into();
+        }
+        if p.id != id {
+            return Space::new().into();
+        }
         let pal = self.palette.faded(self.fade());
 
         let mut sections: Vec<Element<'_, Message>> = vec![self.input_row(p, pal)];
@@ -48,13 +58,24 @@ impl App {
             .on_show(move |size| Message::Resized(id, size))
             .on_resize(move |size| Message::Resized(id, size));
 
-        container(
-            scrollable(measured)
+        let panel = mouse_area(measured)
+            .on_press(Message::PanelPressed)
+            .on_right_press(Message::PanelPressed)
+            .on_middle_press(Message::PanelPressed);
+        let surface = container(
+            scrollable(panel)
                 .direction(scrollable::Direction::Vertical(scrollable::Scrollbar::hidden()))
+                .on_scroll(move |viewport| {
+                    Message::Scrolled(id, viewport.content_bounds().height, viewport.absolute_offset().y)
+                })
                 .height(Length::Fill),
         )
-        .padding(f32::from(u16::try_from(self.margin()).unwrap_or(0)))
-        .into()
+        .padding(f32::from(u16::try_from(self.margin()).unwrap_or(0)));
+        mouse_area(surface)
+            .on_press(Message::OutsideClicked(id))
+            .on_right_press(Message::OutsideClicked(id))
+            .on_middle_press(Message::OutsideClicked(id))
+            .into()
     }
 
     fn input_row<'a>(&'a self, p: &'a Popup, pal: Palette) -> Element<'a, Message> {
