@@ -3,8 +3,8 @@
 use std::f32::consts::TAU;
 
 use iced::theme::Mode;
-use iced::widget::{container, rule, text_editor, text_input};
-use iced::{Background, Border, Color, Radians, Shadow, Vector, border, gradient};
+use iced::widget::{canvas, container, rule, text_editor, text_input};
+use iced::{Border, Color, Point, Radians, Rectangle, Shadow, Size, Vector, border, mouse};
 use quillway_core::config::{ThemeChoice, UiConfig};
 
 pub const RADIUS: f32 = 16.0;
@@ -90,32 +90,19 @@ impl Palette {
     }
 
     /// Outer ring: a hairline normally, a rotating accent gradient while working.
-    pub fn ring(self, shimmer: Option<f32>) -> impl Fn(&iced::Theme) -> container::Style {
-        move |_| {
-            #[expect(clippy::option_if_let_else, reason = "a match reads better for two styles")]
-            let background = match shimmer {
-                Some(phase) => {
-                    let (a, b, c) = (self.accent, rotate_hue(self.accent, 0.18), rotate_hue(self.accent, -0.22));
-                    Background::Gradient(
-                        gradient::Linear::new(Radians(phase * TAU))
-                            .add_stop(0.0, b)
-                            .add_stop(0.5, a)
-                            .add_stop(1.0, c)
-                            .into(),
-                    )
-                }
-                None => self.hairline.into(),
-            };
-            container::Style {
-                background: Some(background),
-                border: Border { radius: RADIUS.into(), ..Border::default() },
-                shadow: if self.client_shadow {
-                    Shadow { color: self.shadow, offset: Vector::new(0.0, 12.0), blur_radius: 28.0 }
-                } else {
-                    Shadow::default()
-                },
-                ..container::Style::default()
-            }
+    pub fn ring<Message>(self, shimmer: Option<f32>) -> impl canvas::Program<Message> {
+        Ring { palette: self, shimmer }
+    }
+
+    pub fn shadow(self) -> impl Fn(&iced::Theme) -> container::Style {
+        move |_| container::Style {
+            border: Border { radius: RADIUS.into(), ..Border::default() },
+            shadow: if self.client_shadow {
+                Shadow { color: self.shadow, offset: Vector::new(0.0, 12.0), blur_radius: 28.0 }
+            } else {
+                Shadow::default()
+            },
+            ..container::Style::default()
         }
     }
 
@@ -177,6 +164,50 @@ impl Palette {
 
     pub fn hairline(self) -> impl Fn(&iced::Theme) -> rule::Style {
         move |_| rule::Style { color: self.hairline, radius: 0.0.into(), fill_mode: rule::FillMode::Full, snap: true }
+    }
+}
+
+struct Ring {
+    palette: Palette,
+    shimmer: Option<f32>,
+}
+
+impl<Message> canvas::Program<Message> for Ring {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &(),
+        renderer: &iced::Renderer,
+        _theme: &iced::Theme,
+        bounds: Rectangle,
+        _cursor: mouse::Cursor,
+    ) -> Vec<canvas::Geometry> {
+        let mut frame = canvas::Frame::new(renderer, bounds.size());
+        let pal = self.palette;
+        #[expect(clippy::option_if_let_else, reason = "a match reads better for two styles")]
+        let style = match self.shimmer {
+            Some(phase) => {
+                let (start, end) = Radians(phase * TAU).to_distance(&Rectangle::with_size(bounds.size()));
+                canvas::Style::Gradient(
+                    canvas::gradient::Linear::new(start, end)
+                        .add_stop(0.0, rotate_hue(pal.accent, 0.18))
+                        .add_stop(0.5, pal.accent)
+                        .add_stop(1.0, rotate_hue(pal.accent, -0.22))
+                        .into(),
+                )
+            }
+            None => canvas::Style::Solid(pal.hairline),
+        };
+        // Stroke only the border: a filled gradient behind the translucent panel
+        // would tint its interior and obscure the compositor's background blur.
+        let path = canvas::Path::rounded_rectangle(
+            Point::new(RING / 2.0, RING / 2.0),
+            Size::new(bounds.width - RING, bounds.height - RING),
+            (RADIUS - RING / 2.0).into(),
+        );
+        frame.stroke(&path, canvas::Stroke { style, width: RING, ..canvas::Stroke::default() });
+        vec![frame.into_geometry()]
     }
 }
 

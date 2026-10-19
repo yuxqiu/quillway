@@ -3,8 +3,8 @@
 
 use iced::keyboard::{Key, key::Named};
 use iced::widget::{
-    Space, column, container, mouse_area, rich_text, row, rule, scrollable, sensor, span, text, text::Span,
-    text_editor, text_input,
+    Space, canvas, column, container, mouse_area, rich_text, row, rule, scrollable, sensor, span, stack, text,
+    text::Span, text_editor, text_input,
 };
 use iced::{Element, Length, Padding, window};
 use quillway_core::diff::{self, Change};
@@ -53,7 +53,10 @@ impl App {
 
         let panel = container(column(sections)).width(Length::Fill).style(pal.panel());
         let width = f32::from(u16::try_from(self.config.ui.width).unwrap_or(u16::MAX));
-        let ring = container(panel).padding(RING).width(width).style(pal.ring(self.shimmer()));
+        let ring = stack![
+            container(panel).padding(RING).width(width).style(pal.shadow()),
+            canvas(pal.ring(self.shimmer())).width(Length::Fill).height(Length::Fill),
+        ];
         let measured = sensor(ring)
             .on_show(move |size| Message::Resized(id, size))
             .on_resize(move |size| Message::Resized(id, size));

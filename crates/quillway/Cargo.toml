@@ -16,7 +16,7 @@ clap = { version = "4", features = ["derive"] }
 futures-util = "0.3"
 rustix = { version = "1", features = ["process"] }
 # `advanced`: the widget trait, for `ui::no_ctrl_typing`.
-iced = { version = "0.14", features = ["tokio", "advanced"] }
+iced = { version = "0.14", features = ["tokio", "advanced", "canvas"] }
 iced_exwlshell = "=0.20.1"
 
 [lints]
